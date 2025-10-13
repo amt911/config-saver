@@ -1,0 +1,6 @@
+directories:
+    - example/dir/1
+    - source: example/dir/2
+      files:
+        - file1.txt
+        - file2.txt
