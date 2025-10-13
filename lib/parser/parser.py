@@ -9,7 +9,7 @@ class Parser:
     def __init__(self, filename: str):
         self.filename = filename
         try:
-            with open(self.filename, "r") as yaml_file:
+            with open(self.filename, "r", encoding="utf-8") as yaml_file:
                 try:
                     yaml_data = yaml.safe_load(yaml_file)
                     validated_data = Model.model_validate(yaml_data)
@@ -22,7 +22,9 @@ class Parser:
             exit(1)
 
     def get_attr(self, attr_name: str):
+        """Get an attribute from the parsed data"""
         return self._data.get(attr_name, None)
 
     def debug(self):
+        """Return the parsed data for debugging purposes"""
         return self._data
