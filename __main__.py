@@ -1,25 +1,50 @@
 """Main module to demonstrate YAML parsing and tar compression"""
+import argparse
 from colorama import init, Fore
-
 from lib.tar_compressor.tar_compressor import TarCompressor
 from lib.parser.parser import Parser
 from lib.models.model import Model
+from lib.tar_compressor.tar_decompressor import TarDecompressor
+
 init(autoreset=True)
 
 def main():
-    """Main function to demonstrate YAML parsing and tar compression"""
-    parser = Parser("configs/default/config.yaml")
-    try:
-        validated = Model.model_validate(parser.get_data())
-    except (ValueError, TypeError) as e:
-        print(Fore.RED + "Validation error:", e)
-        return
-    try:
-        compressor = TarCompressor(validated, "/home/andres/output.tar.gz")
-        compressor.compress()
-        print(Fore.GREEN + "Compression completed successfully.")
-    except (OSError, RuntimeError) as e:
-        print(Fore.RED + "Compression error:", e)
+    parser = argparse.ArgumentParser(description="Tar compressor/decompressor utility")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--compress', '-c', action='store_true', help='Compress files/directories from YAML config')
+    group.add_argument('--decompress', '-d', action='store_true', help='Decompress a tar file')
+    parser.add_argument('--input', '-i', type=str, required=True, help='Input YAML config (for compress) or tar file (for decompress)')
+    parser.add_argument('--output', '-o', type=str, default=None, help='Output tar file (for compress) or extraction directory (for decompress, optional)')
+    args = parser.parse_args()
+
+    # Set default output path if not provided
+    if args.output is None and args.compress:
+        args.output = "output.tar.gz"
+
+    if args.compress:
+        try:
+            yaml_parser = Parser(args.input)
+            validated = Model.model_validate(yaml_parser.get_data())
+            print(Fore.GREEN + "YAML validated successfully.")
+        except (ValueError, TypeError) as e:
+            print(Fore.RED + "Validation error:", e)
+            return
+        try:
+            compressor = TarCompressor(validated, args.output)
+            compressor.compress()
+            print(Fore.GREEN + f"Compression completed successfully. Output: {args.output}")
+        except (OSError, RuntimeError) as e:
+            print(Fore.RED + "Compression error:", e)
+    elif args.decompress:
+        try:
+            if args.output is not None:
+                decompressor = TarDecompressor(args.input, args.output)
+            else:
+                # If no output, extract to current directory (preserve absolute paths)
+                decompressor = TarDecompressor(args.input, None)
+            decompressor.decompress()
+        except (OSError, RuntimeError) as e:
+            print(Fore.RED + "Decompression error:", e)
 
 if __name__ == "__main__":
     main()
