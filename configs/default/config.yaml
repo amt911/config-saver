@@ -1,5 +1,6 @@
 directories:
     - /home/andres/.fonts
+    - /etc/coolercontrol
     - source: /home/andres/Downloads
       files:
         - WSDL.pdf
