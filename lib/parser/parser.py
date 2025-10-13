@@ -25,6 +25,6 @@ class Parser:
         """Get an attribute from the parsed data"""
         return self._data.get(attr_name, None)
 
-    def debug(self):
-        """Return the parsed data for debugging purposes"""
+    def get_data(self):
+        """Return the parsed data as a dictionary"""
         return self._data

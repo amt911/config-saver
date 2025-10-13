@@ -1,7 +1,8 @@
 """Module providing a tar compressor based on a YAML configuration with pydantic validation"""
 import tarfile
 import os
-from termcolor import colored
+from colorama import init, Fore
+init(autoreset=True)
 
 from lib.models.model import Model
 
@@ -17,17 +18,17 @@ class TarCompressor:
             for entry in self.yaml_data.directories:
                 if isinstance(entry, str):
                     if not os.path.exists(entry):
-                        print(colored(f"[WARNING] Directory '{entry}' does not exist. Skipping.", "yellow"))
+                        print(Fore.YELLOW + f"[WARNING] Directory '{entry}' does not exist. Skipping.")
                         continue
                     tar.add(entry, arcname=os.path.basename(entry))
                 else:
                     source = entry.source
                     if not os.path.exists(source):
-                        print(colored(f"[WARNING] Directory '{source}' does not exist. Skipping.", "yellow"))
+                        print(Fore.YELLOW + f"[WARNING] Directory '{source}' does not exist. Skipping.")
                         continue
                     for file in entry.files:
                         file_path = os.path.join(source, file)
                         if not os.path.exists(file_path):
-                            print(colored(f"[WARNING] File '{file_path}' does not exist. Skipping.", "yellow"))
+                            print(Fore.YELLOW + f"[WARNING] File '{file_path}' does not exist. Skipping.")
                             continue
                         tar.add(file_path, arcname=os.path.join(os.path.basename(source), file))
