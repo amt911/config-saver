@@ -1,4 +1,24 @@
 
+# Installation
+
+## Production dependencies
+
+Install the package and its main dependencies:
+
+```sh
+pip install .
+```
+
+## Development dependencies
+
+Install the package along with development tools (type checking, linters, etc.):
+
+```sh
+pip install '.[dev]'
+```
+
+This will install `mypy` and type stubs for PyYAML (`types-PyYAML`).
+
 # Config Saver
 
 Python CLI tool for validating, converting, and managing configuration files (YAML/JSON), as well as compressing/decompressing directories or files with structure preservation and visual feedback.

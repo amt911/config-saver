@@ -6,7 +6,7 @@ from typing import Optional
 from colorama import init
 from tqdm import tqdm
 
-from lib.models.model import Model
+from config_saver.lib.models.model import Model
 
 init(autoreset=True)
 

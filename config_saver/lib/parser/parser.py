@@ -2,7 +2,7 @@
 import yaml
 from pydantic import ValidationError
 from colorama import Fore, Style
-from models.model import Model
+from config_saver.lib.models.model import Model
 
 class Parser:
     """Class representing a yaml and json parser for our model"""

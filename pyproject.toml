@@ -1,16 +1,13 @@
-[tool.setuptools]
-include-package-data = true
+
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0", "wheel", "setuptools_scm"]
 build-backend = "setuptools.build_meta"
 
+
 [project]
-name = "config-saver"
-version = "1.0.0"
+name = "config_saver"
+version = "0.0.0"
 description = "Python CLI tool for validating, converting, and managing YAML/JSON configs, with tar compression utilities"
-authors = [
-    { name = "amt911", email = "a.merlo.truji10@gmail.com" }
-]
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.7"
@@ -21,12 +18,31 @@ dependencies = [
     "pyyaml"
 ]
 
+[[project.authors]]
+name = "amt911"
+email = "a.merlo.truji10@gmail.com"
+
 [project.urls]
 Homepage = "https://github.com/amt911/config-saver"
 
 [project.scripts]
 config-saver = "config_saver.__main__:main"
 
+[tool.setuptools]
+include-package-data = true
+
+
 [tool.setuptools.packages.find]
-where = ["config_saver"]
+where = ["."]
+include = ["config_saver*"]
+
+[project.optional-dependencies]
+dev = [
+    "mypy",
+    "types-PyYAML"
+]
+
+[tool.setuptools_scm]
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"
 
