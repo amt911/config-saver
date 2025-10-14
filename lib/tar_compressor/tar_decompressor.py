@@ -1,10 +1,14 @@
 """Module providing a tar decompressor that extracts files to their original directories"""
-import tarfile
 import os
+import tarfile
+from typing import Optional
+
 from colorama import Fore, init
+from tqdm import tqdm
+
 init(autoreset=True)
 
-from typing import Optional
+
 
 class TarDecompressor:
     """Class representing a tar decompressor"""
@@ -13,22 +17,25 @@ class TarDecompressor:
         self.output_dir = output_dir
 
     def decompress(self):
-        """Extract all files and folders from the tar archive to their original structure or absolute paths"""
+        """Extract all files and folders from the tar archive to their original structure or absolute paths, with progress bar"""
         if not os.path.exists(self.tar_path):
             print(Fore.RED + f"[ERROR] Tar file '{self.tar_path}' does not exist.")
             return
         with tarfile.open(self.tar_path, "r:gz") as tar:
             try:
+                members = tar.getmembers()
                 if self.output_dir:
-                    tar.extractall(path=self.output_dir)
+                    for member in tqdm(members, desc="Extracting files", unit="file"):
+                        tqdm.write(f"Extracting: {member.name}")
+                        tar.extract(member, path=self.output_dir)
                     print(Fore.GREEN + f"Extraction completed successfully in '{self.output_dir}'.")
                 else:
-                    for member in tar.getmembers():
-                        # Construir ruta absoluta
+                    for member in tqdm(members, desc="Extracting files", unit="file"):
                         abs_path = os.path.join(os.sep, member.name.lstrip(os.sep))
                         abs_dir = os.path.dirname(abs_path)
                         if not os.path.exists(abs_dir):
                             os.makedirs(abs_dir, exist_ok=True)
+                        tqdm.write(f"Extracting: {abs_path}")
                         tar.extract(member, path=os.sep)
                     print(Fore.GREEN + "Extraction completed successfully to absolute paths.")
             except Exception as e:
