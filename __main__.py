@@ -36,10 +36,10 @@ def main():
     elif args.decompress:
         try:
             if args.output is not None:
-                    decompressor = TarDecompressor(args.input, args.output, show_progress=args.progress)
+                decompressor = TarDecompressor(args.input, args.output, show_progress=args.progress)
             else:
                 # If no output, extract to current directory (preserve absolute paths)
-                    decompressor = TarDecompressor(args.input, None, show_progress=args.progress)
+                decompressor = TarDecompressor(args.input, None, show_progress=args.progress)
             decompressor.decompress()
         except (OSError, RuntimeError) as e:
             print(Fore.RED + "Decompression error:", e)

@@ -45,5 +45,5 @@ class TarDecompressor:
                             tqdm.write(f"Extracting: {abs_path}")
                         tar.extract(member, path=os.sep)
                     print(Fore.GREEN + "Extraction completed successfully to absolute paths.")
-            except Exception as e:
+            except (tarfile.TarError, OSError, IOError) as e:
                 print(Fore.RED + f"[ERROR] Extraction failed: {e}")
