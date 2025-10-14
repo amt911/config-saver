@@ -1,27 +1,7 @@
 
-# Installation
-
-## Production dependencies
-
-Install the package and its main dependencies:
-
-```sh
-pip install .
-```
-
-## Development dependencies
-
-Install the package along with development tools (type checking, linters, etc.):
-
-```sh
-pip install '.[dev]'
-```
-
-This will install `mypy` and type stubs for PyYAML (`types-PyYAML`).
-
 # Config Saver
 
-Python CLI tool for validating, converting, and managing configuration files (YAML/JSON), as well as compressing/decompressing directories or files with structure preservation and visual feedback.
+Python CLI tool for compressing and decompressing directories or files by using configuration files (YAML/JSON), with optional progress bar.
 
 ## Main Features
 
@@ -33,18 +13,23 @@ Python CLI tool for validating, converting, and managing configuration files (YA
 
 ## Installation
 
-1. Clone the repository:
+### Production dependencies
 
-	 ```sh
-	 git clone https://github.com/amt911/config-saver.git
-	 cd config-saver
-	 ```
+Install the package and its main dependencies:
 
-2. Install dependencies:
+```sh
+pip install .
+```
 
-	 ```sh
-	 pip install -r dependencies/requirements.txt
-	 ```
+### Development dependencies
+
+Install the package along with development tools (type checking, linters, etc.):
+
+```sh
+pip install '.[dev]'
+```
+
+This will install `mypy` and type stubs.
 
 ## Usage
 
@@ -53,9 +38,9 @@ Python CLI tool for validating, converting, and managing configuration files (YA
 Compress a directory or file:
 
 ```sh
-python -m config-saver --compress folder/ archive.tar.gz
+config-saver --compress folder/ archive.tar.gz
 # With progress bar
-python -m config-saver --compress folder/ archive.tar.gz --progress
+config-saver --compress folder/ archive.tar.gz --progress
 ```
 
 ### Decompression
@@ -63,9 +48,9 @@ python -m config-saver --compress folder/ archive.tar.gz --progress
 Decompress a tar.gz archive:
 
 ```sh
-python -m config-saver --decompress archive.tar.gz --output destination_folder/
+config-saver --decompress archive.tar.gz --output destination_folder/
 # With progress bar
-python -m config-saver --decompress archive.tar.gz --output destination_folder/ --progress
+config-saver --decompress archive.tar.gz --output destination_folder/ --progress
 ```
 
 ## Main CLI Options
