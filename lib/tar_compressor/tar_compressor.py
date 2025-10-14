@@ -3,7 +3,8 @@ import os
 import tarfile
 from typing import Optional
 
-from colorama import Fore, init
+from colorama import init
+from tqdm import tqdm
 
 from lib.models.model import Model
 
@@ -19,28 +20,26 @@ class TarCompressor:
         self.base_dir = base_dir or os.getcwd()
 
     def compress(self):
-        """Compress files and directories based on the provided YAML data, preserving absolute folder structure inside the tar"""
-        with tarfile.open(self.output_path, "w:gz") as tar:
-            for entry in self.yaml_data.directories:
-                if isinstance(entry, str):
-                    if not os.path.exists(entry):
-                        print(Fore.YELLOW + f"[WARNING] Directory '{entry}' does not exist. Skipping.")
-                        continue
-                    arcname = os.path.normpath(entry)
-                    if arcname.startswith(os.sep):
-                        arcname = arcname[1:]
-                    tar.add(entry, arcname=arcname)
-                else:
-                    source = entry.source
-                    if not os.path.exists(source):
-                        print(Fore.YELLOW + f"[WARNING] Directory '{source}' does not exist. Skipping.")
-                        continue
+        """Compress files and directories with a global progress bar for all files, showing current file name."""
+        file_list: list[str] = []
+        for entry in self.yaml_data.directories:
+            if isinstance(entry, str):
+                if os.path.exists(entry):
+                    for root, _, files in os.walk(entry):
+                        for f in files:
+                            file_list.append(os.path.join(root, f))
+            else:
+                source = entry.source
+                if os.path.exists(source):
                     for file in entry.files:
                         file_path = os.path.join(source, file)
-                        if not os.path.exists(file_path):
-                            print(Fore.YELLOW + f"[WARNING] File '{file_path}' does not exist. Skipping.")
-                            continue
-                        arcname = os.path.normpath(file_path)
-                        if arcname.startswith(os.sep):
-                            arcname = arcname[1:]
-                        tar.add(file_path, arcname=arcname)
+                        if os.path.exists(file_path):
+                            file_list.append(file_path)
+
+        with tarfile.open(self.output_path, "w:gz") as tar:
+            for file_path in tqdm(file_list, desc="Compressing files", unit="file"):
+                arcname = os.path.normpath(file_path)
+                if arcname.startswith(os.sep):
+                    arcname = arcname[1:]
+                tqdm.write(f"Compressing: {file_path}")
+                tar.add(file_path, arcname=arcname)
