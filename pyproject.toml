@@ -39,7 +39,9 @@ include = ["config_saver*"]
 [project.optional-dependencies]
 dev = [
     "mypy",
-    "types-PyYAML"
+    "types-PyYAML",
+    "types-colorama",
+    "types-tqdm"
 ]
 
 [tool.setuptools_scm]
