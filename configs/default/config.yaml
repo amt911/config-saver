@@ -1,7 +1,6 @@
 directories:
-  - /home/andres/Downloads
-    # - /home/andres/.fonts
-    # - source: /home/andres/Downloads
-      # files:
-        # - WSDL.pdf
-        # - WSDL-1.pdf
+    - /home/andres/.fonts
+    - source: /home/andres/Downloads
+      files:
+        - WSDL.pdf
+        - WSDL-1.pdf

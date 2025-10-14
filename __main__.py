@@ -15,6 +15,7 @@ def main():
     group.add_argument('--decompress', '-d', action='store_true', help='Decompress a tar file')
     parser.add_argument('--input', '-i', type=str, required=True, help='Input YAML config (for compress) or tar file (for decompress)')
     parser.add_argument('--output', '-o', type=str, default=None, help='Output tar file (for compress) or extraction directory (for decompress, optional)')
+    parser.add_argument('--progress', '-P', action='store_true', help='Show progress bar during compression/decompression')
     args = parser.parse_args()
 
     # Set default output path if not provided
@@ -29,19 +30,16 @@ def main():
         except (ValueError, TypeError) as e:
             print(Fore.RED + "Validation error:", e)
             return
-        try:
-            compressor = TarCompressor(validated, args.output)
-            compressor.compress()
-            print(Fore.GREEN + f"Compression completed successfully. Output: {args.output}")
-        except (OSError, RuntimeError) as e:
-            print(Fore.RED + "Compression error:", e)
+        compressor = TarCompressor(validated, args.output, show_progress=args.progress)
+        compressor.compress()
+        print(Fore.GREEN + f"Compression completed successfully. Output: {args.output}")
     elif args.decompress:
         try:
             if args.output is not None:
-                decompressor = TarDecompressor(args.input, args.output)
+                    decompressor = TarDecompressor(args.input, args.output, show_progress=args.progress)
             else:
                 # If no output, extract to current directory (preserve absolute paths)
-                decompressor = TarDecompressor(args.input, None)
+                    decompressor = TarDecompressor(args.input, None, show_progress=args.progress)
             decompressor.decompress()
         except (OSError, RuntimeError) as e:
             print(Fore.RED + "Decompression error:", e)
