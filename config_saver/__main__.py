@@ -1,15 +1,20 @@
+#!/usr/bin/env python3
+
 """Main module to demonstrate YAML parsing and tar compression"""
 import argparse
-from colorama import init, Fore
-from lib.tar_compressor.tar_compressor import TarCompressor
-from lib.parser.parser import Parser
-from lib.models.model import Model
-from lib.tar_compressor.tar_decompressor import TarDecompressor
+
+from colorama import Fore, init
+
+from config_saver import __version__
+
+from .lib.models.model import Model
+from .lib.parser.parser import Parser
+from .lib.tar_compressor.tar_compressor import TarCompressor
+from .lib.tar_compressor.tar_decompressor import TarDecompressor
 
 init(autoreset=True)
 
 def main():
-    from __init__ import __version__
     parser = argparse.ArgumentParser(description="Tar compressor/decompressor utility", prog="config-saver")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--compress', '-c', action='store_true', help='Compress files/directories from YAML config')

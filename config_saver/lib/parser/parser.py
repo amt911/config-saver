@@ -1,8 +1,8 @@
 """Module providing a yaml and json parser with pydantic validation"""
 import yaml
 from pydantic import ValidationError
-from termcolor import colored
-from lib.models.model import Model
+from colorama import Fore, Style
+from models.model import Model
 
 class Parser:
     """Class representing a yaml and json parser for our model"""
@@ -18,7 +18,7 @@ class Parser:
                     exit(2)
                 self._data = validated_data.model_dump()
         except FileNotFoundError:
-            print(colored("File does not exist!", "red"))
+            print(f"{Fore.RED}File does not exist!{Style.RESET_ALL}")
             exit(1)
 
     def get_attr(self, attr_name: str):

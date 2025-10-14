@@ -1,4 +1,4 @@
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 """
 For versioning, the best practice is Semantic Versioning (SemVer):

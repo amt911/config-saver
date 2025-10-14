@@ -1,4 +1,0 @@
-pydantic
-pyyaml
-colorama
-tqdm
