@@ -2,9 +2,10 @@
 
 """Main module to demonstrate YAML parsing and tar compression"""
 import argparse
-
+import glob
+import os
+from datetime import datetime
 from colorama import Fore, init
-
 from config_saver import __version__
 
 from .lib.models.model import Model
@@ -19,6 +20,7 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--compress', '-c', action='store_true', help='Compress files/directories from YAML config')
     group.add_argument('--decompress', '-d', action='store_true', help='Decompress a tar file')
+    group.add_argument('--list', '-l', action='store_true', help='List all config-saver .tar.gz files in the current directory')
     parser.add_argument('--input', '-i', type=str, required=False, default='/etc/config-saver/default-config.yaml', help='Input YAML config (for compress, default: /etc/config-saver/default-config.yaml) or tar file (for decompress)')
     parser.add_argument('--output', '-o', type=str, default=None, help='Output tar file (for compress) or extraction directory (for decompress, optional)')
     parser.add_argument('--progress', '-P', action='store_true', help='Show progress bar during compression/decompression')
@@ -26,8 +28,24 @@ def main():
     args = parser.parse_args()
 
     # Set default output path if not provided
+    saves_dir = "/etc/config-saver/saves"
     if args.output is None and args.compress:
-        args.output = "output.tar.gz"
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        args.output = f"{saves_dir}/config-saver-{timestamp}.tar.gz"
+    # Ensure saves_dir exists when compressing
+    if args.compress:
+        os.makedirs(saves_dir, exist_ok=True)
+
+    if args.list:
+        # List all config-saver .tar.gz files in /etc/config-saver/saves
+        files = sorted(glob.glob(f"{saves_dir}/config-saver-*.tar.gz"))
+        if files:
+            print(f"Available config-saver tar.gz files in {saves_dir}:")
+            for f in files:
+                print(f"  {f}")
+        else:
+            print(f"No config-saver tar.gz files found in {saves_dir}.")
+        return
 
     if args.compress:
         try:
