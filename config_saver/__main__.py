@@ -19,7 +19,7 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--compress', '-c', action='store_true', help='Compress files/directories from YAML config')
     group.add_argument('--decompress', '-d', action='store_true', help='Decompress a tar file')
-    parser.add_argument('--input', '-i', type=str, required=True, help='Input YAML config (for compress) or tar file (for decompress)')
+    parser.add_argument('--input', '-i', type=str, required=False, default='/etc/config-saver/default-config.yaml', help='Input YAML config (for compress, default: /etc/config-saver/default-config.yaml) or tar file (for decompress)')
     parser.add_argument('--output', '-o', type=str, default=None, help='Output tar file (for compress) or extraction directory (for decompress, optional)')
     parser.add_argument('--progress', '-P', action='store_true', help='Show progress bar during compression/decompression')
     parser.add_argument('--version', '-v', action='version', version=f'%(prog)s {__version__}', help='Show program version and exit')
