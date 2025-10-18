@@ -4,15 +4,17 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import sys
 from datetime import datetime
 from typing import Optional
+
 from colorama import Fore, init
-import sys
 from pydantic import ValidationError
 
 from config_saver import __version__
-from .tar_compressor.tar_decompressor import TarDecompressor
-from config_saver.lib.cli_manager import BackupManager
+from config_saver.lib.backup_mapager.backup_manager import BackupManager
+
+from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
 
 init(autoreset=True)
 
