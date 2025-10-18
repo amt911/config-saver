@@ -13,6 +13,7 @@ import sys
 from rich.console import Console
 from rich.table import Table
 from rich.columns import Columns
+from rich.align import Align
 
 from config_saver import __version__
 from config_saver.lib.backup_mapager.backup_manager import BackupManager
@@ -70,18 +71,46 @@ class BackupTable:
 
         # Build a table per config and arrange them left-to-right using Columns
         tables: list[Table] = []
+        manager = BackupManager(self.saves_dir)
+
         for cfgname, timestamps in grouped.items():
             table = Table(show_header=True, header_style="bold bright_blue", row_styles=["none", "dim"])
-            # Left column: ordinal abbreviation in English (1st, 2nd, 3rd, ...)
+            # Left column: ordinal number
             table.add_column("No.", width=5, justify="center", no_wrap=True)
-            # Right column: timestamps under the config name (prevent wrapping for consistent row height)
-            table.add_column(cfgname, overflow="fold", justify="center", no_wrap=True)
+            # Timestamp column
+            table.add_column("Date", overflow="fold", justify="center", no_wrap=True)
+            # Description column: header centered, content left-justified
+            table.add_column(Align.center("Description"), overflow="fold", justify="left")
 
             # sort timestamps descending (newest first)
             timestamps.sort(reverse=True)
 
+            # We need to map timestamp back to a specific archive path to fetch its description.
+            # The manager.list_archives already returned full paths; we'll rebuild a small lookup
+            # by scanning the saves tree for archives that match this cfgname.
+            all_archives = manager.list_archives()
+            # Filter archives that belong to this cfgname
+            cfg_archives = [p for p in all_archives if os.path.basename(p).startswith(cfgname + "-")]
+            # Build a mapping from timestamp string (YYYYMMDD-HHMMSS) to archive path
+            archive_map: dict[str, str] = {}
+            for p in cfg_archives:
+                m = self.FILENAME_PATTERN.search(os.path.basename(p))
+                if m:
+                    archive_map[m.group(2)] = p
+
             for i, t in enumerate(timestamps, start=1):
-                table.add_row(str(i), t.strftime("%Y-%m-%d %H:%M:%S"))
+                ts_str = t.strftime("%Y%m%d-%H%M%S")
+                desc = None
+                if ts_str in archive_map:
+                    desc = manager.get_description_for_archive(archive_map[ts_str])
+
+                # Truncate description for display
+                if desc:
+                    preview = desc if len(desc) <= 60 else desc[:57] + "..."
+                else:
+                    preview = ""
+
+                table.add_row(str(i), t.strftime("%Y-%m-%d %H:%M:%S"), preview)
             tables.append(table)
 
     # Print header then the columns (left-to-right). Use 2 spaces padding between tables and do not expand to terminal width.

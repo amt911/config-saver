@@ -111,6 +111,26 @@ class BackupManager:
         archive_name = f"{cfg_basename}-{timestamp}.tar.gz"
         return self._compress_yaml_to_directory(yaml_path, ts_dir, archive_name, description=description, show_progress=show_progress)
 
+    def get_description_for_archive(self, archive_path: str) -> Optional[str]:
+        """Return the description text associated with a given archive, if present.
+
+        The description is expected to live in the same timestamp directory as the
+        archive under the name `description.txt`.
+        """
+        if not archive_path:
+            return None
+
+        # The archive should be inside a timestamp dir: .../<cfgname>/<timestamp>/<archive>
+        archive_dir = os.path.dirname(os.path.abspath(archive_path))
+        desc_path = os.path.join(archive_dir, "description.txt")
+        if os.path.exists(desc_path) and os.path.isfile(desc_path):
+            try:
+                with open(desc_path, "r", encoding="utf-8") as fh:
+                    return fh.read().strip()
+            except (IOError, PermissionError):
+                return None
+        return None
+
     def compress_directory_of_yamls(
         self,
         input_dir: str,
