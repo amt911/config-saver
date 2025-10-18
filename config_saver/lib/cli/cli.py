@@ -71,16 +71,23 @@ class BackupTable:
         # Build a table per config and arrange them left-to-right using Columns
         tables: list[Table] = []
         for cfgname, timestamps in grouped.items():
-            table = Table(show_header=True, header_style="bold magenta")
-            table.add_column(cfgname, overflow="fold", justify="center")
-            # sort timestamps descending
+            table = Table(show_header=True, header_style="bold bright_blue", row_styles=["none", "dim"])
+            # Left column: ordinal abbreviation in English (1st, 2nd, 3rd, ...)
+            table.add_column("No.", width=5, justify="center", no_wrap=True)
+            # Right column: timestamps under the config name (prevent wrapping for consistent row height)
+            table.add_column(cfgname, overflow="fold", justify="center", no_wrap=True)
+
+            # sort timestamps descending (newest first)
             timestamps.sort(reverse=True)
-            for t in timestamps:
-                table.add_row(t.strftime("%Y-%m-%d %H:%M:%S"))
+
+            for i, t in enumerate(timestamps, start=1):
+                table.add_row(str(i), t.strftime("%Y-%m-%d %H:%M:%S"))
             tables.append(table)
 
-        # Print as columns (left-to-right). Use 2 spaces padding between tables and do not expand to terminal width.
+    # Print header then the columns (left-to-right). Use 2 spaces padding between tables and do not expand to terminal width.
+        console.rule("Saved configurations")
         console.print(Columns(tables, expand=False, padding=(0, 2), equal=False))
+        console.rule()
 
 
 
