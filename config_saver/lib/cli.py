@@ -7,6 +7,8 @@ import os
 from datetime import datetime
 from typing import Optional
 from colorama import Fore, init
+import sys
+from pydantic import ValidationError
 
 from config_saver import __version__
 from .parser.parser import Parser
@@ -41,41 +43,60 @@ class CLI:
         args = self.parse_args()
 
         saves_dir = os.path.expanduser("~/.config/config-saver")
-        if args.output is None and args.compress:
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            args.output = f"{saves_dir}/config-saver-{timestamp}.tar.gz"
+        try:
+            if args.output is None and args.compress:
+                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                args.output = f"{saves_dir}/config-saver-{timestamp}.tar.gz"
 
-        # Ensure saves_dir exists when compressing. If creation fails, fall back to XDG data dir
-        if args.compress:
-            try:
-                os.makedirs(saves_dir, exist_ok=True)
-            except PermissionError:
-                user_saves = os.path.expanduser("~/.local/share/config-saver/saves")
-                os.makedirs(user_saves, exist_ok=True)
-                print(Fore.YELLOW + f"Warning: cannot create {saves_dir} (permission denied). Using {user_saves} instead.")
-                if args.output and args.output.startswith(saves_dir):
-                    args.output = args.output.replace(saves_dir, user_saves)
+            # Ensure saves_dir exists when compressing. If creation fails, fall back to XDG data dir
+            if args.compress:
+                try:
+                    os.makedirs(saves_dir, exist_ok=True)
+                except PermissionError:
+                    user_saves = os.path.expanduser("~/.local/share/config-saver/saves")
+                    os.makedirs(user_saves, exist_ok=True)
+                    print(Fore.YELLOW + f"Warning: cannot create {saves_dir} (permission denied). Using {user_saves} instead.")
+                    if args.output and args.output.startswith(saves_dir):
+                        args.output = args.output.replace(saves_dir, user_saves)
 
-        if args.list:
-            files = sorted(glob.glob(f"{saves_dir}/config-saver-*.tar.gz"))
-            if files:
-                print(f"Available config-saver tar.gz files in {saves_dir}:")
-                for f in files:
-                    print(f"  {f}")
-            else:
-                print(f"No config-saver tar.gz files found in {saves_dir}.")
-            return
+            if args.list:
+                files = sorted(glob.glob(f"{saves_dir}/config-saver-*.tar.gz"))
+                if files:
+                    print(f"Available config-saver tar.gz files in {saves_dir}:")
+                    for f in files:
+                        print(f"  {f}")
+                else:
+                    print(f"No config-saver tar.gz files found in {saves_dir}.")
+                return
 
-        if args.compress:
-            # Load and validate YAML. Parser now raises on errors.
-            yaml_parser = Parser(args.input)
-            validated = Model.model_validate(yaml_parser.get_data())
-            compressor = TarCompressor(validated, args.output, show_progress=args.progress)
-            compressor.compress()
-            print(Fore.GREEN + f"Compression completed successfully. Output: {args.output}")
-            return
+            if args.compress:
+                # Load and validate YAML. Parser now raises on errors.
+                yaml_parser = Parser(args.input)
+                validated = Model.model_validate(yaml_parser.get_data())
+                compressor = TarCompressor(validated, args.output, show_progress=args.progress)
+                compressor.compress()
+                print(Fore.GREEN + f"Compression completed successfully. Output: {args.output}")
+                return
 
-        if args.decompress:
-            decompressor = TarDecompressor(args.input, args.output, show_progress=args.progress)
-            decompressor.decompress()
-            return
+            if args.decompress:
+                decompressor = TarDecompressor(args.input, args.output, show_progress=args.progress)
+                decompressor.decompress()
+                return
+
+        except FileNotFoundError as e:
+            print(Fore.RED + f"Configuration file not found: {e}")
+            sys.exit(2)
+        except ValidationError as e:
+            # pydantic validation error
+            print(Fore.RED + "Validation error in configuration:")
+            print(Fore.RED + str(e))
+            sys.exit(3)
+        except PermissionError as e:
+            print(Fore.RED + f"Permission error: {e}")
+            sys.exit(4)
+        except RuntimeError as e:
+            print(Fore.RED + f"Runtime error: {e}")
+            sys.exit(5)
+        except Exception as e:
+            print(Fore.RED + f"Unexpected error: {e}")
+            sys.exit(10)
