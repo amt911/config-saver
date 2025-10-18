@@ -15,7 +15,7 @@ from rich.table import Table
 from rich.columns import Columns
 
 from config_saver import __version__
-from config_saver.lib.cli_manager import BackupManager
+from config_saver.lib.backup_mapager.backup_manager import BackupManager
 from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
 
 init(autoreset=True)
@@ -109,6 +109,7 @@ class CLI:
         parser.add_argument('--input', '-i', type=str, default=self.DEFAULT_SYSTEM_CONFIG, help='Input YAML config (for compress) or tar file (for decompress)')
         parser.add_argument('--output', '-o', type=str, default=None, help='Output tar file (for compress) or extraction directory (for decompress, optional)')
         parser.add_argument('--progress', '-P', action='store_true', help='Show progress bar during compression/decompression')
+        parser.add_argument('--description', '-m', type=str, default=None, help='Optional description to save alongside the archive')
         parser.add_argument('--version', '-v', action='version', version=f'%(prog)s {__version__}', help='Show program version and exit')
         return parser.parse_args(self.argv)
 
@@ -127,7 +128,9 @@ class CLI:
                     sys.exit(6)
 
                 try:
-                    created = manager.compress_directory_of_yamls(args.input, timestamp, show_progress=args.progress)
+                    created = manager.compress_directory_of_yamls(
+                        args.input, timestamp, show_progress=args.progress, description=args.description
+                    )
                 except FileNotFoundError as e:
                     print(Fore.RED + str(e))
                     sys.exit(2)
@@ -150,8 +153,19 @@ class CLI:
 
             if args.compress:
                 # Single-file compress delegated to BackupManager
-                manager.compress_yaml_file(args.input, args.output, show_progress=args.progress)
-                print(Fore.GREEN + f"Compression completed successfully. Output: {args.output}")
+                # If the user supplied a description, create a per-config timestamped
+                # directory and store both the archive and the description there.
+                if args.description:
+                    # determine config basename from input yaml path
+                    cfg_basename = os.path.splitext(os.path.basename(args.input))[0]
+                    cfg_dir = os.path.join(saves_dir, "configs", cfg_basename)
+                    out_path = manager.compress_yaml_to_timestamp_dir(
+                        args.input, cfg_dir, timestamp, description=args.description, show_progress=args.progress
+                    )
+                    print(Fore.GREEN + f"Compression completed successfully. Output: {out_path}")
+                else:
+                    manager.compress_yaml_file(args.input, args.output, show_progress=args.progress)
+                    print(Fore.GREEN + f"Compression completed successfully. Output: {args.output}")
                 return
 
             if args.decompress:
