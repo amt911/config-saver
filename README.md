@@ -35,7 +35,7 @@ This will install `mypy` and type stubs.
 
 ### Compression
 
-Compress configuration to default location:
+- Compress all system configs (default behaviour). This will read YAMLs from `/etc/config-saver/configs` and create per-config archives under `~/.config/config-saver`:
 
 ```sh
 config-saver --compress
@@ -51,6 +51,18 @@ config-saver --compress --output archive.tar.gz
 config-saver --progress --compress --output archive.tar.gz
 ```
 
+Compress with a short description. This creates a per-config timestamp directory and a `description.txt` next to the archive:
+
+```sh
+config-saver --compress -m "Daily backup before upgrade"
+```
+
+Compress a single config file to a specific output path (no description):
+
+```sh
+config-saver --compress -i /etc/config-saver/configs/default-config.yaml -o ~/backups/default-config-20251018.tar.gz
+```
+
 ### Decompression
 
 Decompress a tar.gz archive:
@@ -60,6 +72,23 @@ config-saver --decompress archive.tar.gz
 # With progress bar
 config-saver --progress --decompress archive.tar.gz
 ```
+
+### Listing
+
+List saved archives (shows date + description preview):
+
+```sh
+config-saver --list
+```
+
+#### Examples (Compression)
+
+Compress all system configs (default behaviour). This will read YAMLs from `/etc/config-saver/configs` and create per-config archives under `~/.config/config-saver`:
+
+```sh
+config-saver --compress
+```
+
 
 ## Main CLI Options
 
@@ -71,6 +100,16 @@ config-saver --progress --decompress archive.tar.gz
 - `--output`/`-o OUTPUT`  Output tar file (for compress) or extraction directory (for decompress, optional)
 - `--progress`/`-P`: Show progress bar during compression/decompression
 - `--version`/`-v`: Show program version and exit
+
+- `--description`/`-m DESCRIPTION`: Optional short description to save alongside a created archive. When provided, the CLI will create a per-config timestamp directory and store both the `.tar.gz` and a `description.txt` file inside:
+
+```text
+~/.config/config-saver/configs/<cfgname>/<timestamp>/
+  <cfgname>-<timestamp>.tar.gz
+  description.txt  # contains the provided description (UTF-8)
+```
+
+If no `--description` is given, archives are stored in the original (backwards-compatible) locations.
 
 ## Example YAML Configuration
 
