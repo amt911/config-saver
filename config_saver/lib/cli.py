@@ -73,7 +73,7 @@ class CLI:
                 return
 
             if args.compress:
-                # Load and validate YAML. Parser now raises on errors and exposes the Model
+                # Load and validate YAML. Parser now raises exceptions and exposes the Model
                 yaml_parser = Parser(args.input)
                 model = yaml_parser.get_model()
                 compressor = TarCompressor(model, args.output, show_progress=args.progress)
@@ -88,7 +88,7 @@ class CLI:
 
         except FileNotFoundError as e:
             # e.filename may not be present if FileNotFoundError was raised manually
-            if hasattr(e, "filename") and e.filename:
+            if hasattr(e, "filename") and e.filename is not None:
                 print(Fore.RED + f"Configuration file not found: {e.filename}")
             else:
                 print(Fore.RED + f"Configuration file not found: {str(e)}")
