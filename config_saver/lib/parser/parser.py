@@ -1,6 +1,5 @@
 """Module providing a yaml and json parser with pydantic validation"""
 import yaml
-from pydantic import ValidationError
 from config_saver.lib.models.model import Model
 
 class Parser:

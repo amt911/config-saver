@@ -1,7 +1,7 @@
 """Module providing a tar compressor based on a YAML configuration with pydantic validation"""
 import os
 import tarfile
-from typing import Optional, Any
+from typing import Optional
 
 from colorama import init
 from tqdm import tqdm

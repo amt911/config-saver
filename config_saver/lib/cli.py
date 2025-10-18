@@ -12,7 +12,6 @@ from pydantic import ValidationError
 
 from config_saver import __version__
 from .parser.parser import Parser
-from .models.model import Model
 from .tar_compressor.tar_compressor import TarCompressor
 from .tar_compressor.tar_decompressor import TarDecompressor
 
@@ -88,7 +87,11 @@ class CLI:
                 return
 
         except FileNotFoundError as e:
-            print(Fore.RED + f"Configuration file not found: {e.filename}")
+            # e.filename may not be present if FileNotFoundError was raised manually
+            if hasattr(e, "filename") and e.filename:
+                print(Fore.RED + f"Configuration file not found: {e.filename}")
+            else:
+                print(Fore.RED + f"Configuration file not found: {str(e)}")
             sys.exit(2)
         except ValidationError as e:
             # pydantic validation error
