@@ -2,25 +2,91 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import os
-import sys
+import re
 from datetime import datetime
 from typing import Optional
 
 from colorama import Fore, init
 from pydantic import ValidationError
+import sys
+from rich.console import Console
+from rich.table import Table
+from rich.columns import Columns
 
 from config_saver import __version__
-from config_saver.lib.backup_mapager.backup_manager import BackupManager
-
+from config_saver.lib.cli_manager import BackupManager
 from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
 
 init(autoreset=True)
 
 
+class BackupTable:
+    """Helper to collect backup archives and render a table of dates.
+
+    This class prefers to list per-config archives under <saves_dir>/configs but
+    will fall back to top-level archives. It delegates listing to BackupManager.
+    """
+
+    FILENAME_PATTERN = re.compile(r"config-saver-(\d{8}-\d{6})\.tar\.gz$")
+
+    def __init__(self, saves_dir: str):
+        self.saves_dir = saves_dir
+        self.user_saves = os.path.expanduser("~/.local/share/config-saver/saves")
+
+    def _gather_files(self) -> list[str]:
+        manager = BackupManager(self.saves_dir)
+        return manager.list_archives()
+
+    def _parse_ts(self, path: str) -> datetime:
+        name = os.path.basename(path)
+        m = self.FILENAME_PATTERN.search(name)
+        if m:
+            try:
+                return datetime.strptime(m.group(1), "%Y%m%d-%H%M%S")
+            except ValueError:
+                pass
+        return datetime.fromtimestamp(os.path.getmtime(path))
+
+    def render(self) -> None:
+        files = self._gather_files()
+        if not files:
+            print(f"No config-saver tar.gz files found in {self.saves_dir} or {self.user_saves}.")
+            return
+
+        # Group timestamps by config basename
+        grouped: dict[str, list[datetime]] = {}
+        for f in files:
+            base = os.path.splitext(os.path.basename(f))[0]
+            # base is like '<name>-<timestamp>' or 'config-saver-<timestamp>'
+            # For per-config buckets we expect '<cfgname>-<timestamp>' so split on last '-'
+            if '-' in base:
+                cfgname = '-'.join(base.split('-')[:-1])
+            else:
+                cfgname = base
+
+            grouped.setdefault(cfgname, []).append(self._parse_ts(f))
+
+        console = Console()
+
+        # Build a table per config and arrange them left-to-right using Columns
+        tables: list[Table] = []
+        for cfgname, timestamps in grouped.items():
+            table = Table(show_header=True, header_style="bold magenta")
+            table.add_column(cfgname, overflow="fold")
+            # sort timestamps descending
+            timestamps.sort(reverse=True)
+            for t in timestamps:
+                table.add_row(t.strftime("%Y-%m-%d %H:%M:%S"))
+            tables.append(table)
+
+        # Print as columns (left-to-right). Use 2 spaces padding between tables and do not expand to terminal width.
+        console.print(Columns(tables, expand=False, padding=(0, 2), equal=False))
+
+
+
 class CLI:
-    """Orchestrates CLI parsing and actions for config-saver (internal lib placement)."""
+    """Orchestrates CLI parsing and actions for config-saver."""
 
     # Default to the directory containing multiple YAML configs
     DEFAULT_SYSTEM_CONFIG = "/etc/config-saver/configs"
@@ -44,7 +110,7 @@ class CLI:
         args = self.parse_args()
 
         manager = BackupManager()
-        saves_dir = manager.saves_dir
+        saves_dir = manager.ensure_saves_dir()
         try:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -64,32 +130,16 @@ class CLI:
                     print(Fore.GREEN + f"Compression completed successfully. Output: {p}")
                 return
 
-            # Ensure saves dir exists for single-file behavior
-            if args.compress:
-                manager.ensure_saves_dir()
+            # Ensure saves dir exists for single-file behavior (manager already ensured above)
 
             # If the user didn't pass an explicit output for single-file compress, set default name using timestamp
             if args.output is None and args.compress:
                 args.output = os.path.join(saves_dir, f"config-saver-{timestamp}.tar.gz")
 
             if args.list:
-                # Prefer listing the per-config archives under saves_dir/configs
-                configs_root = os.path.join(saves_dir, "configs")
-                files = []
-                if os.path.isdir(configs_root):
-                    # recursive glob for any tar.gz under configs_root
-                    files = sorted(glob.glob(os.path.join(configs_root, "**", "*.tar.gz"), recursive=True))
-
-                # fallback: list top-level tar.gz files in saves_dir
-                if not files:
-                    files = sorted(glob.glob(f"{saves_dir}/*.tar.gz"))
-
-                if files:
-                    print("Available config-saver tar.gz files:")
-                    for f in files:
-                        print(f"  {f}")
-                else:
-                    print(f"No config-saver tar.gz files found in {saves_dir} or {configs_root}.")
+                # Use BackupTable to render a table of dates for saved archives
+                table = BackupTable(saves_dir)
+                table.render()
                 return
 
             if args.compress:

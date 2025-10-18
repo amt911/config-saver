@@ -15,7 +15,8 @@ dependencies = [
     "pydantic",
     "colorama",
     "tqdm",
-    "pyyaml"
+    "pyyaml",
+    "rich"
 ]
 
 [[project.authors]]
