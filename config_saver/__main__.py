@@ -27,14 +27,22 @@ def main():
     parser.add_argument('--version', '-v', action='version', version=f'%(prog)s {__version__}', help='Show program version and exit')
     args = parser.parse_args()
 
-    # Set default output path if not provided
-    saves_dir = "/etc/config-saver/saves"
+    # Set default output path if not provided (use user config dir by default)
+    saves_dir = os.path.expanduser("~/.config/config-saver")
     if args.output is None and args.compress:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         args.output = f"{saves_dir}/config-saver-{timestamp}.tar.gz"
-    # Ensure saves_dir exists when compressing
+    # Ensure saves_dir exists when compressing. If creation fails, fall back to XDG data dir
     if args.compress:
-        os.makedirs(saves_dir, exist_ok=True)
+        try:
+            os.makedirs(saves_dir, exist_ok=True)
+        except PermissionError:
+            user_saves = os.path.expanduser("~/.local/share/config-saver/saves")
+            os.makedirs(user_saves, exist_ok=True)
+            print(Fore.YELLOW + f"Warning: cannot create {saves_dir} (permission denied). Using {user_saves} instead.")
+            # Update args.output to point to the fallback location
+            if args.output and args.output.startswith(saves_dir):
+                args.output = args.output.replace(saves_dir, user_saves)
 
     if args.list:
         # List all config-saver .tar.gz files in /etc/config-saver/saves
