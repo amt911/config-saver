@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """Entry point: delegate to the CLI implementation in the lib package."""
-from .lib.cli import CLI
+from config_saver.lib.cli.cli import CLI
 
 
 def main():
