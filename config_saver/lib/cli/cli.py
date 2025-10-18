@@ -28,7 +28,8 @@ class BackupTable:
     will fall back to top-level archives. It delegates listing to BackupManager.
     """
 
-    FILENAME_PATTERN = re.compile(r"config-saver-(\d{8}-\d{6})\.tar\.gz$")
+    # Matches <name>-YYYYMMDD-HHMMSS.tar.gz
+    FILENAME_PATTERN = re.compile(r"(.+)-(\d{8}-\d{6})\.tar\.gz$")
 
     def __init__(self, saves_dir: str):
         self.saves_dir = saves_dir
@@ -57,14 +58,12 @@ class BackupTable:
         # Group timestamps by config basename
         grouped: dict[str, list[datetime]] = {}
         for f in files:
-            base = os.path.splitext(os.path.basename(f))[0]
-            # base is like '<name>-<timestamp>' or 'config-saver-<timestamp>'
-            # For per-config buckets we expect '<cfgname>-<timestamp>' so split on last '-'
-            if '-' in base:
-                cfgname = '-'.join(base.split('-')[:-1])
+            name = os.path.basename(f)
+            m = self.FILENAME_PATTERN.match(name)
+            if m:
+                cfgname = m.group(1)
             else:
-                cfgname = base
-
+                cfgname = os.path.splitext(name)[0]
             grouped.setdefault(cfgname, []).append(self._parse_ts(f))
 
         console = Console()
@@ -73,7 +72,7 @@ class BackupTable:
         tables: list[Table] = []
         for cfgname, timestamps in grouped.items():
             table = Table(show_header=True, header_style="bold magenta")
-            table.add_column(cfgname, overflow="fold")
+            table.add_column(cfgname, overflow="fold", justify="center")
             # sort timestamps descending
             timestamps.sort(reverse=True)
             for t in timestamps:
