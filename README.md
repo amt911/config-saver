@@ -74,6 +74,10 @@ config-saver --progress --decompress archive.tar.gz
 
 ## Example YAML Configuration
 
+Configuration files must go to ```/etc/config-saver/configs/```, by default there is a sample config at ```/etc/config-saver/configs/default-config.yaml```, which you can modify, delete or rename it.
+
+An example YAML configuration file:
+
 ```yaml
 directories:
     - /home/andres/.fonts
