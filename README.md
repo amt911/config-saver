@@ -35,12 +35,20 @@ This will install `mypy` and type stubs.
 
 ### Compression
 
-Compress a directory or file:
+Compress configuration to default location:
 
 ```sh
-config-saver --compress folder/ archive.tar.gz
+config-saver --compress
 # With progress bar
-config-saver --compress folder/ archive.tar.gz --progress
+config-saver --progress --compress
+```
+
+Compress configuration to custom location:
+
+```sh
+config-saver --compress --output archive.tar.gz
+# With progress bar
+config-saver --progress --compress --output archive.tar.gz
 ```
 
 ### Decompression
@@ -48,48 +56,31 @@ config-saver --compress folder/ archive.tar.gz --progress
 Decompress a tar.gz archive:
 
 ```sh
-config-saver --decompress archive.tar.gz --output destination_folder/
+config-saver --decompress archive.tar.gz
 # With progress bar
-config-saver --decompress archive.tar.gz --output destination_folder/ --progress
+config-saver --progress --decompress archive.tar.gz
 ```
 
 ## Main CLI Options
 
-- `--compress` / `-c`: Compress file/directory.
-- `--decompress` / `-d`: Decompress tar.gz archive.
-- `--output` / `-o`: Output directory for decompression.
-- `--progress` / `-P`: Show progress bar.
-- `--validate`: Validate configuration file.
-- `--convert`: Convert between YAML and JSON.
-
-## Project Structure
-
-```
-config-saver/
-├── __main__.py           # CLI entry point
-├── lib/
-│   ├── json_parser/      # JSON parser and validator
-│   ├── models/           # Pydantic models
-│   └── tar_compressor/   # Tar compressor and decompressor
-├── configs/
-│   └── default/
-│       └── config.yaml   # Example configuration
-├── dependencies/         # Requirements
-└── README.md
-```
+- `-h`/`--help`: Show this help message and exit
+- `--compress`/`-c`: Compress files/directories from YAML config
+- `--decompress`/`-d`: Decompress a tar file
+- `--list`/`-l`: List saved config-saver tar.gz files
+- `--input`/`-i INPUT`: Input YAML config (for compress) or tar file (for decompress)
+- `--output`/`-o OUTPUT`  Output tar file (for compress) or extraction directory (for decompress, optional)
+- `--progress`/`-P`: Show progress bar during compression/decompression
+- `--version`/`-v`: Show program version and exit
 
 ## Example YAML Configuration
 
 ```yaml
-# configs/default/config.yaml
-config:
-	name: example
-	version: 1.0
-	files:
-		- path: /path/file1
-			type: json
-		- path: /path/file2
-			type: yaml
+directories:
+    - /home/andres/.fonts
+    - source: /home/andres/Downloads
+      files:
+        - WSDL.pdf
+        - WSDL-1.pdf
 ```
 
 ## Credits
