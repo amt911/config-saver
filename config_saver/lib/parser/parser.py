@@ -11,6 +11,8 @@ class Parser:
         with open(self.filename, "r", encoding="utf-8") as yaml_file:
             yaml_data = yaml.safe_load(yaml_file)
             validated_data = Model.model_validate(yaml_data)
+            # store both the pydantic Model instance and a dumped dict
+            self._model = validated_data
             self._data = validated_data.model_dump()
 
     def get_attr(self, attr_name: str):
@@ -20,3 +22,7 @@ class Parser:
     def get_data(self):
         """Return the parsed data as a dictionary"""
         return self._data
+
+    def get_model(self) -> Model:
+        """Return the validated pydantic Model instance."""
+        return self._model

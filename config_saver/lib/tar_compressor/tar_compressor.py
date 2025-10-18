@@ -1,7 +1,7 @@
 """Module providing a tar compressor based on a YAML configuration with pydantic validation"""
 import os
 import tarfile
-from typing import Optional
+from typing import Optional, Any
 
 from colorama import init
 from tqdm import tqdm
@@ -15,6 +15,7 @@ init(autoreset=True)
 class TarCompressor:
     """Class representing a tar compressor"""
     def __init__(self, yaml_data: Model, output_path: str = "output.tar.gz", base_dir: Optional[str] = None, show_progress: bool = False):
+        # yaml_data is expected to be a validated Model instance
         self.yaml_data = yaml_data
         self.output_path = output_path
         self.base_dir = base_dir or os.getcwd()

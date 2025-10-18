@@ -54,7 +54,11 @@ class CLI:
                     os.makedirs(saves_dir, exist_ok=True)
                 except PermissionError:
                     user_saves = os.path.expanduser("~/.local/share/config-saver/saves")
-                    os.makedirs(user_saves, exist_ok=True)
+                    try:
+                        os.makedirs(user_saves, exist_ok=True)
+                    except PermissionError:
+                        print(Fore.RED + f"Error: cannot create fallback directory {user_saves} (permission denied). Exiting.")
+                        sys.exit(1)
                     print(Fore.YELLOW + f"Warning: cannot create {saves_dir} (permission denied). Using {user_saves} instead.")
                     if args.output and args.output.startswith(saves_dir):
                         args.output = args.output.replace(saves_dir, user_saves)
@@ -70,10 +74,10 @@ class CLI:
                 return
 
             if args.compress:
-                # Load and validate YAML. Parser now raises on errors.
+                # Load and validate YAML. Parser now raises on errors and exposes the Model
                 yaml_parser = Parser(args.input)
-                validated = Model.model_validate(yaml_parser.get_data())
-                compressor = TarCompressor(validated, args.output, show_progress=args.progress)
+                model = yaml_parser.get_model()
+                compressor = TarCompressor(model, args.output, show_progress=args.progress)
                 compressor.compress()
                 print(Fore.GREEN + f"Compression completed successfully. Output: {args.output}")
                 return
@@ -84,7 +88,7 @@ class CLI:
                 return
 
         except FileNotFoundError as e:
-            print(Fore.RED + f"Configuration file not found: {e}")
+            print(Fore.RED + f"Configuration file not found: {e.filename}")
             sys.exit(2)
         except ValidationError as e:
             # pydantic validation error
