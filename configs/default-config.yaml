@@ -67,6 +67,7 @@ directories:
         - spectaclerc
         - systemmonitorrc
         - systemsettingsrc
+        - kwinoutputconfig.json
 
     - source: "$SHARE_DIR"
       files:
@@ -83,6 +84,9 @@ directories:
         - plasma-systemmonitor
         - user-places.xbel
 
+    - source: "$LOCALSHARE_DIR"
+      files:
+        - kscreen
     - source: "$HOME"
       files:
         - .fonts

@@ -11,6 +11,7 @@ class PathExpander:
                 "CONFIG_DIR": os.path.expanduser("~/.config"),
                 "SHARE_DIR": os.path.expanduser("~/.local/share"),
                 "BIN_DIR": os.path.expanduser("~/.local/bin"),
+                "LOCALSHARE_DIR": os.path.expanduser("~/.local/share"),
             }
         self.custom_vars = custom_vars
 
