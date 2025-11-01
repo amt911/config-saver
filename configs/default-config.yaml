@@ -1,17 +1,20 @@
 directories:
     - source: "$CONFIG_DIR"
       files:
+        - breezerc
+        - dolphinrc
         - gtk-2.0
         - gtk-3.0
         - gtk-4.0
+        - gtkrc
+        - gtkrc-2.0
         - kate
         - Kvantum
-        - latte
-        - dolphinrc
         - katerc
         - konsolerc
         - kcminputrc
         - kdeglobals
+        - kcmfonts
         - kglobalshortcutsrc
         - klipperrc
         - krunnerrc
@@ -19,17 +22,51 @@ directories:
         - ksmserverrc
         - kwinrc
         - kwinrulesrc
+        - ksplashrc
+        - khotkeysrc
+        - klaunchrc
+        - kfontinstuirc
+        - latte
+        - lattedockrc
+        - lightlyrc
+        - oxygenrc
         - plasma-org.kde.plasma.desktop-appletsrc
         - plasmarc
         - plasmashellrc
-        - gtkrc
-        - gtkrc-2.0
-        - lattedockrc
-        - breezerc
-        - oxygenrc
-        - lightlyrc
-        - ksplashrc
-        - khotkeysrc
+        - Trolltech.conf
+        # Additional items from README/feature list (added if missing)
+        - kactivitymanagerdrc
+        - kactivitymanagerd-switcher
+        - kactivitymanagerd-statsrc
+        - kactivitymanagerd-pluginsrc
+        - baloofilerc
+        - kuriikwsfiltersrc
+        - plasmanotifyrc
+        - plasma-localerc
+        - ktimezonedrc
+        - kaccessrc
+        - mimeapps.list
+        - user-dirs.dirs
+        - PlasmaUserFeedback
+        - kxkbrc
+        - touchpadxlibinputrc
+        - kgammarc
+        - powermanagementprofilesrc
+        - bluedevilglobalrc
+        - kdeconnect
+        - device_automounter_kcmrc
+        - kded_device_automounterrc
+        - arkrc
+        - filelightrc
+        - katevirc
+        - kate-externaltoolspluginrc
+        - kcalcrc
+        - partitionmanagerrc
+        - konsolesshconfig
+        - krusaderrc
+        - spectaclerc
+        - systemmonitorrc
+        - systemsettingsrc
 
     - source: "$SHARE_DIR"
       files:
@@ -41,6 +78,10 @@ directories:
         - aurorae
         - icons
         - wallpapers
+        # Additional share items
+        - kservices5/searchproviders
+        - plasma-systemmonitor
+        - user-places.xbel
 
     - source: "$HOME"
       files:
@@ -49,3 +90,9 @@ directories:
         - .icons
 
     - "$HOME/Pictures/Nice Wallpapers"
+    - source: "$HOME/.ssh"
+      files:
+        - id_ed25519
+        - id_ed25519.pub
+    # System connections (NetworkManager) - outside user home
+    - /etc/NetworkManager/system-connections
