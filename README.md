@@ -113,7 +113,11 @@ If no `--description` is given, archives are stored in the original (backwards-c
 
 ## User-independent path normalization
 
-Config-saver automatically makes your backups portable across different users. When compressing files from your home directory (e.g., `/home/andres/.fonts`), the tool normalizes the paths by replacing your username with a generic placeholder `home/user/`.
+Config-saver automatically makes your backups portable across different users by normalizing both **file paths** and **file contents**.
+
+### Path normalization
+
+When compressing files from your home directory (e.g., `/home/andres/.fonts`), the tool normalizes the paths by replacing your username with a generic placeholder `home/user/`.
 
 **During compression:**
 
@@ -123,13 +127,42 @@ Config-saver automatically makes your backups portable across different users. W
 
 - `home/user/.fonts/myfont.ttf` → extracted to `/home/currentuser/.fonts/myfont.ttf`
 
+### Content normalization
+
+Additionally, config-saver scans **text files** (configuration files, scripts, etc.) and replaces hardcoded home directory paths in their content:
+
+**During compression (user `andres`):**
+
+```text
+Original file content:
+  cache_location = /home/andres/.cache/myapp
+  data_path = /home/andres/Documents/data.db
+
+Stored in archive:
+  cache_location = <<<HOME_PLACEHOLDER>>>/.cache/myapp
+  data_path = <<<HOME_PLACEHOLDER>>>/Documents/data.db
+```
+
+**During decompression (user `maria`):**
+
+```text
+Extracted file content:
+  cache_location = /home/maria/.cache/myapp
+  data_path = /home/maria/Documents/data.db
+```
+
 This means:
 
 - You can create a backup as user `andres`
 - Share the `.tar.gz` file with another user (e.g., `maria`)
 - When `maria` decompresses it, files go to `/home/maria/` automatically
+- **Config files with hardcoded paths** are automatically updated to reference `/home/maria/`
 
-**Note:** Files outside the home directory (e.g., `/etc/`, `/opt/`) are stored with their absolute paths and will be restored to the same locations.
+**Note:**
+
+- Files outside the home directory (e.g., `/etc/`, `/opt/`) are stored with their absolute paths and will be restored to the same locations.
+- Binary files are preserved as-is; only text files have their content normalized.
+- The placeholder `<<<HOME_PLACEHOLDER>>>` is used internally and is automatically replaced during extraction.
 
 ## Path variable expansion
 
