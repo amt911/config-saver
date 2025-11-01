@@ -111,7 +111,56 @@ config-saver --compress
 
 If no `--description` is given, archives are stored in the original (backwards-compatible) locations.
 
-## Example YAML Configuration
+## Path variable expansion
+
+You can use variables in your YAML paths, for example:
+
+```yaml
+directories:
+  - "$CONFIG_DIR/.fonts"
+  - source: "$HOME/Downloads"
+    files:
+      - WSDL.pdf
+      - WSDL-1.pdf
+```
+
+When processing the YAML, these variables are automatically expanded:
+
+- `$HOME` → `/home/youruser`
+- `$CONFIG_DIR` → `/home/youruser/.config`
+- `$SHARE_DIR` → `/home/youruser/.local/share`
+- `$BIN_DIR` → `/home/youruser/.local/bin`
+
+For example, the entry:
+
+```yaml
+directories:
+  - "$CONFIG_DIR/.fonts"
+```
+
+Will be expanded to:
+
+```text
+/home/youruser/.config/.fonts
+```
+
+You can also use advanced placeholders:
+
+- `${ENDS_WITH=".default-release"}` to find folders ending with that text.
+- `${BEGINS_WITH="prefix"}` to find folders starting with that text.
+
+Example:
+
+```yaml
+directories:
+  - "$HOME/.mozilla/firefox/${ENDS_WITH='.default-release'}"
+```
+
+Will be expanded to:
+
+```text
+/home/youruser/.mozilla/firefox/abcd1234.default-release
+```
 
 Configuration files must go to ```/etc/config-saver/configs/```, by default there is a sample config at ```/etc/config-saver/configs/default-config.yaml```, which you can modify, delete or rename it.
 
