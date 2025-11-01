@@ -1,6 +1,6 @@
 directories:
-    - /home/andres/.fonts
-    - source: /home/andres/Downloads
+    - "$CONFIG_DIR/.fonts"
+    - source: "$HOME/Downloads"
       files:
         - WSDL.pdf
         - WSDL-1.pdf
