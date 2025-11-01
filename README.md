@@ -111,6 +111,26 @@ config-saver --compress
 
 If no `--description` is given, archives are stored in the original (backwards-compatible) locations.
 
+## User-independent path normalization
+
+Config-saver automatically makes your backups portable across different users. When compressing files from your home directory (e.g., `/home/andres/.fonts`), the tool normalizes the paths by replacing your username with a generic placeholder `home/user/`.
+
+**During compression:**
+
+- `/home/andres/.fonts/myfont.ttf` → stored as `home/user/.fonts/myfont.ttf` in the archive
+
+**During decompression:**
+
+- `home/user/.fonts/myfont.ttf` → extracted to `/home/currentuser/.fonts/myfont.ttf`
+
+This means:
+
+- You can create a backup as user `andres`
+- Share the `.tar.gz` file with another user (e.g., `maria`)
+- When `maria` decompresses it, files go to `/home/maria/` automatically
+
+**Note:** Files outside the home directory (e.g., `/etc/`, `/opt/`) are stored with their absolute paths and will be restored to the same locations.
+
 ## Path variable expansion
 
 You can use variables in your YAML paths, for example:
