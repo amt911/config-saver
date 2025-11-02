@@ -1,3 +1,8 @@
+# Enable content normalization to replace hardcoded home paths in text files
+# Set to true if you want config files (XML, JSON, etc.) to be portable across users
+# Set to false (or omit) to only normalize file paths in the archive
+normalize_content: true
+
 directories:
     - source: "$CONFIG_DIR"
       files:

@@ -142,8 +142,10 @@ class TarCompressor:
                 for file_path in tqdm(file_list, desc="Compressing files", unit="file"):
                     arcname = self._normalize_path(file_path)
                     
-                    # Try to normalize file content
-                    normalized_content = self._normalize_file_content(file_path)
+                    # Try to normalize file content (only if enabled in YAML)
+                    normalized_content = None
+                    if self.yaml_data.normalize_content:
+                        normalized_content = self._normalize_file_content(file_path)
                     
                     if normalized_content is not None:
                         # File content was normalized, add from memory
@@ -159,8 +161,10 @@ class TarCompressor:
                 for file_path in file_list:
                     arcname = self._normalize_path(file_path)
                     
-                    # Try to normalize file content
-                    normalized_content = self._normalize_file_content(file_path)
+                    # Try to normalize file content (only if enabled in YAML)
+                    normalized_content = None
+                    if self.yaml_data.normalize_content:
+                        normalized_content = self._normalize_file_content(file_path)
                     
                     if normalized_content is not None:
                         # File content was normalized, add from memory

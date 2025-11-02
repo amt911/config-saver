@@ -228,6 +228,58 @@ directories:
         - WSDL-1.pdf
 ```
 
+### Content normalization (optional)
+
+By default, config-saver only normalizes **file paths** in the archive (e.g., `/home/andres/.fonts` → `home/user/.fonts`).
+
+If you want to also normalize **file contents** (replace hardcoded home paths inside text files), add the `normalize_content: true` option to your YAML:
+
+```yaml
+normalize_content: true
+directories:
+    - source: "$SHARE_DIR"
+      files:
+        - konsole  # Will normalize bookmarks.xml and other text files inside
+```
+
+**When enabled**, the tool will:
+
+- Scan text files (config files, XML, scripts, etc.) for paths containing your home directory
+- Replace them with a placeholder (`<<<HOME_PLACEHOLDER>>>`) during compression
+- Restore them to the current user's home during decompression
+
+**Example:**
+
+With `normalize_content: true`, a file like `~/.local/share/konsole/bookmarks.xml`:
+
+```xml
+<bookmark href="file:///home/andres/Downloads" >
+  <title>Downloads</title>
+</bookmark>
+```
+
+Will be stored as:
+
+```xml
+<bookmark href="file://<<<HOME_PLACEHOLDER>>>/Downloads" >
+  <title>Downloads</title>
+</bookmark>
+```
+
+And when user `maria` decompresses it, it becomes:
+
+```xml
+<bookmark href="file:///home/maria/Downloads" >
+  <title>Downloads</title>
+</bookmark>
+```
+
+**Notes:**
+
+- Binary files (images, fonts, executables) are never modified
+- Only UTF-8 and Latin-1 encoded text files are processed
+- This option is **disabled by default** for safety
+
 ## Credits
 
 Developed by amt911. Inspired by best practices for CLI and configuration management in Python.
