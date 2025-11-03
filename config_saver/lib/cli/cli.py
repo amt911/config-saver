@@ -138,6 +138,7 @@ class CLI:
         group.add_argument('--decompress', '-d', action='store_true', help='Decompress a tar file')
         group.add_argument('--list', '-l', action='store_true', help='List saved config-saver tar.gz files')
         group.add_argument('--export-config', '-e', type=str, metavar='NAME', help='Export the latest config archive by name')
+        group.add_argument('--show-configs', action='store_true', help='Show available configuration names')
         parser.add_argument('--input', '-i', type=str, default=self.DEFAULT_SYSTEM_CONFIG, help='Input YAML config (for compress) or tar file (for decompress)')
         parser.add_argument('--output', '-o', type=str, default=None, help='Output tar file (for compress) or extraction directory (for decompress, optional)')
         parser.add_argument('--progress', '-P', action='store_true', help='Show progress bar during compression/decompression')
@@ -152,6 +153,23 @@ class CLI:
         saves_dir = manager.ensure_saves_dir()
         try:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+            # Mostrar los nombres de las configuraciones disponibles
+            if args.show_configs:
+                archives = manager.list_archives()
+                config_names: set[str] = set()
+                for p in archives:
+                    name = os.path.basename(p)
+                    m = re.match(r"(.+)-(\d{8}-\d{6})\.tar\.gz$", name)
+                    if m:
+                        config_names.add(m.group(1))
+                if config_names:
+                    print(Fore.GREEN + "Configuraciones disponibles:")
+                    for cfg in sorted(config_names):
+                        print("- " + cfg)
+                else:
+                    print(Fore.YELLOW + "No hay configuraciones guardadas.")
+                return
 
             # Exportar la última configuración por nombre
             if args.export_config:
