@@ -1,6 +1,107 @@
+# Enable content normalization to replace hardcoded home paths in text files
+# Set to true if you want config files (XML, JSON, etc.) to be portable across users
+# Set to false (or omit) to only normalize file paths in the archive
+normalize_content: true
+
 directories:
-    - /home/andres/.fonts
-    - source: /home/andres/Downloads
+    - source: "$CONFIG_DIR"
       files:
-        - WSDL.pdf
-        - WSDL-1.pdf
+        - breezerc
+        - dolphinrc
+        - gtk-2.0
+        - gtk-3.0
+        - gtk-4.0
+        - gtkrc
+        - gtkrc-2.0
+        - kate
+        - Kvantum
+        - katerc
+        - konsolerc
+        - kcminputrc
+        - kdeglobals
+        - kcmfonts
+        - kglobalshortcutsrc
+        - klipperrc
+        - krunnerrc
+        - kscreenlockerrc
+        - ksmserverrc
+        - kwinrc
+        - kwinrulesrc
+        - ksplashrc
+        - khotkeysrc
+        - klaunchrc
+        - kfontinstuirc
+        - latte
+        - lattedockrc
+        - lightlyrc
+        - oxygenrc
+        - plasma-org.kde.plasma.desktop-appletsrc
+        - plasmarc
+        - plasmashellrc
+        - Trolltech.conf
+        # Additional items from README/feature list (added if missing)
+        - kactivitymanagerdrc
+        - kactivitymanagerd-switcher
+        - kactivitymanagerd-statsrc
+        - kactivitymanagerd-pluginsrc
+        - baloofilerc
+        - kuriikwsfiltersrc
+        - plasmanotifyrc
+        - plasma-localerc
+        - ktimezonedrc
+        - kaccessrc
+        - mimeapps.list
+        - user-dirs.dirs
+        - PlasmaUserFeedback
+        - kxkbrc
+        - touchpadxlibinputrc
+        - kgammarc
+        - powermanagementprofilesrc
+        - bluedevilglobalrc
+        - kdeconnect
+        - device_automounter_kcmrc
+        - kded_device_automounterrc
+        - arkrc
+        - filelightrc
+        - katevirc
+        - kate-externaltoolspluginrc
+        - kcalcrc
+        - partitionmanagerrc
+        - konsolesshconfig
+        - krusaderrc
+        - spectaclerc
+        - systemmonitorrc
+        - systemsettingsrc
+        - kwinoutputconfig.json
+
+    - source: "$SHARE_DIR"
+      files:
+        - plasma
+        - kwin
+        - konsole
+        - fonts
+        - color-schemes
+        - aurorae
+        - icons
+        - wallpapers
+        # Additional share items
+        - kservices5/searchproviders
+        - plasma-systemmonitor
+        - user-places.xbel
+
+    - source: "$LOCALSHARE_DIR"
+      files:
+        - kscreen
+    - source: "$HOME"
+      files:
+        - .fonts
+        - .themes
+        - .icons
+
+    - "$HOME/Pictures/Nice Wallpapers"
+    - source: "$HOME/.ssh"
+      files:
+        - id_ed25519
+        - id_ed25519.pub
+    # System connections (NetworkManager) - outside user home
+    - /etc/NetworkManager/system-connections

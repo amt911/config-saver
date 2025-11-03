@@ -4,16 +4,16 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 from datetime import datetime
 from typing import Optional
 
 from colorama import Fore, init
 from pydantic import ValidationError
-import sys
+from rich.align import Align
+from rich.columns import Columns
 from rich.console import Console
 from rich.table import Table
-from rich.columns import Columns
-from rich.align import Align
 
 from config_saver import __version__
 from config_saver.lib.backup_mapager.backup_manager import BackupManager
@@ -220,6 +220,6 @@ class CLI:
         except RuntimeError as e:
             print(Fore.RED + f"Runtime error: {e}")
             sys.exit(5)
-        except Exception as e:
-            print(Fore.RED + f"Unexpected error: {e}")
+        except (OSError, IOError) as e:
+            print(Fore.RED + f"I/O error: {e}")
             sys.exit(10)

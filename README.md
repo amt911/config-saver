@@ -111,7 +111,109 @@ config-saver --compress
 
 If no `--description` is given, archives are stored in the original (backwards-compatible) locations.
 
-## Example YAML Configuration
+## User-independent path normalization
+
+Config-saver automatically makes your backups portable across different users by normalizing both **file paths** and **file contents**.
+
+### Path normalization
+
+When compressing files from your home directory (e.g., `/home/andres/.fonts`), the tool normalizes the paths by replacing your username with a generic placeholder `home/user/`.
+
+**During compression:**
+
+- `/home/andres/.fonts/myfont.ttf` → stored as `home/user/.fonts/myfont.ttf` in the archive
+
+**During decompression:**
+
+- `home/user/.fonts/myfont.ttf` → extracted to `/home/currentuser/.fonts/myfont.ttf`
+
+### Content normalization
+
+Additionally, config-saver scans **text files** (configuration files, scripts, etc.) and replaces hardcoded home directory paths in their content:
+
+**During compression (user `andres`):**
+
+```text
+Original file content:
+  cache_location = /home/andres/.cache/myapp
+  data_path = /home/andres/Documents/data.db
+
+Stored in archive:
+  cache_location = <<<HOME_PLACEHOLDER>>>/.cache/myapp
+  data_path = <<<HOME_PLACEHOLDER>>>/Documents/data.db
+```
+
+**During decompression (user `maria`):**
+
+```text
+Extracted file content:
+  cache_location = /home/maria/.cache/myapp
+  data_path = /home/maria/Documents/data.db
+```
+
+This means:
+
+- You can create a backup as user `andres`
+- Share the `.tar.gz` file with another user (e.g., `maria`)
+- When `maria` decompresses it, files go to `/home/maria/` automatically
+- **Config files with hardcoded paths** are automatically updated to reference `/home/maria/`
+
+**Note:**
+
+- Files outside the home directory (e.g., `/etc/`, `/opt/`) are stored with their absolute paths and will be restored to the same locations.
+- Binary files are preserved as-is; only text files have their content normalized.
+- The placeholder `<<<HOME_PLACEHOLDER>>>` is used internally and is automatically replaced during extraction.
+
+## Path variable expansion
+
+You can use variables in your YAML paths, for example:
+
+```yaml
+directories:
+  - "$CONFIG_DIR/.fonts"
+  - source: "$HOME/Downloads"
+    files:
+      - WSDL.pdf
+      - WSDL-1.pdf
+```
+
+When processing the YAML, these variables are automatically expanded:
+
+- `$HOME` → `/home/youruser`
+- `$CONFIG_DIR` → `/home/youruser/.config`
+- `$SHARE_DIR` → `/home/youruser/.local/share`
+- `$BIN_DIR` → `/home/youruser/.local/bin`
+
+For example, the entry:
+
+```yaml
+directories:
+  - "$CONFIG_DIR/.fonts"
+```
+
+Will be expanded to:
+
+```text
+/home/youruser/.config/.fonts
+```
+
+You can also use advanced placeholders:
+
+- `${ENDS_WITH=".default-release"}` to find folders ending with that text.
+- `${BEGINS_WITH="prefix"}` to find folders starting with that text.
+
+Example:
+
+```yaml
+directories:
+  - "$HOME/.mozilla/firefox/${ENDS_WITH='.default-release'}"
+```
+
+Will be expanded to:
+
+```text
+/home/youruser/.mozilla/firefox/abcd1234.default-release
+```
 
 Configuration files must go to ```/etc/config-saver/configs/```, by default there is a sample config at ```/etc/config-saver/configs/default-config.yaml```, which you can modify, delete or rename it.
 
@@ -125,6 +227,58 @@ directories:
         - WSDL.pdf
         - WSDL-1.pdf
 ```
+
+### Content normalization (optional)
+
+By default, config-saver only normalizes **file paths** in the archive (e.g., `/home/andres/.fonts` → `home/user/.fonts`).
+
+If you want to also normalize **file contents** (replace hardcoded home paths inside text files), add the `normalize_content: true` option to your YAML:
+
+```yaml
+normalize_content: true
+directories:
+    - source: "$SHARE_DIR"
+      files:
+        - konsole  # Will normalize bookmarks.xml and other text files inside
+```
+
+**When enabled**, the tool will:
+
+- Scan text files (config files, XML, scripts, etc.) for paths containing your home directory
+- Replace them with a placeholder (`<<<HOME_PLACEHOLDER>>>`) during compression
+- Restore them to the current user's home during decompression
+
+**Example:**
+
+With `normalize_content: true`, a file like `~/.local/share/konsole/bookmarks.xml`:
+
+```xml
+<bookmark href="file:///home/andres/Downloads" >
+  <title>Downloads</title>
+</bookmark>
+```
+
+Will be stored as:
+
+```xml
+<bookmark href="file://<<<HOME_PLACEHOLDER>>>/Downloads" >
+  <title>Downloads</title>
+</bookmark>
+```
+
+And when user `maria` decompresses it, it becomes:
+
+```xml
+<bookmark href="file:///home/maria/Downloads" >
+  <title>Downloads</title>
+</bookmark>
+```
+
+**Notes:**
+
+- Binary files (images, fonts, executables) are never modified
+- Only UTF-8 and Latin-1 encoded text files are processed
+- This option is **disabled by default** for safety
 
 ## Credits
 
