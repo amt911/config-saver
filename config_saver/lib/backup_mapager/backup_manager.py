@@ -171,8 +171,8 @@ class BackupManager:
             # with the same timestamp. This can happen if backups are created within
             # the same second. We need to ensure unique timestamps.
             print(f"[WARNING] Timestamp directory already exists: {ts_dir}")
-            print(f"[WARNING] This may cause issues with incremental backups.")
-            print(f"[WARNING] Consider waiting 1 second between backups.")
+            print("[WARNING] This may cause issues with incremental backups.")
+            print("[WARNING] Consider waiting 1 second between backups.")
         
         # Find the most recent previous timestamp directory BEFORE creating the new one
         prev_state_dir = self._find_previous_timestamp_dir(base_cfg_dir, timestamp)

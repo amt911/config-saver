@@ -199,7 +199,10 @@ class TarCompressor:
                         tar.add(file_path, arcname=arcname)
                     
                     # Update state
-                    new_state.update_file(file_path)
+                    
+                    # NOTE: state will be updated for all current files after
+                    # compression to ensure the saved .backup-state.json reflects
+                    # the complete snapshot (not only the changed files).
             else:
                 for file_path in sorted(files_to_compress):
                     arcname = self._normalize_path(file_path)
@@ -217,7 +220,19 @@ class TarCompressor:
                         tar.add(file_path, arcname=arcname)
                     
                     # Update state
-                    new_state.update_file(file_path)
+                    
+                    # NOTE: state will be updated for all current files after
+                    # compression to ensure the saved .backup-state.json reflects
+                    # the complete snapshot (not only the changed files).
         
         # Save state after compression
+        # Ensure state contains entries for all files currently present so
+        # subsequent incremental runs can correctly detect unchanged files.
+        for file_path in file_list:
+            try:
+                new_state.update_file(file_path)
+            except (OSError, IOError):
+                # Ignore per-file errors when gathering state
+                pass
+
         new_state.save()
