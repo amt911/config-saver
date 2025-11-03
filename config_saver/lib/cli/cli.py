@@ -29,8 +29,8 @@ class BackupTable:
     will fall back to top-level archives. It delegates listing to BackupManager.
     """
 
-    # Matches <name>-YYYYMMDD-HHMMSS.tar.gz
-    FILENAME_PATTERN = re.compile(r"(.+)-(\d{8}-\d{6})\.tar\.gz$")
+    # Matches <name>-YYYYMMDD-HHMMSS.tar.gz or <name>-YYYYMMDD-HHMMSS-mmm.tar.gz
+    FILENAME_PATTERN = re.compile(r"(.+)-(\d{8}-\d{6}(?:-\d{3})?)\.tar\.gz$")
 
     def __init__(self, saves_dir: str):
         self.saves_dir = saves_dir
@@ -44,8 +44,13 @@ class BackupTable:
         name = os.path.basename(path)
         m = self.FILENAME_PATTERN.search(name)
         if m:
+            ts_str = m.group(2)
             try:
-                return datetime.strptime(m.group(1), "%Y%m%d-%H%M%S")
+                # Try new format with milliseconds first
+                if len(ts_str) == 21:  # YYYYMMDD-HHMMSS-mmm
+                    return datetime.strptime(ts_str, "%Y%m%d-%H%M%S-%f")
+                else:  # Old format YYYYMMDD-HHMMSS
+                    return datetime.strptime(ts_str, "%Y%m%d-%H%M%S")
             except ValueError:
                 pass
         return datetime.fromtimestamp(os.path.getmtime(path))
@@ -148,7 +153,9 @@ class CLI:
         manager = BackupManager()
         saves_dir = manager.ensure_saves_dir()
         try:
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            # Generate timestamp with milliseconds to avoid collisions when running multiple backups per second
+            # Format: YYYYMMDD-HHMMSS-mmm (milliseconds, 3 digits)
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:21]
 
             # Directory-mode compression
             if args.compress and os.path.isdir(args.input):

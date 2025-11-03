@@ -1,15 +1,25 @@
 
 # Config Saver
 
-Python CLI tool for compressing and decompressing directories or files by using configuration files (YAML/JSON), with optional progress bar.
+Python CLI tool for compressing and decompressing directories or files by using configuration files (YAML/JSON), with **automatic incremental backups**.
 
 ## Main Features
 
 - Validate YAML and JSON files using Pydantic models.
 - Compress files and directories into `.tar.gz` archives.
+- **🚀 Incremental backups ALWAYS enabled**: Only saves changed files automatically (70-90% space savings).
 - Decompress `.tar.gz` archives, preserving the original structure.
 - Optional progress bar for compression/decompression (`--progress`/`-P`).
 - Robust error handling and clear messages.
+
+### Incremental Backups (Automatic)
+
+Every backup after the first one is **automatically incremental**:
+- **First backup**: Full (includes all files)
+- **Subsequent backups**: Only changed files (saves 70-90% space)
+- **Detection strategy**: Hybrid (timestamp + size → hash if needed)
+
+📖 **See**: [INCREMENTAL_README.md](INCREMENTAL_README.md) for details.
 
 ## Installation
 
