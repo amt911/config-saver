@@ -5,6 +5,8 @@ import argparse
 import os
 import re
 import sys
+import shutil
+
 from datetime import datetime
 from typing import Optional
 
@@ -135,6 +137,7 @@ class CLI:
         group.add_argument('--compress', '-c', action='store_true', help='Compress files/directories from YAML config')
         group.add_argument('--decompress', '-d', action='store_true', help='Decompress a tar file')
         group.add_argument('--list', '-l', action='store_true', help='List saved config-saver tar.gz files')
+        group.add_argument('--export-config', '-e', type=str, metavar='NAME', help='Export the latest config archive by name')
         parser.add_argument('--input', '-i', type=str, default=self.DEFAULT_SYSTEM_CONFIG, help='Input YAML config (for compress) or tar file (for decompress)')
         parser.add_argument('--output', '-o', type=str, default=None, help='Output tar file (for compress) or extraction directory (for decompress, optional)')
         parser.add_argument('--progress', '-P', action='store_true', help='Show progress bar during compression/decompression')
@@ -149,6 +152,32 @@ class CLI:
         saves_dir = manager.ensure_saves_dir()
         try:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+            # Exportar la última configuración por nombre
+            if args.export_config:
+                cfgname = args.export_config
+                # Buscar archivos que coincidan con el nombre
+                archives = manager.list_archives()
+                # Filtrar por nombre
+                matching = [p for p in archives if os.path.basename(p).startswith(cfgname + "-")]
+                if not matching:
+                    print(Fore.RED + f"No se encontró ninguna configuración guardada con el nombre: {cfgname}")
+                    sys.exit(7)
+                # Ordenar por timestamp descendente
+                def extract_ts(path: str) -> str:
+                    m = re.search(r"-(\d{8}-\d{6})\.tar\.gz$", os.path.basename(path))
+                    return m.group(1) if m else "00000000-000000"
+                matching.sort(key=extract_ts, reverse=True)
+                latest = matching[0]
+                # Si se especifica --output, copiar el archivo allí
+                if args.output:
+                    dest_path = args.output
+                else:
+                    home = os.path.expanduser("~")
+                    dest_path = os.path.join(home, os.path.basename(latest))
+                shutil.copy2(latest, dest_path)
+                print(Fore.GREEN + f"Exportación completada: {dest_path}")
+                return
 
             # Directory-mode compression
             if args.compress and os.path.isdir(args.input):
