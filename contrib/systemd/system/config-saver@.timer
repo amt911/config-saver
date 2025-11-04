@@ -1,0 +1,14 @@
+[Unit]
+Description=Run config-saver compression daily for user %i
+
+[Timer]
+Unit=config-saver@%i.service
+OnCalendar=*-*-*/*6:00:00
+OnActiveSec=1min
+OnBootSec=5min
+Persistent=true
+# Reduce randomized delay to limit spread while avoiding exact simultaneous runs
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

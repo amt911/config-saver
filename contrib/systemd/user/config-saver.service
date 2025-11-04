@@ -1,0 +1,14 @@
+[Unit]
+Description=Config Saver: compress system configurations
+Documentation=man:systemd.service(5)
+After=network.target
+
+[Service]
+Type=oneshot
+Nice=10
+# Use python -m so the service works even if the console script isn't installed into PATH.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env python3 -m config_saver --compress
+
+[Install]
+WantedBy=default.target
