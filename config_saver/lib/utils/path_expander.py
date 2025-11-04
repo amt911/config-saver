@@ -16,6 +16,7 @@ class PathExpander:
                 "SHARE_DIR": os.path.expanduser("~/.local/share"),
                 "BIN_DIR": os.path.expanduser("~/.local/bin"),
                 "LOCALSHARE_DIR": os.path.expanduser("~/.local/share"),
+                "ETC_CONFIG_DIR": os.path.expanduser("/etc/config-saver/configs"),
             }
         self.custom_vars: Dict[str, str] = custom_vars
 

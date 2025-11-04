@@ -4,6 +4,8 @@
 normalize_content: true
 
 directories:
+    - "$ETC_CONFIG_DIR"
+
     - source: "$CONFIG_DIR"
       files:
         - breezerc
@@ -98,7 +100,6 @@ directories:
         - .themes
         - .icons
 
-    - "$HOME/Pictures/Nice Wallpapers"
     - source: "$HOME/.ssh"
       files:
         - id_ed25519

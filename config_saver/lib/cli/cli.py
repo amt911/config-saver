@@ -138,6 +138,7 @@ class CLI:
         group.add_argument('--decompress', '-d', action='store_true', help='Decompress a tar file')
         group.add_argument('--list', '-l', action='store_true', help='List saved config-saver tar.gz files')
         group.add_argument('--export-config', '-e', type=str, metavar='NAME', help='Export the latest config archive by name')
+        group.add_argument('--export-all-configs', action='store_true', help='Export the latest archive for every saved configuration')
         group.add_argument('--show-configs', action='store_true', help='Show available configuration names')
         parser.add_argument('--input', '-i', type=str, default=self.DEFAULT_SYSTEM_CONFIG, help='Input YAML config (for compress) or tar file (for decompress)')
         parser.add_argument('--output', '-o', type=str, default=None, help='Output tar file (for compress) or extraction directory (for decompress, optional)')
@@ -195,6 +196,50 @@ class CLI:
                     dest_path = os.path.join(home, os.path.basename(latest))
                 shutil.copy2(latest, dest_path)
                 print(Fore.GREEN + f"Exportación completada: {dest_path}")
+                return
+
+            # Exportar la última versión de todas las configuraciones disponibles
+            if getattr(args, 'export_all_configs', False):
+                archives = manager.list_archives()
+                cfg_latest: dict[str, tuple[str, str]] = {}
+                # pattern to extract <name>-YYYYMMDD-HHMMSS.tar.gz
+                pattern = re.compile(r"(.+)-(\d{8}-\d{6})\.tar\.gz$")
+                for p in archives:
+                    name = os.path.basename(p)
+                    m = pattern.match(name)
+                    if m:
+                        cfg = m.group(1)
+                        ts = m.group(2)
+                    else:
+                        cfg = os.path.splitext(name)[0]
+                        ts = "00000000-000000"
+                    # keep the latest timestamp string (lexicographic works for YYYYMMDD-HHMMSS)
+                    if cfg not in cfg_latest or ts > cfg_latest[cfg][0]:
+                        cfg_latest[cfg] = (ts, p)
+
+                if not cfg_latest:
+                    print(Fore.YELLOW + "No hay configuraciones guardadas.")
+                    return
+
+                # Determine destination directory for exports. For multi-export we treat --output as a directory.
+                if args.output:
+                    dest_dir = args.output
+                else:
+                    dest_dir = os.path.expanduser("~")
+
+                try:
+                    os.makedirs(dest_dir, exist_ok=True)
+                except PermissionError:
+                    print(Fore.RED + f"Cannot create output directory: {dest_dir}")
+                    sys.exit(6)
+
+                for cfg, (_ts, src_path) in sorted(cfg_latest.items()):
+                    dest_path = os.path.join(dest_dir, os.path.basename(src_path))
+                    try:
+                        shutil.copy2(src_path, dest_path)
+                        print(Fore.GREEN + f"Exportado: {dest_path}")
+                    except PermissionError:
+                        print(Fore.RED + f"Permission denied copying {src_path} -> {dest_path}")
                 return
 
             # Directory-mode compression
