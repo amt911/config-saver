@@ -31,6 +31,20 @@ pip install '.[dev]'
 
 This will install `mypy` and type stubs.
 
+
+### As an Arch Linux package
+You can install `config-saver` from the AUR using an AUR helper like `yay`:
+
+```sh
+yay -S config-saver
+```
+
+This will also install the templated systemd unit and timer files to run periodic backups. If you want to enable them for a specific user, do the following:
+
+```bash
+  systemctl enable --now config-saver@user.timer
+```
+
 ## Usage
 
 ### Compression
@@ -279,6 +293,79 @@ And when user `maria` decompresses it, it becomes:
 - Binary files (images, fonts, executables) are never modified
 - Only UTF-8 and Latin-1 encoded text files are processed
 - This option is **disabled by default** for safety
+
+## Systemd units and timers
+
+This repository contains example systemd unit and timer files to run `config-saver` periodically.
+
+Files included in `contrib/systemd/`:
+
+- `config-saver.service` - a oneshot service that executes the compression of all configs using the system-wide YAML directory (`/etc/config-saver/configs`).
+- `config-saver.timer` - a user-level timer that triggers the service daily at 03:00 with a randomized delay.
+- `config-saver@.service` - templated system-wide service. When instantiated as `config-saver@alice.service` it will run as user `alice`, so archives are written to that user's home.
+- `config-saver@.timer` - templated system timer that triggers `config-saver@<user>.service` on schedule.
+
+### Install (user-level)
+
+1. Copy the files to your user systemd unit directory:
+
+   ```bash
+     ~/.config/systemd/user/
+   ```
+
+2. Reload user systemd units:
+
+   ```bash
+     systemctl --user daemon-reload
+   ```
+
+3. Enable and start the timer (it will activate the service on schedule):
+
+   ```bash
+     systemctl --user enable --now config-saver.timer
+   ```
+
+4. Check the timer and last run:
+
+   ```bash
+     systemctl --user list-timers --all
+     journalctl --user -u config-saver.service --since "1 hour ago"
+   ```
+
+### Install (system-wide)
+
+If you prefer to run the timer as a system service (e.g., root-managed), copy the files to `/etc/systemd/system/` and use `systemctl daemon-reload` and `systemctl enable --now config-saver.timer` as root.
+
+### Templated system-wide timers (per-user)
+
+The repository also includes templated units that allow a root-managed timer to run the job as a specific non-root user. This is useful if a sysadmin wants to schedule backups for a given account while preserving that user's $HOME as the saves dir.
+
+1. Copy the templated units to `/etc/systemd/system/`:
+
+   ```bash
+     sudo cp contrib/systemd/system/config-saver@.service /etc/systemd/system/
+     sudo cp contrib/systemd/system/config-saver@.timer /etc/systemd/system/
+   ```
+
+2. Reload systemd and enable the timer for user `alice` (example):
+
+   ```bash
+     sudo systemctl daemon-reload
+     sudo systemctl enable --now config-saver@alice.timer
+   ```
+
+3. Check timer and service logs:
+
+  ```bash
+    sudo systemctl status config-saver@alice.timer
+    sudo journalctl -u config-saver@alice.service
+  ```
+
+Notes:
+
+- The templated service sets `User=%i` and `HOME=/home/%i` so outputs are written to `/home/alice/.config/config-saver` by default.
+- If the target user has a non-standard home directory, adjust the `Environment=HOME=...` and `WorkingDirectory=` lines in the installed unit.
+- For virtualenv usage, change `ExecStart` to the absolute python path in the venv.
 
 ## Credits
 
