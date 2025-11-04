@@ -1,14 +1,18 @@
 [Unit]
-Description=Config Saver: compress system configurations
+Description=Config Saver: compress system configurations for user %i
 Documentation=man:systemd.service(5)
 After=network.target
 
 [Service]
 Type=oneshot
-Nice=10
-# Use python -m so the service works even if the console script isn't installed into PATH.
+# Run the job as the target user so archives are written to their $HOME rather than root's.
+User=%i
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/env python3 -m config_saver --compress
+# Ensure HOME is set correctly for the invoked process
+Environment=HOME=/home/%i
+WorkingDirectory=/home/%i
+# Prefer system python; if you need a venv use the absolute python binary below
+ExecStart=/usr/bin/env python3 -m config_saver --compress --description "Automated backup by systemd timer"
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

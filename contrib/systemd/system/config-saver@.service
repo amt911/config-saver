@@ -12,7 +12,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/home/%i
 WorkingDirectory=/home/%i
 # Prefer system python; if you need a venv use the absolute python binary below
-ExecStart=/usr/bin/env python3 -m config_saver --compress
+ExecStart=/usr/bin/env python3 -m config_saver --compress --description "Automated backup by systemd timer"
 
 [Install]
 WantedBy=multi-user.target

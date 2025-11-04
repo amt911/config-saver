@@ -76,7 +76,13 @@ class BackupTable:
         manager = BackupManager(self.saves_dir)
 
         for cfgname, timestamps in grouped.items():
-            table = Table(show_header=True, header_style="bold bright_blue", row_styles=["none", "dim"])
+            table = Table(
+                show_header=True,
+                header_style="bold bright_blue",
+                row_styles=["none", "dim"],
+                title=cfgname,
+                title_style="bold magenta"
+            )
             # Left column: ordinal number
             table.add_column("No.", width=5, justify="center", no_wrap=True)
             # Timestamp column
