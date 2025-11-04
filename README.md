@@ -32,6 +32,22 @@ pip install '.[dev]'
 This will install `mypy` and type stubs.
 
 ## Usage
+### Export all configurations
+
+Exports the latest version of every saved configuration. By default, files are copied to the user's home directory. If you specify `--output`, all files are exported to the given directory.
+
+```sh
+config-saver --export-all-configs
+config-saver --export-all-configs --output /path/to/destination
+```
+
+### Export a specific configuration
+Exports the latest archive for a specific configuration name. By default, the file is copied to your home directory. If you specify `--output`, it will be exported to the given path.
+
+```sh
+config-saver --export-config myconfig
+config-saver --export-config myconfig --output /path/to/destination/myconfig-latest.tar.gz
+```
 
 ### Compression
 
@@ -92,12 +108,15 @@ config-saver --compress
 
 ## Main CLI Options
 
-- `-h`/`--help`: Show this help message and exit
-- `--compress`/`-c`: Compress files/directories from YAML config
-- `--decompress`/`-d`: Decompress a tar file
-- `--list`/`-l`: List saved config-saver tar.gz files
-- `--input`/`-i INPUT`: Input YAML config (for compress) or tar file (for decompress)
-- `--output`/`-o OUTPUT`  Output tar file (for compress) or extraction directory (for decompress, optional)
+`-h`/`--help`: Show this help message and exit
+`--compress`/`-c`: Compress files/directories from YAML config
+`--decompress`/`-d`: Decompress a tar file
+`--list`/`-l`: List saved config-saver tar.gz files
+`--export-config`/`-e NAME`: Export the latest config archive by name
+`--export-all-configs`: Export the latest archive for every saved configuration
+`--show-configs`: Show available configuration names
+`--input`/`-i INPUT`: Input YAML config (for compress) or tar file (for decompress)
+`--output`/`-o OUTPUT`: Output tar file (for compress), extraction directory (for decompress), or destination directory (for export-all-configs)
 - `--progress`/`-P`: Show progress bar during compression/decompression
 - `--version`/`-v`: Show program version and exit
 
