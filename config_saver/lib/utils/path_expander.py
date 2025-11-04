@@ -25,7 +25,7 @@ class PathExpander:
         # Expande variables personalizadas tipo $HOME, $CONFIG_DIR, etc.
         for key, value in self.custom_vars.items():
             path = path.replace(f"${key}", value)
-        # Expande variables de entorno estándar
+    # Expands standard environment variables
         path = os.path.expandvars(path)
         # Expande placeholders avanzados
         # ENDS_WITH

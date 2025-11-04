@@ -155,7 +155,7 @@ class CLI:
         try:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-            # Mostrar los nombres de las configuraciones disponibles
+            # Show available configuration names
             if args.show_configs:
                 archives = manager.list_archives()
                 config_names: set[str] = set()
@@ -165,22 +165,22 @@ class CLI:
                     if m:
                         config_names.add(m.group(1))
                 if config_names:
-                    print(Fore.GREEN + "Configuraciones disponibles:")
+                    print(Fore.GREEN + "Available configurations:")
                     for cfg in sorted(config_names):
                         print("- " + cfg)
                 else:
-                    print(Fore.YELLOW + "No hay configuraciones guardadas.")
+                    print(Fore.YELLOW + "No saved configurations found.")
                 return
 
-            # Exportar la última configuración por nombre
+            # Export the latest configuration by name
             if args.export_config:
                 cfgname = args.export_config
-                # Buscar archivos que coincidan con el nombre
+                # Search for files matching the name
                 archives = manager.list_archives()
                 # Filtrar por nombre
                 matching = [p for p in archives if os.path.basename(p).startswith(cfgname + "-")]
                 if not matching:
-                    print(Fore.RED + f"No se encontró ninguna configuración guardada con el nombre: {cfgname}")
+                    print(Fore.RED + f"No saved configuration found with the name: {cfgname}")
                     sys.exit(7)
                 # Ordenar por timestamp descendente
                 def extract_ts(path: str) -> str:
@@ -188,17 +188,17 @@ class CLI:
                     return m.group(1) if m else "00000000-000000"
                 matching.sort(key=extract_ts, reverse=True)
                 latest = matching[0]
-                # Si se especifica --output, copiar el archivo allí
+                # If --output is specified, copy the file there
                 if args.output:
                     dest_path = args.output
                 else:
                     home = os.path.expanduser("~")
                     dest_path = os.path.join(home, os.path.basename(latest))
                 shutil.copy2(latest, dest_path)
-                print(Fore.GREEN + f"Exportación completada: {dest_path}")
+                print(Fore.GREEN + f"Export completed: {dest_path}")
                 return
 
-            # Exportar la última versión de todas las configuraciones disponibles
+            # Export the latest version of all available configurations
             if getattr(args, 'export_all_configs', False):
                 archives = manager.list_archives()
                 cfg_latest: dict[str, tuple[str, str]] = {}
@@ -218,7 +218,7 @@ class CLI:
                         cfg_latest[cfg] = (ts, p)
 
                 if not cfg_latest:
-                    print(Fore.YELLOW + "No hay configuraciones guardadas.")
+                    print(Fore.YELLOW + "No saved configurations found.")
                     return
 
                 # Determine destination directory for exports. For multi-export we treat --output as a directory.
@@ -237,7 +237,7 @@ class CLI:
                     dest_path = os.path.join(dest_dir, os.path.basename(src_path))
                     try:
                         shutil.copy2(src_path, dest_path)
-                        print(Fore.GREEN + f"Exportado: {dest_path}")
+                        print(Fore.GREEN + f"Exported: {dest_path}")
                     except PermissionError:
                         print(Fore.RED + f"Permission denied copying {src_path} -> {dest_path}")
                 return
