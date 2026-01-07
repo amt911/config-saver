@@ -1,0 +1,10 @@
+normalize_content: true
+
+directories:
+    - source: "$HOME"
+      files:
+        - .histfile
+
+    - source: "$ROOT_HOME"
+      files:
+        - .histfile

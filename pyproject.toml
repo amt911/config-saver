@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "config_saver"
-version = "3.0.1"
+version = "3.0.3"
 description = "Python CLI tool for validating, converting, and managing YAML/JSON configs, with tar compression utilities"
 license = { file = "LICENSE" }
 readme = "README.md"

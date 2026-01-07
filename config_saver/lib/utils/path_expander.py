@@ -12,6 +12,7 @@ class PathExpander:
         if custom_vars is None:
             custom_vars = {
                 "HOME": os.path.expanduser("~"),
+                "ROOT_HOME": os.path.expanduser("~root"),
                 "CONFIG_DIR": os.path.expanduser("~/.config"),
                 "SHARE_DIR": os.path.expanduser("~/.local/share"),
                 "BIN_DIR": os.path.expanduser("~/.local/bin"),
