@@ -1,5 +1,6 @@
 """Module providing a yaml and json parser with pydantic validation"""
 from typing import Any, Dict, List, Optional, Union, cast
+import os
 
 import yaml
 
@@ -14,6 +15,16 @@ class Parser:
         with open(self.filename, "r", encoding="utf-8") as yaml_file:
             yaml_data = yaml.safe_load(yaml_file)
             validated_data = Model.model_validate(yaml_data)
+            
+            # Check if only_root_user is enabled and verify user permissions
+            # Note: root user (uid==0) can always execute any configuration
+            if validated_data.only_root_user:
+                if os.getuid() != 0:
+                    raise PermissionError(
+                        f"Configuration '{filename}' requires root privileges (only_root_user: true). "
+                        "Please run with sudo or as root user."
+                    )
+            
             raw_dict: Dict[str, Any] = validated_data.model_dump()
             expanded_dict: Dict[str, Any] = self._expand_dict(raw_dict)
             validated_expanded = Model.model_validate(expanded_dict)

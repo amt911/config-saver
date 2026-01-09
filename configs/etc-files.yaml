@@ -1,0 +1,14 @@
+# Example configuration that requires root privileges
+# This config is designed to backup system files that are owned by root
+# Only root user can execute this configuration
+
+# Set this to true to restrict execution to root user only
+only_root_user: true
+
+# Content normalization can still be enabled even for root-owned files
+normalize_content: true
+
+directories:
+    - "$ETC_CONFIG_DIR"
+    # System connections (NetworkManager) - outside user home
+    - /etc/NetworkManager/system-connections    

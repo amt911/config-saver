@@ -261,6 +261,71 @@ directories:
         - WSDL-1.pdf
 ```
 
+### Root-only configurations (optional)
+
+Some configurations may require root privileges to read system files (e.g., `/etc`, `/var/log`, system service configurations). You can restrict a YAML configuration to only run as root by adding the `only_root_user: true` option:
+
+```yaml
+only_root_user: true
+directories:
+    - /etc/systemd/system
+    - /etc/nginx
+    - /var/log/apache2
+```
+
+**When enabled**, the tool will:
+
+- Check if the current user is root (`uid == 0`) before processing
+- Reject execution with a clear error message if run by a non-root user
+- Allow compression/decompression only when executed with `sudo` or as root
+
+**Important behaviors:**
+
+1. **Root can execute any configuration**: The root user can always execute any YAML configuration, regardless of whether `only_root_user` is set to `true` or `false`.
+
+2. **Non-root users skip root-owned files**: When `only_root_user: false` (or not set) and a non-root user executes the configuration, any files owned by root (uid=0 or gid=0) will be automatically skipped during compression. This prevents permission errors when backing up mixed-ownership directories.
+
+   **A warning will be displayed at the end** if any root-owned files were skipped, showing:
+   - The total number of skipped files
+   - Suggestions on how to include them (set `only_root_user: true` or change ownership)
+   - A list of the skipped files (up to 10 files shown)
+
+3. **Batch processing skips root-only configs**: When processing a directory with multiple YAML files (e.g., `/etc/config-saver/configs`), if a non-root user runs the command, any YAML with `only_root_user: true` will be skipped with a warning, and processing will continue with the remaining configs. At the end, a summary shows which configs were skipped and suggests running with `sudo` to process them.
+
+**Example:**
+
+```bash
+# As a non-root user, this will fail
+config-saver --compress --input /etc/config-saver/configs/system-root-only.yaml
+
+# Run with sudo to succeed
+sudo config-saver --compress --input /etc/config-saver/configs/system-root-only.yaml
+
+# As a non-root user with a normal config containing some root-owned files
+# The root-owned files will be automatically skipped with a warning
+config-saver --compress --input ~/.config/my-config.yaml
+# Output during compression (if --progress is used):
+# "Skipping root-owned file (only_root_user=false): /some/root/file"
+# 
+# Output at the end:
+# ⚠ Warning: 3 root-owned file(s) were skipped because 'only_root_user' is not set to true.
+#   To include these files, either:
+#   1. Set 'only_root_user: true' in your YAML config and run with sudo
+#   2. Change ownership of the files to your user
+#
+#   Skipped files:
+#     - /home/user/.config/some-root-file.conf
+#     - /home/user/.local/share/root-owned-data
+#     - /home/user/.cache/elevated-cache
+```
+
+**Notes:**
+
+- This option is **disabled by default** (`only_root_user: false`)
+- Use this for system-level backups that require elevated privileges
+- Regular user configs should not use this option
+- Root-owned files are identified by checking if `uid == 0` or `gid == 0`
+
 ### Content normalization (optional)
 
 By default, config-saver only normalizes **file paths** in the archive (e.g., `/home/andres/.fonts` → `home/user/.fonts`).

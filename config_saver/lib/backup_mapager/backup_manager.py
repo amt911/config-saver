@@ -5,6 +5,8 @@ import glob
 import os
 from typing import List, Optional
 
+from colorama import Fore
+
 from config_saver.lib.parser.parser import Parser
 from config_saver.lib.tar_compressor.tar_compressor import TarCompressor
 
@@ -157,6 +159,7 @@ class BackupManager:
         self.ensure_saves_dir()
 
         results: List[str] = []
+        skipped_root_only: List[str] = []  # Track configs skipped due to root requirement
         for cfg in cfg_files:
             cfg_basename = os.path.splitext(os.path.basename(cfg))[0]
             cfg_dir = os.path.join(self.saves_dir, "configs", cfg_basename)
@@ -175,9 +178,26 @@ class BackupManager:
                 continue
 
             archive_name = f"{cfg_basename}-{timestamp}.tar.gz"
-            out_path = self._compress_yaml_to_directory(
-                cfg, ts_dir, archive_name, description=description, show_progress=show_progress
-            )
-            results.append(out_path)
+            try:
+                out_path = self._compress_yaml_to_directory(
+                    cfg, ts_dir, archive_name, description=description, show_progress=show_progress
+                )
+                results.append(out_path)
+            except PermissionError as e:
+                # This YAML requires root privileges - skip it and continue
+                if "only_root_user" in str(e):
+                    skipped_root_only.append(cfg)
+                    if show_progress:
+                        print(Fore.YELLOW + f"\n⊘ Skipping {cfg_basename}: requires root privileges (only_root_user: true)")
+                else:
+                    # Re-raise other permission errors
+                    raise
+
+        # Show summary if some configs were skipped
+        if skipped_root_only:
+            print(Fore.YELLOW + f"\n⚠ Note: {len(skipped_root_only)} configuration(s) skipped because they require root privileges:")
+            for cfg in skipped_root_only:
+                print(Fore.YELLOW + f"  - {os.path.basename(cfg)}")
+            print(Fore.YELLOW + "  To process these configs, run with: sudo config-saver --compress")
 
         return results

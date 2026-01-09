@@ -14,6 +14,9 @@ init(autoreset=True)
 # Placeholder for user home directory in file contents
 HOME_CONTENT_PLACEHOLDER = "<<<HOME_PLACEHOLDER>>>"
 
+# Import Fore for colored warnings
+from colorama import Fore
+
 
 
 class TarCompressor:
@@ -26,6 +29,16 @@ class TarCompressor:
         self.show_progress = show_progress
         # Get current user's home directory for path normalization
         self.user_home = os.path.expanduser("~")
+        # Get current user uid for filtering
+        self.current_uid = os.getuid()
+
+    def _is_root_owned(self, file_path: str) -> bool:
+        """Check if a file is owned by root (uid=0 or gid=0)"""
+        try:
+            stat_info = os.stat(file_path)
+            return stat_info.st_uid == 0 or stat_info.st_gid == 0
+        except (OSError, IOError):
+            return False
 
     def _normalize_path(self, file_path: str) -> str:
         """Normalize path by replacing user's home directory with 'home/user/' placeholder"""
@@ -116,6 +129,7 @@ class TarCompressor:
     def compress(self):
         """Compress files and directories with a global progress bar for all files, showing current file name."""
         file_list: list[str] = []
+        skipped_root_files: list[str] = []  # Track skipped root-owned files
         for entry in self.yaml_data.directories:
             if isinstance(entry, str):
                 if os.path.exists(entry):
@@ -140,6 +154,13 @@ class TarCompressor:
         with tarfile.open(self.output_path, "w:gz") as tar:
             if self.show_progress:
                 for file_path in tqdm(file_list, desc="Compressing files", unit="file"):
+                    # Skip root-owned files if only_root_user is false and current user is not root
+                    if not self.yaml_data.only_root_user and self.current_uid != 0:
+                        if self._is_root_owned(file_path):
+                            tqdm.write(f"Skipping root-owned file (only_root_user=false): {file_path}")
+                            skipped_root_files.append(file_path)
+                            continue
+                    
                     arcname = self._normalize_path(file_path)
                     
                     # Try to normalize file content (only if enabled in YAML)
@@ -159,6 +180,12 @@ class TarCompressor:
                         tar.add(file_path, arcname=arcname)
             else:
                 for file_path in file_list:
+                    # Skip root-owned files if only_root_user is false and current user is not root
+                    if not self.yaml_data.only_root_user and self.current_uid != 0:
+                        if self._is_root_owned(file_path):
+                            skipped_root_files.append(file_path)
+                            continue
+                    
                     arcname = self._normalize_path(file_path)
                     
                     # Try to normalize file content (only if enabled in YAML)
@@ -174,3 +201,19 @@ class TarCompressor:
                     else:
                         # Add file as-is
                         tar.add(file_path, arcname=arcname)
+        
+        # Show warning if root-owned files were skipped
+        if skipped_root_files:
+            print(Fore.YELLOW + f"\n⚠ Warning: {len(skipped_root_files)} root-owned file(s) were skipped because 'only_root_user' is not set to true.")
+            print(Fore.YELLOW + "  To include these files, either:")
+            print(Fore.YELLOW + "  1. Set 'only_root_user: true' in your YAML config and run with sudo")
+            print(Fore.YELLOW + "  2. Change ownership of the files to your user")
+            if not self.show_progress and len(skipped_root_files) <= 10:
+                print(Fore.YELLOW + "\n  Skipped files:")
+                for f in skipped_root_files:
+                    print(Fore.YELLOW + f"    - {f}")
+            elif not self.show_progress and len(skipped_root_files) > 10:
+                print(Fore.YELLOW + "\\n  First 10 skipped files:")
+                for f in skipped_root_files[:10]:
+                    print(Fore.YELLOW + f"    - {f}")
+                print(Fore.YELLOW + f"    ... and {len(skipped_root_files) - 10} more")
