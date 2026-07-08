@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Type-check · import smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: pip install '.[dev]'
+      # No test suite exists yet; compile every module as a smoke check.
+      - run: python -m compileall -q config_saver
+      - run: mypy config_saver
+
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: pip install semgrep
+      # Verified clean locally (0 findings) at the time this landed.
+      - run: >-
+          semgrep scan --error --disable-version-check --metrics=off
+          --config p/python
+
+  audit:
+    name: Dependency audit (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: pip install pip-audit
+      - run: pip install .
+      # Advisory: not verified against a curated allow-list yet, so it must not block merges.
+      - run: pip-audit
