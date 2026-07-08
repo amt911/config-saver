@@ -69,6 +69,23 @@ mypy config_saver        # type check
 - **Round-trip integrity** — compress → decompress must reproduce the original tree exactly.
 - **AUR packaging lives in `config-saver-aur`** — bump it when releasing.
 
+## Agentic PR verification (MANDATORY on every PR)
+
+**Every PR MUST be verified end-to-end before merge, and the verdict MUST be posted as a PR
+comment** via `gh pr comment`. A headless agent (`claude -p`, local) builds/installs the CLI and
+runs a smoke of the affected path (e.g. `pip install .` then `python -m config_saver --compress
+--input configs/<sample>.yaml --output /tmp/out.tar.gz` and a round-trip `--decompress`), then
+posts the verdict; it **never merges** — it waits for you. Running the pass and posting the
+verdict comment is **not optional**. It catches what the diff and `mypy` miss: a CLI flag that no
+longer parses, a config that fails to validate, a broken round-trip.
+
+- **Engine.** CLI (no browser, no service) → build/install the package into a scratch venv and run
+  a smoke of the affected command(s) against a sample config under `configs/`, inspecting stdout
+  and the resulting archive/output tree.
+- **Two layers.** `mypy` (and any tests) stay the hard merge gate; the agentic pass is advisory and
+  never vetoes a merge on its own — but running it and posting the verdict comment is mandatory.
+- **Hard limits.** The verdict awaits your close; the agent never merges.
+
 ## Git & GitHub
 
 - **Commits and branches OK** — create commits and new branches whenever it makes sense, without
