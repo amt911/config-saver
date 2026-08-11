@@ -51,6 +51,10 @@ mypy config_saver
 The hooks run `ruff`, `ruff format` and `mypy` before each commit, and the full test suite before
 each push, so activate this environment in the shell you commit and push from.
 
+The suite includes property-based tests (Hypothesis) for the round-trip and path-normalization
+invariants. Mutation testing (mutmut) is available for the pure logic and is run by hand, not in CI
+— see [docs/TESTING.md](docs/TESTING.md).
+
 
 ### As an Arch Linux package
 You can install `config-saver` from the AUR using an AUR helper like `yay`:

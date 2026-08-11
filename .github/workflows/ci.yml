@@ -39,7 +39,7 @@ jobs:
       - run: pip install '.[dev]'
       - run: mypy config_saver
       # The gate is the behavioural suite; ratchet --cov-fail-under as coverage grows.
-      - run: pytest --cov=config_saver --cov-report=term-missing --cov-fail-under=80
+      - run: pytest --cov=config_saver --cov-report=term-missing --cov-fail-under=90
 
   packaging:
     name: Build · install smoke
@@ -104,9 +104,8 @@ jobs:
           --config p/python
 
   audit:
-    name: Dependency audit (advisory)
+    name: Dependency audit
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -114,5 +113,5 @@ jobs:
           python-version: '3.x'
       - run: pip install pip-audit
       - run: pip install .
-      # Advisory: not verified against a curated allow-list yet, so it must not block merges.
+      # Blocking: fix a finding by bumping the dependency, never by relaxing this.
       - run: pip-audit
