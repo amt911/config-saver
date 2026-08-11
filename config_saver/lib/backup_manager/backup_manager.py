@@ -16,7 +16,11 @@ from dataclasses import dataclass, field
 
 from config_saver.lib.errors import RootRequiredError
 from config_saver.lib.parser.parser import Parser
-from config_saver.lib.tar_compressor.tar_compressor import ARCHIVE_MODE, CompressResult, TarCompressor
+from config_saver.lib.tar_compressor.tar_compressor import (
+    ARCHIVE_MODE,
+    CompressResult,
+    TarCompressor,
+)
 
 # Backups contain secrets; their directories are private by construction.
 PRIVATE_DIR_MODE = 0o700
@@ -110,7 +114,11 @@ def _compress_job(job: tuple[str, str, str, str | None, bool]) -> ConfigOutcome:
     try:
         manager = BackupManager()
         outcome.archive_path, outcome.result = manager.compress_config_to_directory(
-            config_path, dest_dir, archive_name, description=description, show_progress=show_progress
+            config_path,
+            dest_dir,
+            archive_name,
+            description=description,
+            show_progress=show_progress,
         )
     except RootRequiredError:
         outcome.skipped_root_only = True
@@ -212,7 +220,11 @@ class BackupManager:
         cfg_basename = os.path.splitext(os.path.basename(config_path))[0]
         archive_name = f"{cfg_basename}-{timestamp}.tar.gz"
         return self.compress_config_to_directory(
-            config_path, ts_dir, archive_name, description=description, show_progress=show_progress
+            config_path,
+            ts_dir,
+            archive_name,
+            description=description,
+            show_progress=show_progress,
         )
 
     # Backwards-compatible alias.

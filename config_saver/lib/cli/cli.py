@@ -143,16 +143,36 @@ class CLI:
     def parse_args(self) -> argparse.Namespace:
         parser = argparse.ArgumentParser(description="Tar compressor/decompressor utility", prog="config-saver")
         group = parser.add_mutually_exclusive_group(required=True)
-        group.add_argument("--compress", "-c", action="store_true", help="Compress files/directories from a config")
+        group.add_argument(
+            "--compress",
+            "-c",
+            action="store_true",
+            help="Compress files/directories from a config",
+        )
         group.add_argument("--decompress", "-d", action="store_true", help="Decompress a tar file")
-        group.add_argument("--list", "-l", action="store_true", help="List saved config-saver tar.gz files")
         group.add_argument(
-            "--export-config", "-e", type=str, metavar="NAME", help="Export the latest config archive by name"
+            "--list",
+            "-l",
+            action="store_true",
+            help="List saved config-saver tar.gz files",
         )
         group.add_argument(
-            "--export-all-configs", action="store_true", help="Export the latest archive for every saved configuration"
+            "--export-config",
+            "-e",
+            type=str,
+            metavar="NAME",
+            help="Export the latest config archive by name",
         )
-        group.add_argument("--show-configs", action="store_true", help="Show available configuration names")
+        group.add_argument(
+            "--export-all-configs",
+            action="store_true",
+            help="Export the latest archive for every saved configuration",
+        )
+        group.add_argument(
+            "--show-configs",
+            action="store_true",
+            help="Show available configuration names",
+        )
         parser.add_argument(
             "--input",
             "-i",
@@ -169,7 +189,11 @@ class CLI:
         )
         parser.add_argument("--progress", "-P", action="store_true", help="Show a progress bar")
         parser.add_argument(
-            "--description", "-m", type=str, default=None, help="Optional description saved alongside the archive"
+            "--description",
+            "-m",
+            type=str,
+            default=None,
+            help="Optional description saved alongside the archive",
         )
         parser.add_argument(
             "--jobs",
@@ -185,7 +209,11 @@ class CLI:
             help=f"Exit with {EXIT_INCOMPLETE} when a configured path was missing from the backup",
         )
         parser.add_argument(
-            "--version", "-v", action="version", version=f"%(prog)s {__version__}", help="Show program version and exit"
+            "--version",
+            "-v",
+            action="version",
+            version=f"%(prog)s {__version__}",
+            help="Show program version and exit",
         )
         return parser.parse_args(self.argv)
 
@@ -358,7 +386,13 @@ class CLI:
         print(Fore.YELLOW + "Note: archives are not encrypted and may contain secrets.")
         return exit_code
 
-    def _compress(self, manager: BackupManager, args: argparse.Namespace, saves_dir: str, timestamp: str) -> int:
+    def _compress(
+        self,
+        manager: BackupManager,
+        args: argparse.Namespace,
+        saves_dir: str,
+        timestamp: str,
+    ) -> int:
         try:
             jobs = self._resolve_jobs(args.jobs)
         except ValueError as e:
@@ -415,7 +449,11 @@ class CLI:
             cfg_basename = os.path.splitext(os.path.basename(input_path))[0]
             cfg_dir = os.path.join(saves_dir, "configs", cfg_basename)
             out_path, result = manager.compress_config_to_timestamp_dir(
-                input_path, cfg_dir, timestamp, description=args.description, show_progress=args.progress
+                input_path,
+                cfg_dir,
+                timestamp,
+                description=args.description,
+                show_progress=args.progress,
             )
         else:
             out_path = args.output or os.path.join(saves_dir, f"config-saver-{timestamp}.tar.gz")

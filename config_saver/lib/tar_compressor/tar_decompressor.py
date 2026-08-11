@@ -182,7 +182,13 @@ class TarDecompressor:
 
     # -------------------------------------------------------------- extraction
 
-    def _write_file(self, tar: tarfile.TarFile, member: tarfile.TarInfo, destination: str, denormalize: bool) -> None:
+    def _write_file(
+        self,
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        destination: str,
+        denormalize: bool,
+    ) -> None:
         handle = tar.extractfile(member)
         if handle is None:
             return
@@ -240,7 +246,9 @@ class TarDecompressor:
                 members = [m for m in tar.getmembers() if m.name != METADATA_MEMBER]
                 iterator: Iterable[tarfile.TarInfo] = members
                 if self.show_progress:
-                    from tqdm import tqdm  # imported lazily: only needed for the progress bar
+                    from tqdm import (
+                        tqdm,  # imported lazily: only needed for the progress bar
+                    )
 
                     iterator = tqdm(members, desc="Extracting files", unit="file")
                     emit = tqdm.write
