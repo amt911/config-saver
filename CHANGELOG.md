@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-08-11
+
 ### Security
 
 - **Extraction is containment-checked** (#14). Archive members that use `..`, absolute names, links

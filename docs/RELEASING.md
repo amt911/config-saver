@@ -9,7 +9,15 @@ the AUR `PKGBUILD` said `3.1.1`), which made `config-saver --version` lie in rel
 2. Move the `## [Unreleased]` entries in `CHANGELOG.md` under the new version and date.
 3. Commit, then tag: `git tag v<version> && git push --tags`.
    The `release-consistency` CI job fails the tag if `v<version>` ≠ `project.version`.
-4. Bump `pkgver` (and the checksum) in the sibling **`config-saver-aur`** repo's `PKGBUILD`.
+4. In the sibling **`config-saver-aur`** repo: bump `pkgver`, refresh the checksum with
+   `updpkgsums` (it can only be computed once the tag exists), regenerate `.SRCINFO` with
+   `makepkg --printsrcinfo > .SRCINFO`, and push to the AUR.
+
+### Runtime dependencies that are not Python packages
+
+Archive encryption shells out to `age` or `gnupg`. They are **optional**: without them the tool
+works exactly as before, and a config that asks for encryption fails with a message naming the
+package. That is why they are `optdepends` in the PKGBUILD and not in `project.dependencies`.
 
 ## Notes
 
