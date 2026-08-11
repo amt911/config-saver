@@ -277,9 +277,9 @@ def test_directory_mode_is_parallel_by_default(tmp_path: Path, data_dir: Path, m
 
     original = BackupManager.compress_directory_of_configs
 
-    def spy(self, input_dir, timestamp, *, show_progress=False, description=None, jobs=1):
-        seen["jobs"] = jobs
-        return original(self, input_dir, timestamp, show_progress=show_progress, description=description, jobs=jobs)
+    def spy(self, input_dir, timestamp, **kwargs):
+        seen["jobs"] = kwargs.get("jobs", 1)
+        return original(self, input_dir, timestamp, **kwargs)
 
     monkeypatch.setattr(BackupManager, "compress_directory_of_configs", spy)
     assert run(["--compress", "--input", str(cfg_dir)]) == EXIT_OK
@@ -295,9 +295,9 @@ def test_progress_falls_back_to_sequential(tmp_path: Path, data_dir: Path, monke
 
     original = BackupManager.compress_directory_of_configs
 
-    def spy(self, input_dir, timestamp, *, show_progress=False, description=None, jobs=1):
-        seen["jobs"] = jobs
-        return original(self, input_dir, timestamp, show_progress=show_progress, description=description, jobs=jobs)
+    def spy(self, input_dir, timestamp, **kwargs):
+        seen["jobs"] = kwargs.get("jobs", 1)
+        return original(self, input_dir, timestamp, **kwargs)
 
     monkeypatch.setattr(BackupManager, "compress_directory_of_configs", spy)
     assert run(["--compress", "--progress", "--input", str(cfg_dir)]) == EXIT_OK

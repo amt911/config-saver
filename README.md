@@ -13,10 +13,11 @@ Python CLI tool for compressing and decompressing directories or files by using 
 - Missing inputs are reported, never silently skipped (`--strict` turns them into a non-zero exit).
 - Stable exit codes for scripting (see [Exit codes](#exit-codes)).
 
-> **⚠ Archives are compressed, not encrypted.** A `.tar.gz` produced from a config that lists
+> **⚠ A plain `.tar.gz` is compressed, not encrypted.** An archive produced from a config that lists
 > `~/.ssh`, `~/.config/rclone` or similar contains those secrets in the clear. config-saver keeps
 > its directories `0700` and its archives `0600`, but that protection ends the moment the file is
 > copied to cloud storage, a shared drive or another machine.
+> Use [encryption](#encryption-optional) for those configs.
 
 ## Installation
 
@@ -186,6 +187,9 @@ config-saver --compress
 - `--progress`/`-P`: Show progress bar during compression/decompression
 - `--jobs`/`-j N`: Worker count for directory mode. Default `auto` (one per CPU, capped at the number of configurations); `1` forces sequential
 - `--strict`: Exit with code 8 when a configured path was missing from the backup
+- `--encrypt-to RECIPIENT`: Encrypt the archive for this age public key or gpg key id (repeatable)
+- `--encrypt-method {age,gpg}`: Backend for `--encrypt-to` (default `age`)
+- `--identity FILE`: Key file used to decrypt an encrypted archive (required for `age`)
 - `--version`/`-v`: Show program version and exit
 
 - `--description`/`-m DESCRIPTION`: Optional short description to save alongside a created archive. When provided, the CLI will create a per-config timestamp directory and store both the `.tar.gz` and a `description.txt` file inside:
@@ -212,6 +216,7 @@ itself.
 | `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`) |
 | `7` | `--export-config NAME` matched no saved configuration |
 | `8` | `--strict` and at least one configured path was missing |
+| `9` | Encryption or decryption failed (backend missing, wrong key, bad recipient) |
 | `10` | I/O error |
 
 argparse itself exits with `2` for usage errors such as a missing action flag.
@@ -239,6 +244,49 @@ normalized.
 - Archives are written to a temporary file in the destination directory and moved into place with
   `os.replace()` only after a clean close — an interrupted run never leaves a truncated file that
   looks like a valid backup.
+
+## Encryption (optional)
+
+Archives can be encrypted with **`age`** or **`gpg`**. config-saver does not implement any crypto:
+it writes the archive, hands it to the binary you already trust, and deletes the plaintext before
+anything appears under the final name. The result is an ordinary `age`/`gpg` file — `age -d
+backup.tar.gz.age > backup.tar.gz` gives you exactly the archive you would have had without
+encryption.
+
+Per configuration (this is what a systemd timer uses, no flags involved):
+
+```yaml
+encrypt:
+  method: age            # or gpg
+  recipients:
+    - age1qz...          # age public key, or a gpg key id / user id
+directories:
+  - "$HOME/.ssh"
+```
+
+Or from the command line, which overrides whatever the config says:
+
+```sh
+config-saver --compress -i secrets.yaml --encrypt-to age1qz...
+config-saver --compress --encrypt-to me@example.com --encrypt-method gpg
+```
+
+The archive gains a `.age` or `.gpg` suffix (`zsh-20260811-120000.tar.gz.age`) and is still listed,
+exported and restored like any other:
+
+```sh
+config-saver --decompress -i zsh-20260811-120000.tar.gz.age --identity ~/.config/age/key.txt
+config-saver --decompress -i zsh-20260811-120000.tar.gz.gpg   # gpg uses its own agent/keyring
+```
+
+Notes:
+
+- `age` needs `--identity` to decrypt; `gpg` uses its agent, so `--identity` is optional there.
+- Recipients are **public** keys: the machine taking backups never needs the private key.
+- The plaintext archive is written to a `0600` temporary file in the destination directory and
+  removed as soon as the encrypted file is in place; a failed run leaves neither.
+- Encryption failures exit with code `9` and never leave a partial archive.
+- What is *not* protected: the file name, its size and its timestamp.
 
 ## User-independent path normalization
 
