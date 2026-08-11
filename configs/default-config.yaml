@@ -98,9 +98,17 @@ directories:
         - .themes
         - .icons
 
+    # ⚠ SECRETS ⚠
+    # config-saver archives are plain .tar.gz: compressed, NOT encrypted. Anything
+    # listed below ends up readable by whoever can read the archive, so private
+    # keys are deliberately NOT part of this default config.
+    # To include a private key, add it explicitly (e.g. `- id_ed25519`) and keep the
+    # resulting archive off cloud storage, backups and shared drives.
     - source: "$HOME/.ssh"
       files:
-        - id_ed25519
         - id_ed25519.pub
+        - known_hosts
+        - config
 
+    # rclone.conf holds cloud tokens/credentials in clear text; same warning applies.
     - "$HOME/.config/rclone"

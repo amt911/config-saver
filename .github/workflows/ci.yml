@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 concurrency:
@@ -10,18 +11,83 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
-    name: Type-check · import smoke
+  lint:
+    name: Lint · format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.12'
       - run: pip install '.[dev]'
-      # No test suite exists yet; compile every module as a smoke check.
-      - run: python -m compileall -q config_saver
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    name: Tests · mypy (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The minimum supported version and the current stable one.
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install '.[dev]'
       - run: mypy config_saver
+      # The gate is the behavioural suite; ratchet --cov-fail-under as coverage grows.
+      - run: pytest --cov=config_saver --cov-report=term-missing --cov-fail-under=80
+
+  packaging:
+    name: Build · install smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install build
+      - run: python -m build
+      - name: Install the wheel into a clean environment
+        run: |
+          python -m venv /tmp/cleanenv
+          /tmp/cleanenv/bin/pip install dist/*.whl
+          /tmp/cleanenv/bin/config-saver --version
+          /tmp/cleanenv/bin/config-saver --help
+          # The example configs must be reachable from a pip install, not only from the AUR package.
+          test -f /tmp/cleanenv/share/config-saver/configs/default-config.yaml
+      - name: Install the sdist into a clean environment
+        run: |
+          python -m venv /tmp/sdistenv
+          /tmp/sdistenv/bin/pip install dist/*.tar.gz
+          /tmp/sdistenv/bin/config-saver --version
+
+  systemd:
+    name: systemd units
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: systemd-analyze verify contrib/systemd/system/config-saver@.service contrib/systemd/system/config-saver@.timer
+      - run: systemd-analyze verify contrib/systemd/user/config-saver.service contrib/systemd/user/config-saver.timer
+
+  release-consistency:
+    name: Tag matches pyproject version
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The 3.0.3-vs-3.1.1 drift shipped a --version that lied; make it a CI failure.
+      - run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PYPROJECT=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag=$TAG pyproject=$PYPROJECT"
+          test "$TAG" = "$PYPROJECT"
 
   sast:
     name: SAST (Semgrep)

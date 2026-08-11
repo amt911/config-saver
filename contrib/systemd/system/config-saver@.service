@@ -6,11 +6,12 @@ After=network.target
 [Service]
 Type=oneshot
 # Run the job as the target user so archives are written to their $HOME rather than root's.
+# systemd derives HOME/USER/SHELL from the user record when User= is set; do not hardcode them.
 User=%i
+WorkingDirectory=~
 Environment=PYTHONUNBUFFERED=1
-# Ensure HOME is set correctly for the invoked process
-Environment=HOME=/home/%i
-WorkingDirectory=/home/%i
+# Archives contain secrets: keep every file the run creates private.
+UMask=0077
 # Prefer system python; if you need a venv use the absolute python binary below
 ExecStart=/usr/bin/env python3 -m config_saver --compress --description "Automated backup by systemd timer"
 

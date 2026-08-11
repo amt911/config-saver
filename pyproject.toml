@@ -1,18 +1,20 @@
-
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "setuptools_scm"]
+requires = ["setuptools>=64.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 
 [project]
 name = "config_saver"
-version = "3.0.3"
+# Single source of truth for the version. The release process (docs/RELEASING.md)
+# keeps this value, the git tag and the AUR PKGBUILD in sync; CI enforces it on tags.
+version = "3.1.1"
 description = "Python CLI tool for validating, converting, and managing YAML/JSON configs, with tar compression utilities"
 license = { file = "LICENSE" }
 readme = "README.md"
-requires-python = ">=3.7"
+# 3.10+: models/model.py evaluates `str | SpecificFilesModel` at runtime via pydantic.
+requires-python = ">=3.10"
 dependencies = [
-    "pydantic",
+    "pydantic>=2,<3",
     "colorama",
     "tqdm",
     "pyyaml",
@@ -37,15 +39,50 @@ include-package-data = true
 where = ["."]
 include = ["config_saver*"]
 
+# Example configs are not importable package data: they are installed next to the
+# distribution so a pip install has something to fall back to when
+# /etc/config-saver/configs does not exist (the AUR package installs that one).
+[tool.setuptools.data-files]
+"share/config-saver/configs" = ["configs/*.yaml"]
+
 [project.optional-dependencies]
 dev = [
     "mypy",
     "types-PyYAML",
     "types-colorama",
-    "types-tqdm"
+    "types-tqdm",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "pre-commit"
 ]
 
-[tool.setuptools_scm]
-version_scheme = "guess-next-dev"
-local_scheme = "node-and-date"
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: tests that build wheels or walk large trees",
+]
 
+[tool.coverage.run]
+source = ["config_saver"]
+branch = true
+
+[tool.mypy]
+python_version = "3.10"
+check_untyped_defs = true
+warn_unused_ignores = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",  # line length is handled by the formatter
+    "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]

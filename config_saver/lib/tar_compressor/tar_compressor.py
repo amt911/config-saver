@@ -1,27 +1,63 @@
 """Module providing a tar compressor based on a YAML configuration with pydantic validation"""
+
+from __future__ import annotations
+
 import io
+import json
 import os
 import tarfile
-from typing import Optional
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
 
-from colorama import init
-from tqdm import tqdm
-
+from config_saver import __version__
 from config_saver.lib.models.model import Model
-
-init(autoreset=True)
 
 # Placeholder for user home directory in file contents
 HOME_CONTENT_PLACEHOLDER = "<<<HOME_PLACEHOLDER>>>"
 
-# Import Fore for colored warnings
-from colorama import Fore
+# Archive-level metadata member. It records whether contents were normalized so
+# decompression does not have to guess (a file may legitimately contain the
+# placeholder string).
+METADATA_MEMBER = ".config-saver-metadata.json"
+METADATA_FORMAT = 1
 
+# Archives may contain secrets (ssh keys, cloud tokens): never rely on the umask.
+ARCHIVE_MODE = 0o600
+
+
+def _no_emit(_message: str) -> None:
+    """Discard progress messages when no progress bar is attached."""
+
+
+@dataclass
+class CompressResult:
+    """Structured outcome of a compression run.
+
+    The library returns this instead of printing: the CLI decides what to render
+    and which exit code a partial backup deserves.
+    """
+
+    output_path: str
+    added: int = 0
+    skipped_root_owned: list[str] = field(default_factory=list)
+    missing_inputs: list[str] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        """True when every configured input made it into the archive."""
+        return not self.missing_inputs and not self.skipped_root_owned
 
 
 class TarCompressor:
     """Class representing a tar compressor"""
-    def __init__(self, yaml_data: Model, output_path: str = "output.tar.gz", base_dir: Optional[str] = None, show_progress: bool = False):
+
+    def __init__(
+        self,
+        yaml_data: Model,
+        output_path: str = "output.tar.gz",
+        base_dir: str | None = None,
+        show_progress: bool = False,
+    ):
         # yaml_data is expected to be a validated Model instance
         self.yaml_data = yaml_data
         self.output_path = output_path
@@ -35,23 +71,24 @@ class TarCompressor:
     def _is_root_owned(self, file_path: str) -> bool:
         """Check if a file is owned by root (uid=0 or gid=0)"""
         try:
-            stat_info = os.stat(file_path)
+            stat_info = os.lstat(file_path)
             return stat_info.st_uid == 0 or stat_info.st_gid == 0
-        except (OSError, IOError):
+        except OSError:
             return False
 
     def _normalize_path(self, file_path: str) -> str:
         """Normalize path by replacing user's home directory with 'home/user/' placeholder"""
         # Ensure we're working with absolute paths
         abs_path = os.path.abspath(file_path)
-        
-        # If the path starts with the user's home directory, replace it
-        if abs_path.startswith(self.user_home):
-            # Replace /home/username with home/user
+
+        # Only a real path *inside* the home directory is normalized. A plain
+        # startswith() would also match a sibling home such as /home/andres2.
+        if abs_path == self.user_home or abs_path.startswith(self.user_home.rstrip(os.sep) + os.sep):
             relative_to_home = os.path.relpath(abs_path, self.user_home)
-            normalized = os.path.join("home", "user", relative_to_home)
-            return normalized
-        
+            if relative_to_home == os.curdir:
+                return os.path.join("home", "user")
+            return os.path.join("home", "user", relative_to_home)
+
         # For paths outside home, keep them as is but remove leading slash
         arcname = os.path.normpath(abs_path)
         if arcname.startswith(os.sep):
@@ -63,157 +100,202 @@ class TarCompressor:
         # Known binary extensions (images, fonts, archives, etc.)
         binary_extensions = {
             # Images
-            '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.webp', '.tiff', '.tif',
+            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp", ".tiff", ".tif",
             # Fonts
-            '.ttf', '.otf', '.woff', '.woff2', '.eot',
+            ".ttf", ".otf", ".woff", ".woff2", ".eot",
             # Archives
-            '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar',
+            ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
             # Executables and libraries
-            '.so', '.a', '.o', '.pyc', '.pyo', '.exe', '.dll', '.dylib',
+            ".so", ".a", ".o", ".pyc", ".pyo", ".exe", ".dll", ".dylib",
             # Databases
-            '.db', '.sqlite', '.sqlite3',
+            ".db", ".sqlite", ".sqlite3",
             # Media
-            '.mp3', '.mp4', '.avi', '.mkv', '.wav', '.flac', '.ogg',
+            ".mp3", ".mp4", ".avi", ".mkv", ".wav", ".flac", ".ogg",
             # Documents (binary formats)
-            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-        }
-        
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        }  # fmt: skip
+
         # Check extension first (fast path)
         _, ext = os.path.splitext(file_path.lower())
         if ext in binary_extensions:
             return False
-        
+
         try:
             # Try to read first 8192 bytes and check for null bytes
-            with open(file_path, 'rb') as f:
+            with open(file_path, "rb") as f:
                 chunk = f.read(8192)
-                # If there are null bytes, it's likely binary
-                if b'\0' in chunk:
-                    return False
-                # Try to decode as UTF-8
-                try:
-                    chunk.decode('utf-8')
-                    return True
-                except UnicodeDecodeError:
-                    return False
-        except (OSError, IOError):
+        except OSError:
             return False
 
-    def _normalize_file_content(self, file_path: str) -> Optional[bytes]:
-        """Read file content and replace user home paths with placeholder. Returns None if file should not be modified."""
-        if not self._is_text_file(file_path):
-            return None
-        
+        # Null bytes mean binary; otherwise anything that decodes as UTF-8 or as
+        # latin-1 is treated as text (latin-1 is the fallback used when writing
+        # the normalized content back, so it must be accepted here too).
+        if b"\0" in chunk:
+            return False
         try:
-            with open(file_path, 'rb') as f:
-                content = f.read()
-            
-            # Try to decode and replace
-            try:
-                text_content = content.decode('utf-8')
-                # Replace absolute home path with placeholder
-                if self.user_home in text_content:
-                    text_content = text_content.replace(self.user_home, HOME_CONTENT_PLACEHOLDER)
-                    return text_content.encode('utf-8')
-            except UnicodeDecodeError:
-                # If UTF-8 fails, try latin-1
-                text_content = content.decode('latin-1')
-                if self.user_home in text_content:
-                    text_content = text_content.replace(self.user_home, HOME_CONTENT_PLACEHOLDER)
-                    return text_content.encode('latin-1')
-            
-            return None  # No replacement needed
-        except (OSError, IOError):
+            chunk.decode("utf-8")
+            return True
+        except UnicodeDecodeError:
+            pass
+        try:
+            chunk.decode("latin-1")
+            return True
+        except UnicodeDecodeError:
+            return False
+
+    def _normalize_file_content(self, file_path: str) -> bytes | None:
+        """Read file content and replace user home paths with placeholder.
+
+        Returns None when the file must be archived unchanged.
+        """
+        if os.path.islink(file_path) or not self._is_text_file(file_path):
             return None
 
-    def compress(self):
-        """Compress files and directories with a global progress bar for all files, showing current file name."""
-        file_list: list[str] = []
-        skipped_root_files: list[str] = []  # Track skipped root-owned files
+        try:
+            with open(file_path, "rb") as f:
+                content = f.read()
+        except OSError:
+            return None
+
+        for encoding in ("utf-8", "latin-1"):
+            try:
+                text_content = content.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+            if self.user_home in text_content:
+                return text_content.replace(self.user_home, HOME_CONTENT_PLACEHOLDER).encode(encoding)
+            return None  # decodes fine, nothing to replace
+        return None
+
+    def _iter_entries(self, result: CompressResult) -> Iterator[tuple[str, bool]]:
+        """Yield (path, is_dir) for every configured input, deterministically.
+
+        Missing inputs are recorded on ``result`` instead of being dropped: a
+        backup that silently skips what it was asked to save is worse than one
+        that fails.
+        """
+
+        def walk(root: str) -> Iterator[tuple[str, bool]]:
+            # The directory itself is archived so empty directories survive a round-trip.
+            yield root, True
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames.sort()
+                filenames.sort()
+                for d in dirnames:
+                    yield os.path.join(dirpath, d), True
+                for f in filenames:
+                    yield os.path.join(dirpath, f), False
+
         for entry in self.yaml_data.directories:
             if isinstance(entry, str):
-                if os.path.exists(entry):
-                    for root, _, files in os.walk(entry):
-                        for f in files:
-                            file_list.append(os.path.join(root, f))
-            else:
-                source = entry.source
-                if os.path.exists(source):
-                    for file in entry.files:
-                        file_path = os.path.join(source, file)
-                        if os.path.exists(file_path):
-                            # Check if it's a directory - if so, walk it recursively
-                            if os.path.isdir(file_path):
-                                for root, _, files in os.walk(file_path):
-                                    for f in files:
-                                        file_list.append(os.path.join(root, f))
-                            else:
-                                # It's a file, add it directly
-                                file_list.append(file_path)
+                if "${" in entry or not os.path.lexists(entry):
+                    result.missing_inputs.append(entry)
+                    continue
+                if os.path.isdir(entry) and not os.path.islink(entry):
+                    yield from walk(entry)
+                else:
+                    yield entry, False
+                continue
 
-        with tarfile.open(self.output_path, "w:gz") as tar:
-            if self.show_progress:
-                for file_path in tqdm(file_list, desc="Compressing files", unit="file"):
+            source = entry.source
+            if "${" in source or not os.path.isdir(source):
+                result.missing_inputs.append(source)
+                continue
+            for file in entry.files:
+                file_path = os.path.join(source, file)
+                if not os.path.lexists(file_path):
+                    result.missing_inputs.append(file_path)
+                    continue
+                if os.path.isdir(file_path) and not os.path.islink(file_path):
+                    yield from walk(file_path)
+                else:
+                    yield file_path, False
+
+    def _collect(self, result: CompressResult) -> Iterator[tuple[str, str, bool]]:
+        """Yield (path, arcname, is_dir) with duplicates removed, order preserved."""
+        seen: set[str] = set()
+        for path, is_dir in self._iter_entries(result):
+            arcname = self._normalize_path(path)
+            if arcname in seen:
+                continue
+            seen.add(arcname)
+            yield path, arcname, is_dir
+
+    def _write_metadata(self, tar: tarfile.TarFile) -> None:
+        """Store how the archive was produced, so restore does not have to guess."""
+        payload = json.dumps(
+            {
+                "format": METADATA_FORMAT,
+                "tool_version": __version__,
+                "normalize_content": bool(self.yaml_data.normalize_content),
+            },
+            indent=2,
+        ).encode("utf-8")
+        info = tarfile.TarInfo(METADATA_MEMBER)
+        info.size = len(payload)
+        info.mode = 0o600
+        tar.addfile(info, io.BytesIO(payload))
+
+    def compress(self) -> CompressResult:
+        """Compress every configured file/directory into ``self.output_path``.
+
+        The archive is written to a temporary file in the destination directory
+        and moved into place with ``os.replace`` only after a clean close, so an
+        interrupted run never leaves a truncated file that looks like a backup.
+        """
+        result = CompressResult(output_path=self.output_path)
+
+        emit: Callable[[str], None] = _no_emit
+        items: Iterable[tuple[str, str, bool]] = self._collect(result)
+        if self.show_progress:
+            from tqdm import tqdm  # imported lazily: only needed for the progress bar
+
+            # Materialise the list only when a total is actually needed; in headless
+            # mode the generator keeps startup latency and memory flat.
+            items = tqdm(list(items), desc="Compressing files", unit="file")
+            emit = tqdm.write
+
+        out_dir = os.path.dirname(os.path.abspath(self.output_path)) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        tmp_path = os.path.join(out_dir, f".{os.path.basename(self.output_path)}.{os.getpid()}.part")
+
+        try:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, ARCHIVE_MODE)
+            with os.fdopen(fd, "wb") as raw, tarfile.open(fileobj=raw, mode="w:gz") as tar:
+                self._write_metadata(tar)
+                for path, arcname, is_dir in items:
                     # Skip root-owned files if only_root_user is false and current user is not root
-                    if not self.yaml_data.only_root_user and self.current_uid != 0:
-                        if self._is_root_owned(file_path):
-                            tqdm.write(f"Skipping root-owned file (only_root_user=false): {file_path}")
-                            skipped_root_files.append(file_path)
-                            continue
-                    
-                    arcname = self._normalize_path(file_path)
-                    
-                    # Try to normalize file content (only if enabled in YAML)
+                    if not self.yaml_data.only_root_user and self.current_uid != 0 and self._is_root_owned(path):
+                        emit(f"Skipping root-owned file (only_root_user=false): {path}")
+                        result.skipped_root_owned.append(path)
+                        continue
+
+                    if is_dir:
+                        tar.add(path, arcname=arcname, recursive=False)
+                        result.added += 1
+                        continue
+
                     normalized_content = None
                     if self.yaml_data.normalize_content:
-                        normalized_content = self._normalize_file_content(file_path)
-                    
+                        normalized_content = self._normalize_file_content(path)
+
                     if normalized_content is not None:
-                        # File content was normalized, add from memory
-                        tqdm.write(f"Compressing (normalized): {file_path} -> {arcname}")
-                        tarinfo = tar.gettarinfo(file_path, arcname=arcname)
+                        emit(f"Compressing (normalized): {path} -> {arcname}")
+                        tarinfo = tar.gettarinfo(path, arcname=arcname)
                         tarinfo.size = len(normalized_content)
                         tar.addfile(tarinfo, fileobj=io.BytesIO(normalized_content))
                     else:
-                        # Add file as-is
-                        tqdm.write(f"Compressing: {file_path} -> {arcname}")
-                        tar.add(file_path, arcname=arcname)
-            else:
-                for file_path in file_list:
-                    # Skip root-owned files if only_root_user is false and current user is not root
-                    if not self.yaml_data.only_root_user and self.current_uid != 0:
-                        if self._is_root_owned(file_path):
-                            skipped_root_files.append(file_path)
-                            continue
-                    
-                    arcname = self._normalize_path(file_path)
-                    
-                    # Try to normalize file content (only if enabled in YAML)
-                    normalized_content = None
-                    if self.yaml_data.normalize_content:
-                        normalized_content = self._normalize_file_content(file_path)
-                    
-                    if normalized_content is not None:
-                        # File content was normalized, add from memory
-                        tarinfo = tar.gettarinfo(file_path, arcname=arcname)
-                        tarinfo.size = len(normalized_content)
-                        tar.addfile(tarinfo, fileobj=io.BytesIO(normalized_content))
-                    else:
-                        # Add file as-is
-                        tar.add(file_path, arcname=arcname)
-        
-        # Show warning if root-owned files were skipped
-        if skipped_root_files:
-            print(Fore.YELLOW + f"\n⚠ Warning: {len(skipped_root_files)} root-owned file(s) were skipped because 'only_root_user' is not set to true.")
-            print(Fore.YELLOW + "  To include these files, either:")
-            print(Fore.YELLOW + "  1. Set 'only_root_user: true' in your YAML config and run with sudo")
-            print(Fore.YELLOW + "  2. Change ownership of the files to your user")
-            if not self.show_progress and len(skipped_root_files) <= 10:
-                print(Fore.YELLOW + "\n  Skipped files:")
-                for f in skipped_root_files:
-                    print(Fore.YELLOW + f"    - {f}")
-            elif not self.show_progress and len(skipped_root_files) > 10:
-                print(Fore.YELLOW + "\\n  First 10 skipped files:")
-                for f in skipped_root_files[:10]:
-                    print(Fore.YELLOW + f"    - {f}")
-                print(Fore.YELLOW + f"    ... and {len(skipped_root_files) - 10} more")
+                        emit(f"Compressing: {path} -> {arcname}")
+                        tar.add(path, arcname=arcname)
+                    result.added += 1
+            os.chmod(tmp_path, ARCHIVE_MODE)
+            os.replace(tmp_path, self.output_path)
+        except BaseException:
+            # Never leave a partial archive behind, whatever went wrong.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+        return result
