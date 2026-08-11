@@ -5,11 +5,18 @@ Python CLI tool for compressing and decompressing directories or files by using 
 
 ## Main Features
 
-- Validate YAML and JSON files using Pydantic models.
-- Compress files and directories into `.tar.gz` archives.
-- Decompress `.tar.gz` archives, preserving the original structure.
+- Validate YAML and JSON files using Pydantic models (unknown keys are rejected, not ignored).
+- Compress files and directories into `.tar.gz` archives, written atomically and with mode `0600`.
+- Decompress `.tar.gz` archives, preserving the original structure, with containment-checked extraction.
 - Optional progress bar for compression/decompression (`--progress`/`-P`).
-- Robust error handling and clear messages.
+- Parallel compression of independent configurations (`--jobs`/`-j`).
+- Missing inputs are reported, never silently skipped (`--strict` turns them into a non-zero exit).
+- Stable exit codes for scripting (see [Exit codes](#exit-codes)).
+
+> **⚠ Archives are compressed, not encrypted.** A `.tar.gz` produced from a config that lists
+> `~/.ssh`, `~/.config/rclone` or similar contains those secrets in the clear. config-saver keeps
+> its directories `0700` and its archives `0600`, but that protection ends the moment the file is
+> copied to cloud storage, a shared drive or another machine.
 
 ## Installation
 
@@ -23,13 +30,26 @@ pip install .
 
 ### Development dependencies
 
-Install the package along with development tools (type checking, linters, etc.):
+Install the package along with development tools (tests, type checking, linters, hooks):
 
 ```sh
-pip install '.[dev]'
+pip install -e '.[dev]'
+pre-commit install --hook-type pre-commit --hook-type pre-push
 ```
 
-This will install `mypy` and type stubs.
+This installs `pytest`, `pytest-cov`, `ruff`, `mypy`, type stubs and `pre-commit`.
+
+Day-to-day commands:
+
+```sh
+pytest                      # the behavioural suite
+pytest --cov=config_saver   # with coverage (CI gate: 80%)
+ruff check . && ruff format --check .
+mypy config_saver
+```
+
+The hooks run `ruff`, `ruff format` and `mypy` before each commit, and the full test suite before
+each push, so activate this environment in the shell you commit and push from.
 
 
 ### As an Arch Linux package
@@ -73,12 +93,27 @@ config-saver --compress
 config-saver --progress --compress
 ```
 
-Compress configuration to custom location:
+Compress **one** configuration to a custom location. `--output` names a single archive, so it
+requires a single config file as `--input` (in directory mode config-saver creates one archive per
+configuration and `--output` is rejected):
 
 ```sh
-config-saver --compress --output archive.tar.gz
+config-saver --compress --input /etc/config-saver/configs/zsh.yaml --output archive.tar.gz
 # With progress bar
-config-saver --progress --compress --output archive.tar.gz
+config-saver --progress --compress --input /etc/config-saver/configs/zsh.yaml --output archive.tar.gz
+```
+
+Compress every configuration in parallel (one process per archive; gzip is CPU-bound):
+
+```sh
+config-saver --compress --jobs 4
+config-saver --compress --jobs auto
+```
+
+Fail the run when a configured path was missing:
+
+```sh
+config-saver --compress --strict
 ```
 
 Compress with a short description. This creates a per-config timestamp directory and a `description.txt` next to the archive:
@@ -95,13 +130,20 @@ config-saver --compress -i /etc/config-saver/configs/default-config.yaml -o ~/ba
 
 ### Decompression
 
-Decompress a tar.gz archive:
+Decompress a tar.gz archive. Without `--output` the archive is restored to its original absolute
+locations (home-relative members land in the *current* user's home); with `--output` everything is
+extracted below that directory:
 
 ```sh
-config-saver --decompress archive.tar.gz
+config-saver --decompress --input archive.tar.gz
+config-saver --decompress --input archive.tar.gz --output /tmp/restored
 # With progress bar
-config-saver --progress --decompress archive.tar.gz
+config-saver --progress --decompress --input archive.tar.gz
 ```
+
+Extraction refuses any member that would land outside the destination: `..` traversal, absolute
+member names, links pointing out of the root, and device/fifo members are rejected with exit code
+`5` before anything is written. `setuid`/`setgid` bits are never restored.
 
 ### Listing
 
@@ -129,9 +171,11 @@ config-saver --compress
 `--export-config`/`-e NAME`: Export the latest config archive by name
 `--export-all-configs`: Export the latest archive for every saved configuration
 `--show-configs`: Show available configuration names
-`--input`/`-i INPUT`: Input YAML config (for compress) or tar file (for decompress)
+`--input`/`-i INPUT`: Input YAML/JSON config **or config directory** (for compress) or tar file (for decompress). Defaults to `/etc/config-saver/configs`, falling back to the examples shipped with a pip install (`<prefix>/share/config-saver/configs`)
 `--output`/`-o OUTPUT`: Output tar file (for compress), extraction directory (for decompress), or destination directory (for export-all-configs)
 - `--progress`/`-P`: Show progress bar during compression/decompression
+- `--jobs`/`-j N`: Compress N configurations in parallel (directory mode only; `auto` = one per CPU)
+- `--strict`: Exit with code 8 when a configured path was missing from the backup
 - `--version`/`-v`: Show program version and exit
 
 - `--description`/`-m DESCRIPTION`: Optional short description to save alongside a created archive. When provided, the CLI will create a per-config timestamp directory and store both the `.tar.gz` and a `description.txt` file inside:
@@ -143,6 +187,48 @@ config-saver --compress
 ```
 
 If no `--description` is given, archives are stored in the original (backwards-compatible) locations.
+`--description` and `--output` cannot be combined: the description mode decides the archive location
+itself.
+
+## Exit codes
+
+| Code | Meaning |
+|-----:|---------|
+| `0` | Success |
+| `2` | Configuration file, config directory or archive not found |
+| `3` | Configuration failed validation (bad shape, unknown key) |
+| `4` | Permission denied, including `only_root_user: true` run as non-root |
+| `5` | Archive error: corrupt archive, or a member refused as unsafe |
+| `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`) |
+| `7` | `--export-config NAME` matched no saved configuration |
+| `8` | `--strict` and at least one configured path was missing |
+| `10` | I/O error |
+
+argparse itself exits with `2` for usage errors such as a missing action flag.
+
+## Round-trip semantics
+
+`compress` → `decompress` reproduces:
+
+- file contents, byte for byte (binary, UTF-8 and Latin-1 text alike);
+- the directory structure, **including empty directories**;
+- symlinks, as symlinks;
+- permission bits, minus `setuid`/`setgid`, which are deliberately dropped on restore.
+
+It does **not** preserve ownership, mtimes, ACLs or extended attributes.
+
+Each archive carries a `.config-saver-metadata.json` member recording whether `normalize_content`
+was enabled, so a file that legitimately contains the literal `<<<HOME_PLACEHOLDER>>>` string is no
+longer rewritten on extraction. Archives created before this metadata existed are still treated as
+normalized.
+
+## Storage layout and permissions
+
+- Directories created by config-saver: `0700`.
+- Archives and `description.txt`: `0600`, set at creation instead of relying on the umask.
+- Archives are written to a temporary file in the destination directory and moved into place with
+  `os.replace()` only after a clean close — an interrupted run never leaves a truncated file that
+  looks like a valid backup.
 
 ## User-independent path normalization
 
@@ -235,6 +321,11 @@ You can also use advanced placeholders:
 - `${ENDS_WITH=".default-release"}` to find folders ending with that text.
 - `${BEGINS_WITH="prefix"}` to find folders starting with that text.
 
+Matching is **deterministic**: candidates are sorted, so directory order on disk never changes the
+result, and when several entries match, the first sorted one wins. A placeholder that matches
+nothing is left unexpanded and reported as a missing input (and fails the run under `--strict`)
+instead of disappearing silently.
+
 Example:
 
 ```yaml
@@ -306,7 +397,7 @@ sudo config-saver --compress --input /etc/config-saver/configs/system-root-only.
 config-saver --compress --input ~/.config/my-config.yaml
 # Output during compression (if --progress is used):
 # "Skipping root-owned file (only_root_user=false): /some/root/file"
-# 
+#
 # Output at the end:
 # ⚠ Warning: 3 root-owned file(s) were skipped because 'only_root_user' is not set to true.
 #   To include these files, either:
@@ -447,8 +538,13 @@ The repository also includes templated units that allow a root-managed timer to 
 
 Notes:
 
-- The templated service sets `User=%i` and `HOME=/home/%i` so outputs are written to `/home/alice/.config/config-saver` by default.
-- If the target user has a non-standard home directory, adjust the `Environment=HOME=...` and `WorkingDirectory=` lines in the installed unit.
+- The templated service sets `User=%i` and lets systemd derive `HOME`/`USER` from the user record,
+  so outputs land in that user's `~/.config/config-saver` even with a non-standard home directory.
+- The user units are plain (non-templated) units: they set no `User=`, no `HOME=`, and install into
+  `default.target`.
+- Both timers use `OnCalendar=*-*-* 03:00:00` with `Persistent=true`, i.e. daily at 03:00 with a
+  catch-up run after downtime. (They previously used `OnActiveSec=3h`, which fires **once**.)
+- Both services set `UMask=0077` so scheduled runs never create world-readable archives.
 - For virtualenv usage, change `ExecStart` to the absolute python path in the venv.
 
 ## Credits

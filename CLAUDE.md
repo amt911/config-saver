@@ -18,8 +18,9 @@ backups.
   absolute paths and the default config includes `~/.ssh` and `~/.config/rclone`. Treat any change to
   `tar_compressor/` or `configs/` as security-relevant; see the open security issues before touching
   extraction.
-- **There is no test suite yet** (tracked in the repo's issues). Until there is, "it type-checks" is
-  not evidence — run the CLI against a scratch config and inspect the resulting archive/tree.
+- **`pytest` is the gate** (`tests/`, ~85% coverage, CI fails under 80%). "It type-checks" is not
+  evidence: run `pytest`, and for compress/restore changes also run the CLI against a scratch config
+  and inspect the resulting archive/tree.
 
 ## ⚡ graphify — use every session
 
@@ -109,17 +110,22 @@ numbers you'd trust by mistake.
 - `config_saver/lib/models/` — Pydantic models (`model.py`, `specific_files_model.py`).
 - `config_saver/lib/parser/` — YAML/JSON parser.
 - `config_saver/lib/tar_compressor/` — compress / decompress.
-- `config_saver/lib/backup_mapager/` — backup orchestration. (Dir is literally spelled
-  `backup_mapager` — a typo baked into the import path; don't rename without fixing imports.)
-- `configs/*.yaml` — example config files.
+- `config_saver/lib/backup_manager/` — backup orchestration (renamed from the `backup_mapager` typo).
+- `config_saver/lib/errors.py` — typed exceptions; control flow keys off types, never off messages.
+- `configs/*.yaml` — example config files (also installed to `<prefix>/share/config-saver/configs`).
+- `tests/` — pytest suite, one file per concern (round-trip, extraction security, CLI exit codes…).
 
 ## Commands
 
 ```bash
-pip install .            # install
-pip install '.[dev]'     # + mypy and type stubs
-python -m config_saver   # run the CLI
-mypy config_saver        # type check
+pip install .                  # install
+pip install -e '.[dev]'        # + pytest, ruff, mypy, pre-commit and stubs
+pre-commit install --hook-type pre-commit --hook-type pre-push
+python -m config_saver         # run the CLI
+pytest                         # test suite
+pytest --cov=config_saver      # with coverage (gate: 80%)
+ruff check . && ruff format --check .
+mypy config_saver              # type check (--check-untyped-defs is on)
 ```
 
 Wrap anything long-running in the memory cgroup from the section above — a compress run over a real
@@ -127,10 +133,10 @@ home directory is exactly the kind of job that is cheap to underestimate.
 
 ## Tests and quality
 
-**Current state, stated plainly: there is no test suite.** CI runs `python -m compileall` + `mypy`,
-which proves the modules import, nothing more. `mypy` also runs without `--check-untyped-defs`, so
-the body of `TarCompressor.compress()` — the core of the tool — is not type-checked. Treat the
-sections below as the target the next test-bearing PR moves toward, not as a description of today.
+**Current state:** `tests/` covers round-trip integrity, extraction-security regressions (one per
+attack vector), the parser/models, the path expander, the backup manager (including parallel batch
+mode), CLI exit codes, the systemd units and the packaging metadata. `mypy` runs with
+`--check-untyped-defs`. The rules below describe today, and the bar for anything new.
 
 - **Runner:** `pytest` + `pytest-cov`, declared in `[project.optional-dependencies].dev`.
 - **Layout:** `tests/` at the repo root, mirroring `config_saver/lib/` one file per module.
@@ -154,7 +160,7 @@ accents, nested directories.
 | `parser/`, `models/` | parser tests + validate every file under `configs/` |
 | `utils/path_expander.py` | expander tests (pure, deterministic — no excuse) |
 | `cli/` | CLI-by-subprocess tests, including the **exit code** for the affected path |
-| `backup_mapager/` | manager tests + `--list` / `--show-configs` / `--export-*` by hand |
+| `backup_manager/` | manager tests + `--list` / `--show-configs` / `--export-*` by hand |
 | anything ambiguous or large | full suite + install the wheel in a scratch venv and smoke the CLI |
 
 ### What to test per module
@@ -165,7 +171,7 @@ accents, nested directories.
 | `parser/parser.py` | invalid YAML, missing required fields, `only_root_user: true` as non-root, `directories` mixing plain strings and `{source, files}` |
 | `tar_compressor/tar_compressor.py` | path normalization (including sibling home dirs), text/binary classification, content normalization, root-owned skip |
 | `tar_compressor/tar_decompressor.py` | round-trip, **and one regression per malicious-archive vector**: `../` member, absolute member name, symlink escaping the root, hardlink, device node |
-| `backup_mapager/backup_manager.py` | archive listing, per-config timestamp dirs, description round-trip, XDG fallback on `PermissionError` |
+| `backup_manager/backup_manager.py` | archive listing, per-config timestamp dirs, description round-trip, XDG fallback on `PermissionError` |
 | `cli/cli.py` | every flag, `--version`, and the documented exit codes (2, 3, 4, 5, 6, 7, 10) |
 
 ### TDD — required for new logic
@@ -224,16 +230,21 @@ edge cases — and have the AI implement against them.
 
 **Policy — heavy checks run locally on push, CI stays lean.**
 
-- **Pre-push** should run the full local gate: `pytest --cov` + `mypy config_saver` (+ `ruff check`
-  once it exists). Emergency bypass only via `--no-verify`, and then you own the breakage.
+- **Pre-push** runs the full local gate via `pre-commit` (`pytest`), on top of the per-commit
+  `ruff check`, `ruff format` and `mypy`. Emergency bypass only via `--no-verify`, and then you own
+  the breakage.
 - **GitHub Actions** (`.github/workflows/ci.yml`) — only the cheap, important checks:
-  - `checks` → `mypy` and, once the suite exists, the test run. It currently runs
-    `python -m compileall` as a stand-in; **that placeholder goes away with the first test PR**.
+  - `lint` → `ruff check` + `ruff format --check`.
+  - `test` → `mypy` + `pytest --cov --cov-fail-under=80` on a Python 3.10–3.13 matrix.
+  - `packaging` → build wheel + sdist, install each into a clean venv, smoke the CLI.
+  - `systemd` → `systemd-analyze verify` on the shipped units.
+  - `release-consistency` → on a `v*` tag, the tag must equal `project.version`.
   - `sast` → **Semgrep** `p/python`, currently blocking (`--error`). Keep it that way.
   - `audit` → **`pip-audit`**, currently `continue-on-error: true`. Promote it to a blocking gate
     once the findings are triaged, and fix a failure by bumping the dependency, never by relaxing the
     threshold.
-- **No git hooks are installed yet.** When they land, use `pre-commit`.
+- **Git hooks:** `.pre-commit-config.yaml`; install with
+  `pre-commit install --hook-type pre-commit --hook-type pre-push`.
 
 ## Working rules
 
