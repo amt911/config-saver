@@ -101,6 +101,9 @@ def _ensure_private_dir(path: str) -> None:
 
 def _chmod_private(path: str) -> None:
     try:
+        # The insecure-file-permissions rule cannot resolve the constant and suggests
+        # 0o644 as a "good default"; PRIVATE_DIR_MODE is 0o700, which is the point (#15).
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
         os.chmod(path, PRIVATE_DIR_MODE)
     except (PermissionError, FileNotFoundError):
         # Directory owned by someone else: leave its permissions alone.
