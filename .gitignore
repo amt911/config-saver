@@ -1,5 +1,13 @@
 config_saver.egg-info/
 .mypy_cache
+.pytest_cache
+.ruff_cache
 __pycache__
 .pip
 build
+dist
+.venv
+venv
+.coverage
+htmlcov
+graphify-out/

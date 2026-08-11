@@ -1,0 +1,48 @@
+# Install both stages once per clone:
+#   pre-commit install --hook-type pre-commit --hook-type pre-push
+#
+# pre-commit  -> fast, file-scoped checks (lint, format, type-check)
+# pre-push    -> the behavioural test suite, so nothing that fails CI leaves the machine
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.18.2
+    hooks:
+      - id: mypy
+        files: ^config_saver/
+        additional_dependencies:
+          - pydantic>=2,<3
+          - types-PyYAML
+          - types-colorama
+          - types-tqdm
+
+  - repo: local
+    hooks:
+      # Runs with whatever python is on PATH, so activate the dev environment
+      # (`pip install -e '.[dev]'`) in the shell you push from.
+      - id: pytest
+        name: pytest (full suite)
+        entry: python -m pytest -q
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

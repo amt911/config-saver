@@ -11,4 +11,4 @@ normalize_content: true
 directories:
     - "$ETC_CONFIG_DIR"
     # System connections (NetworkManager) - outside user home
-    - /etc/NetworkManager/system-connections    
+    - /etc/NetworkManager/system-connections

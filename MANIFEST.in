@@ -1,1 +1,4 @@
-recursive-include config_saver/configs/default *
+include LICENSE
+include README.md
+recursive-include config_saver/configs *.yaml
+recursive-include contrib/systemd *
