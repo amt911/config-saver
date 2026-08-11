@@ -161,3 +161,15 @@ def test_corrupt_archive_raises_archive_error(tmp_path: Path, fake_home: Path) -
     corrupt.write_bytes(b"this is not a gzip stream")
     with pytest.raises(ArchiveError):
         TarDecompressor(str(corrupt)).decompress()
+
+
+def test_output_directory_is_created_even_for_an_empty_archive(tmp_path: Path, fake_home: Path) -> None:
+    """Reporting success into a directory that was never created is a lie."""
+    archive = tmp_path / "empty.tar.gz"
+    with tarfile.open(archive, "w:gz"):
+        pass
+    out = tmp_path / "out" / "nested"
+
+    result = TarDecompressor(str(archive), str(out)).decompress()
+    assert result.extracted == 0
+    assert out.is_dir()

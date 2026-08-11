@@ -234,6 +234,11 @@ class TarDecompressor:
 
         result = DecompressResult(tar_path=self.tar_path, output_dir=self.output_dir)
 
+        if self.output_dir:
+            # Create it up front: an archive with no extractable member would
+            # otherwise report success into a directory that does not exist.
+            os.makedirs(self.output_dir, exist_ok=True)
+
         emit: Callable[[str], None] = _no_emit
         try:
             with tarfile.open(self.tar_path, "r:gz") as tar:
