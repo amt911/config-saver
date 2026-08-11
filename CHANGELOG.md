@@ -24,7 +24,8 @@ All notable changes to this project are documented here. The format follows
   vector, parser/models, path expander, backup manager, CLI exit codes, systemd units and packaging
   metadata (#20). CI gate: 90% coverage.
 - `--jobs N` / `--jobs auto`: compress independent configurations in parallel processes, with output
-  ordered by config filename regardless of completion order (#13).
+  ordered by config filename regardless of completion order (#13). **Parallel is the default**
+  (`auto`), capped at the number of configurations; measured at 2–3.3× in `docs/BENCHMARKS.md`.
 - `--strict`: exit with code `8` when a configured path was missing from the backup.
 - Documented, stable exit codes (`0/2/3/4/5/6/7/8/10`) in the README.
 - Archive metadata member `.config-saver-metadata.json` recording whether `normalize_content` was
@@ -79,6 +80,9 @@ All notable changes to this project are documented here. The format follows
   streamed when no progress bar needs a total, and `BackupTable` scans the archive tree once instead
   of once per configuration (#23).
 - The coverage gate is 90% and `pip-audit` is a blocking CI check rather than advisory.
+- Content normalization is a streaming, byte-level pass: peak memory for a 64 MB file drops from
+  ~400 MB to ~9 MB and the pass is 40% faster, at the cost of ~4 µs per small file. Files with
+  nothing to replace are no longer copied at all.
 - `pip install`ed environments fall back to the example configs shipped under
   `<prefix>/share/config-saver/configs` and print an actionable error when no config directory
   exists at all (#19).

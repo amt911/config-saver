@@ -199,9 +199,12 @@ class CLI:
             "--jobs",
             "-j",
             type=str,
-            default="1",
+            default="auto",
             metavar="N",
-            help="Compress N configurations in parallel in directory mode ('auto' for one per CPU)",
+            help=(
+                "Compress N configurations in parallel in directory mode. Default 'auto' "
+                "(one worker per CPU, capped at the number of configurations); use 1 to force sequential"
+            ),
         )
         parser.add_argument(
             "--strict",
@@ -221,6 +224,7 @@ class CLI:
 
     @staticmethod
     def _resolve_jobs(raw: str) -> int:
+        """Turn the --jobs value into a worker count (the manager caps it again)."""
         if raw == "auto":
             return os.cpu_count() or 1
         try:
@@ -399,6 +403,12 @@ class CLI:
             print(Fore.RED + str(e))
             return EXIT_USAGE
 
+        # A per-file progress bar and several workers writing at once are
+        # unreadable together, so --progress alone means sequential; asking for
+        # both explicitly is allowed and reports config-level progress only.
+        if args.progress and args.jobs == "auto":
+            jobs = 1
+
         input_path = args.input
         if input_path is None:
             input_path = default_config_dir()
@@ -434,7 +444,7 @@ class CLI:
                 return EXIT_INCOMPLETE
             return EXIT_OK
 
-        if jobs > 1:
+        if args.jobs != "auto" and self._resolve_jobs(args.jobs) > 1:
             print(Fore.RED + "--jobs only applies when --input is a directory of configurations.")
             return EXIT_USAGE
 

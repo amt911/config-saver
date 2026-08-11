@@ -9,9 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from config_saver.lib.tar_compressor.tar_compressor import METADATA_MEMBER, TarCompressor
+from config_saver.lib.tar_compressor.tar_compressor import (
+    HOME_CONTENT_PLACEHOLDER,
+    METADATA_MEMBER,
+    TarCompressor,
+)
 
-from .conftest import archive_names, make_model
+from .conftest import archive_member_bytes, archive_names, make_model
 
 
 def _compressor(directories: list, out: Path, **kwargs) -> TarCompressor:
@@ -208,3 +212,69 @@ def test_extension_matching_is_case_insensitive(fake_home: Path) -> None:
     target = fake_home / "IMAGE.PNG"
     target.write_text("not really a png", encoding="utf-8")
     assert compressor._is_text_file(str(target)) is False
+
+
+def test_normalization_handles_a_home_path_across_chunk_boundaries(tmp_path: Path, fake_home: Path) -> None:
+    """Content is normalized in a streaming pass; a match straddling two chunks
+    must still be replaced."""
+    from config_saver.lib.tar_compressor import tar_compressor as module
+
+    tree = fake_home / "t"
+    tree.mkdir()
+    target = tree / "big.conf"
+    filler = "x" * (module._CHUNK_SIZE - 5)
+    target.write_text(f"{filler}{fake_home}/data\n{filler}{fake_home}/more\n", encoding="utf-8")
+
+    out = tmp_path / "out.tar.gz"
+    _compressor([str(tree)], out, normalize_content=True).compress()
+    stored = archive_member_bytes(out, os.path.join("home", "user", "t", "big.conf")).decode()
+
+    assert str(fake_home) not in stored
+    assert stored.count(HOME_CONTENT_PLACEHOLDER) == 2
+    assert stored == f"{filler}{HOME_CONTENT_PLACEHOLDER}/data\n{filler}{HOME_CONTENT_PLACEHOLDER}/more\n"
+
+
+def test_large_normalized_file_round_trips(tmp_path: Path, fake_home: Path) -> None:
+    """Above the spool threshold the normalized content lives in a temporary
+    file rather than in memory; the archive must be identical either way."""
+    from config_saver.lib.tar_compressor import tar_compressor as module
+
+    tree = fake_home / "t"
+    tree.mkdir()
+    line = f"path={fake_home}/x\n"
+    repeats = (module._SPOOL_MAX_SIZE // len(line)) + 10
+    (tree / "huge.conf").write_text(line * repeats, encoding="utf-8")
+
+    out = tmp_path / "out.tar.gz"
+    _compressor([str(tree)], out, normalize_content=True).compress()
+    stored = archive_member_bytes(out, os.path.join("home", "user", "t", "huge.conf")).decode()
+
+    assert stored == f"path={HOME_CONTENT_PLACEHOLDER}/x\n" * repeats
+
+
+def test_files_without_the_home_path_are_added_from_disk(tmp_path: Path, fake_home: Path) -> None:
+    """The common case must not pay for normalization: no match means the file is
+    handed to tar.add untouched."""
+    tree = fake_home / "t"
+    tree.mkdir()
+    (tree / "plain.conf").write_text("nothing to replace\n", encoding="utf-8")
+
+    compressor = _compressor([str(tree)], tmp_path / "out.tar.gz", normalize_content=True)
+    assert compressor._normalized_stream(str(tree / "plain.conf")) is None
+
+
+def test_a_home_with_non_ascii_characters_is_replaced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The replacement runs on bytes, so both encodings of the home path count."""
+    home = tmp_path / "home" / "josé"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    tree = home / "t"
+    tree.mkdir()
+    (tree / "utf8.conf").write_text(f"p={home}\n", encoding="utf-8")
+    (tree / "latin1.conf").write_bytes(f"p={home}\n".encode("latin-1"))
+
+    out = tmp_path / "out.tar.gz"
+    _compressor([str(tree)], out, normalize_content=True).compress()
+    for name in ("utf8.conf", "latin1.conf"):
+        stored = archive_member_bytes(out, os.path.join("home", "user", "t", name))
+        assert HOME_CONTENT_PLACEHOLDER.encode() in stored
