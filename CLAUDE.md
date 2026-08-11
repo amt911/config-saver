@@ -5,6 +5,38 @@ with Pydantic validation and an optional progress bar. Installable as a package 
 AUR package (see the sibling **`config-saver-aur`** repo) with systemd timer units for periodic
 backups.
 
+## Start here
+
+- **Run `/graphify` before each session.** The persistent graph at `graphify-out/graph.json`
+  summarizes architecture, dependencies and cross-cutting concepts without re-reading the repo.
+- **Read `docs/FINDINGS.md` before debugging or touching the build** — non-obvious gotchas.
+  **Convention:** when you discover something non-obvious that cost time and isn't deducible from the
+  code, add a short entry to `docs/FINDINGS.md`.
+- **`README.md` is the user-facing contract** — CLI flags, path/content normalization, path-variable
+  expansion, `only_root_user`, systemd units. When you change behaviour, update it in the same change.
+- **This tool writes to arbitrary filesystem locations and archives secrets.** Restoring extracts to
+  absolute paths and the default config includes `~/.ssh` and `~/.config/rclone`. Treat any change to
+  `tar_compressor/` or `configs/` as security-relevant; see the open security issues before touching
+  extraction.
+- **There is no test suite yet** (tracked in the repo's issues). Until there is, "it type-checks" is
+  not evidence — run the CLI against a scratch config and inspect the resulting archive/tree.
+
+## ⚡ graphify — use every session
+
+```text
+/graphify            # first run (builds graph from scratch)
+/graphify --update   # incremental update (only re-extracts changed files)
+/graphify query "<question>"    # architecture questions instead of opening multiple files
+/graphify explain "<name>"      # locate a concept or symbol
+/graphify path "A" "B"          # dependency path between two modules
+```
+
+Outputs in `graphify-out/`: `graph.json` (source of truth), `GRAPH_REPORT.md` (god nodes,
+communities, surprising connections), `graph.html` (interactive view).
+
+Run `/graphify --update` at end of session if you touched docs (code changes rebuild via hook if
+installed).
+
 ## Superpowers — use whenever applicable
 
 Always prefer **superpowers** skills over ad-hoc approaches. If there's even a small chance a
@@ -32,6 +64,35 @@ User instructions always take precedence over skills; skills override default be
   defaults on **"normal mode"**.
 
 Confirm the switch briefly when it happens.
+
+## 🧠 Heavy jobs run inside a memory cgroup (MANDATORY)
+
+**No exceptions:** any long or parallel job started here — the full test suite, coverage, mutation
+testing, a production build, a compress/restore run over a big tree, anything that spawns workers —
+runs under a kernel-enforced memory ceiling:
+
+```bash
+systemd-run --user --scope --quiet -p MemoryHigh=5G -p MemoryMax=6G -p MemorySwapMax=0 -- <command>
+```
+
+**6 GB is the standing ceiling on this machine** (raised from 4 GB by the user on 2026-08-11); don't
+exceed it without being told to. `MemoryHigh` throttles and reclaims, `MemoryMax` is the hard stop,
+`MemorySwapMax=0` keeps the job from thrashing swap instead of respecting either. Verify it is
+actually in force rather than assuming:
+`systemctl --user show <scope> -p MemoryMax -p MemoryHigh -p MemoryCurrent`.
+
+**Cap the tool too — but never *instead* of the cgroup.** Pass the tool's own concurrency limit
+(`--concurrency`, `--maxWorkers`, `workers`, `-n` for `pytest-xdist`) so the job isn't throttled to a
+crawl by the ceiling. A tool's default concurrency is not a budget, and an estimate of per-worker RSS
+is not a ceiling. Only the cgroup is.
+
+**Why this is a rule and not advice:** a mutation-testing run on this 24-core box sized its worker
+pool from the core count and spawned **23 workers at ~2.3 GB each** — ~50 GB of demand on 31 GB of
+RAM. It took the whole machine down hard enough that the user had to power-cycle it; `systemd-oomd`
+did not save it. The run before that was wasted too: with the machine starving, **139 of the first
+142 mutants "timed out"**, and a timeout is scored as *killed*, so the result came out inflated by
+starvation and meant nothing. A job that OOMs the box doesn't merely fail — it also hands you
+numbers you'd trust by mistake.
 
 ## Stack
 
@@ -61,8 +122,133 @@ python -m config_saver   # run the CLI
 mypy config_saver        # type check
 ```
 
+Wrap anything long-running in the memory cgroup from the section above — a compress run over a real
+home directory is exactly the kind of job that is cheap to underestimate.
+
+## Tests and quality
+
+**Current state, stated plainly: there is no test suite.** CI runs `python -m compileall` + `mypy`,
+which proves the modules import, nothing more. `mypy` also runs without `--check-untyped-defs`, so
+the body of `TarCompressor.compress()` — the core of the tool — is not type-checked. Treat the
+sections below as the target the next test-bearing PR moves toward, not as a description of today.
+
+- **Runner:** `pytest` + `pytest-cov`, declared in `[project.optional-dependencies].dev`.
+- **Layout:** `tests/` at the repo root, mirroring `config_saver/lib/` one file per module.
+- **Filesystem work uses `tmp_path`** — never the real `$HOME`, never `/etc`, never the user's
+  `~/.config/config-saver`. A test that writes outside its `tmp_path` is a bug in the test.
+- **Coverage gate: 80%** (statements/branches), critical logic ≥90%. Don't lower it to ship —
+  exclude a module in config with a written reason instead.
+
+### The invariant that matters most
+
+**compress → decompress must reproduce the original tree exactly.** Same bytes, same modes, same
+symlink targets. This is the product's entire promise and it is the first test to write. Cover:
+permissions, symlinks, binary files, UTF-8 *and* latin-1 text, empty files, names with spaces and
+accents, nested directories.
+
+### Run before declaring done
+
+| Change touches | Run before claiming success |
+| --- | --- |
+| `tar_compressor/` (compress or decompress) | round-trip test + a manual compress/restore into `tmp_path`, then diff the trees |
+| `parser/`, `models/` | parser tests + validate every file under `configs/` |
+| `utils/path_expander.py` | expander tests (pure, deterministic — no excuse) |
+| `cli/` | CLI-by-subprocess tests, including the **exit code** for the affected path |
+| `backup_mapager/` | manager tests + `--list` / `--show-configs` / `--export-*` by hand |
+| anything ambiguous or large | full suite + install the wheel in a scratch venv and smoke the CLI |
+
+### What to test per module
+
+| Module | What |
+| --- | --- |
+| `utils/path_expander.py` | `$HOME`, `$CONFIG_DIR`, `${ENDS_WITH="…"}`, `${BEGINS_WITH="…"}`, unknown variable, no candidate match, several placeholders in one path |
+| `parser/parser.py` | invalid YAML, missing required fields, `only_root_user: true` as non-root, `directories` mixing plain strings and `{source, files}` |
+| `tar_compressor/tar_compressor.py` | path normalization (including sibling home dirs), text/binary classification, content normalization, root-owned skip |
+| `tar_compressor/tar_decompressor.py` | round-trip, **and one regression per malicious-archive vector**: `../` member, absolute member name, symlink escaping the root, hardlink, device node |
+| `backup_mapager/backup_manager.py` | archive listing, per-config timestamp dirs, description round-trip, XDG fallback on `PermissionError` |
+| `cli/cli.py` | every flag, `--version`, and the documented exit codes (2, 3, 4, 5, 6, 7, 10) |
+
+### TDD — required for new logic
+
+1. **Red** — write a failing test that describes the behaviour.
+2. **Green** — implement the minimum to pass.
+3. **Refactor** — clean up under green tests.
+
+Exceptions: pure docs/comment changes and spikes — but add tests before merging.
+
+### Hard rules (no exceptions)
+
+- **Never claim done without showing test output.** "`mypy` passes" is not "it works".
+- **A bug fix needs a failing regression test first**, then the fix (see `systematic-debugging`).
+- **A security fix ships with the malicious input as a test** — the archive that escaped, the path
+  that traversed. Without it the fix regresses the next refactor.
+- **Never delete, `.skip` or `.xfail` a test to get green.** Fix the code or the test on purpose.
+- **Never test against the real `$HOME` or `/etc`.** `tmp_path` or it doesn't run.
+- **Test over mock** — this tool's whole job is real filesystem behaviour; mocking `tarfile` or `os`
+  proves nothing. Build a real tree in `tmp_path` and assert on it.
+
+## Quality beyond coverage
+
+**Coverage measures how much code runs, not whether it's correct.** This is especially treacherous
+with AI: it tends to write the test *and* the code in one move, so if it misread the requirement,
+both encode the same mistake and the test passes happily. These gates attack that blind spot.
+
+- **Property-based testing** *(highest priority here)* — **Hypothesis**. This codebase is unusually
+  well suited to it: `decompress(compress(tree)) == tree` is a textbook round-trip property, and
+  `PathExpander.expand` is a pure function over strings. Let it generate the filenames, encodings and
+  nesting nobody thinks of by hand.
+- **Mutation testing** — **mutmut** or **cosmic-ray**, scoped to the pure logic (path normalization,
+  the expander, the filename/timestamp parsing), not to the I/O shells. A surviving mutant means the
+  code is *covered but not verified*. Run it **inside the memory cgroup** — see the section above for
+  what happens otherwise.
+- **Runtime boundary validation** — **Pydantic** is already used for the YAML models; keep every new
+  config shape a model. The other boundary is the **archive**, and it is currently unvalidated: every
+  member name coming out of a tar is untrusted input and must be checked before use.
+- **Strict types + static analysis** — `mypy` with `--check-untyped-defs` (and `--strict` as the
+  target), plus **Semgrep** in CI. SAST matters because AI introduces exactly the class of bug this
+  repo already has: unvalidated extraction paths and secrets written with loose permissions.
+- **Smoke tests** *(mandatory, not a nice-to-have)* — build the wheel, install it into a scratch
+  venv, run `--compress` then `--decompress` against a sample config. Code routinely passes every
+  unit test while the packaged CLI won't start (a missing package, a bad entry point).
+- **Dependency auditing** — `pip-audit` in CI. AI invents non-existent packages ("slopsquatting")
+  and pulls vulnerable versions; verify every new dependency actually exists and is the one you
+  think it is.
+- **Dead-code elimination** — **vulture** (unused code) and **deptry** (unused/undeclared
+  dependencies). Pruning dead code shrinks the surface every session has to reason about.
+
+**Process rule (worth more than any tool): don't let the AI define the acceptance criteria.** You
+write or review the important test cases yourself — at least the key asserts and the requirement's
+edge cases — and have the AI implement against them.
+
+## CI & git hooks
+
+**Policy — heavy checks run locally on push, CI stays lean.**
+
+- **Pre-push** should run the full local gate: `pytest --cov` + `mypy config_saver` (+ `ruff check`
+  once it exists). Emergency bypass only via `--no-verify`, and then you own the breakage.
+- **GitHub Actions** (`.github/workflows/ci.yml`) — only the cheap, important checks:
+  - `checks` → `mypy` and, once the suite exists, the test run. It currently runs
+    `python -m compileall` as a stand-in; **that placeholder goes away with the first test PR**.
+  - `sast` → **Semgrep** `p/python`, currently blocking (`--error`). Keep it that way.
+  - `audit` → **`pip-audit`**, currently `continue-on-error: true`. Promote it to a blocking gate
+    once the findings are triaged, and fix a failure by bumping the dependency, never by relaxing the
+    threshold.
+- **No git hooks are installed yet.** When they land, use `pre-commit`.
+
 ## Working rules
 
+- **Use superpowers skills whenever they apply** — invoke via `Skill` before acting; process skills
+  before implementation skills.
+- **Heavy or parallel jobs run inside a memory cgroup** — never launch a suite, build or
+  compress/restore over a real tree on a bare estimate; wrap it in
+  `systemd-run --user --scope -p MemoryHigh=5G -p MemoryMax=6G -p MemorySwapMax=0 -- <command>`
+  and cap the tool's own concurrency too.
+- **Archive contents are untrusted input** — every member name from a tar must be validated against
+  the intended root before it is joined, opened or extracted. This is the tool's sharpest edge.
+- **Archives hold secrets** — the default config includes `~/.ssh` and rclone credentials. Anything
+  that creates an archive or a saves directory sets restrictive permissions; never widen them.
+- **TDD for new logic. Don't merge logic without tests**, and don't lower the coverage gate —
+  exclude with a written justification instead.
 - **Config is validated with Pydantic** — add new config shapes as models; don't parse ad-hoc.
 - **Keep `--progress` optional** — the tool must run headless (systemd timer) without a TTY.
 - **Type-clean** — `mypy` must pass; the dev extra installs the stubs.
