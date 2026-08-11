@@ -367,8 +367,12 @@ directories:
 **When enabled**, the tool will:
 
 - Check if the current user is root (`uid == 0`) before processing
-- Reject execution with a clear error message if run by a non-root user
-- Allow compression/decompression only when executed with `sudo` or as root
+- Reject execution with a clear error message (exit code `4`) if run by a non-root user
+- Allow the **compression** of that configuration only when executed with `sudo` or as root
+
+The option gates *compression*, which is what reads the configuration file. `--decompress` takes an
+archive, not a config, so `only_root_user` does not apply to it: restoring files into root-owned
+locations succeeds or fails on the filesystem permissions of the process doing it.
 
 **Important behaviors:**
 
