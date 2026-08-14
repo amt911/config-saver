@@ -107,12 +107,18 @@ config-saver --compress --input /etc/config-saver/configs/zsh.yaml --output arch
 config-saver --progress --compress --input /etc/config-saver/configs/zsh.yaml --output archive.tar.gz
 ```
 
-Compress every configuration in parallel (one process per archive; gzip is CPU-bound):
+Directory mode compresses the configurations **in parallel by default** (`--jobs auto`: one worker
+per CPU, capped at the number of configurations, since gzip is CPU-bound and each archive is
+independent). Measured speedups are 2–3.3× — see [docs/BENCHMARKS.md](docs/BENCHMARKS.md):
 
 ```sh
-config-saver --compress --jobs 4
-config-saver --compress --jobs auto
+config-saver --compress            # parallel by default
+config-saver --compress --jobs 4   # fixed worker count
+config-saver --compress --jobs 1   # force sequential
 ```
+
+`--progress` on its own falls back to sequential, because a per-file progress bar and several
+workers writing at once are unreadable together; pass `--jobs N` explicitly to keep both.
 
 Fail the run when a configured path was missing:
 
@@ -178,7 +184,7 @@ config-saver --compress
 `--input`/`-i INPUT`: Input YAML/JSON config **or config directory** (for compress) or tar file (for decompress). Defaults to `/etc/config-saver/configs`, falling back to the examples shipped with a pip install (`<prefix>/share/config-saver/configs`)
 `--output`/`-o OUTPUT`: Output tar file (for compress), extraction directory (for decompress), or destination directory (for export-all-configs)
 - `--progress`/`-P`: Show progress bar during compression/decompression
-- `--jobs`/`-j N`: Compress N configurations in parallel (directory mode only; `auto` = one per CPU)
+- `--jobs`/`-j N`: Worker count for directory mode. Default `auto` (one per CPU, capped at the number of configurations); `1` forces sequential
 - `--strict`: Exit with code 8 when a configured path was missing from the backup
 - `--version`/`-v`: Show program version and exit
 

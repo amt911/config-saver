@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from config_saver.lib.backup_manager.backup_manager import BackupManager
 from config_saver.lib.cli import cli as cli_module
 from config_saver.lib.cli.cli import (
     CLI,
@@ -264,3 +265,44 @@ def test_version_and_help_via_subprocess() -> None:
 def test_no_action_is_a_usage_error() -> None:
     proc = subprocess.run([sys.executable, "-m", "config_saver"], capture_output=True, text=True, check=False)
     assert proc.returncode == 2  # argparse's own usage exit code
+
+
+def test_directory_mode_is_parallel_by_default(tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Parallel batch compression is a 2-3x win whenever there is more than one
+    configuration (docs/BENCHMARKS.md), so it is the default."""
+    cfg_dir = tmp_path / "configs"
+    cfg_dir.mkdir()
+    write_config(cfg_dir / "one.yaml", [str(data_dir)])
+    seen: dict[str, int] = {}
+
+    original = BackupManager.compress_directory_of_configs
+
+    def spy(self, input_dir, timestamp, *, show_progress=False, description=None, jobs=1):
+        seen["jobs"] = jobs
+        return original(self, input_dir, timestamp, show_progress=show_progress, description=description, jobs=jobs)
+
+    monkeypatch.setattr(BackupManager, "compress_directory_of_configs", spy)
+    assert run(["--compress", "--input", str(cfg_dir)]) == EXIT_OK
+    assert seen["jobs"] == (os.cpu_count() or 1)
+
+
+def test_progress_falls_back_to_sequential(tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Several workers and a per-file progress bar are unreadable together."""
+    cfg_dir = tmp_path / "configs"
+    cfg_dir.mkdir()
+    write_config(cfg_dir / "one.yaml", [str(data_dir)])
+    seen: dict[str, int] = {}
+
+    original = BackupManager.compress_directory_of_configs
+
+    def spy(self, input_dir, timestamp, *, show_progress=False, description=None, jobs=1):
+        seen["jobs"] = jobs
+        return original(self, input_dir, timestamp, show_progress=show_progress, description=description, jobs=jobs)
+
+    monkeypatch.setattr(BackupManager, "compress_directory_of_configs", spy)
+    assert run(["--compress", "--progress", "--input", str(cfg_dir)]) == EXIT_OK
+    assert seen["jobs"] == 1
+
+    # Asking for both explicitly is still honoured.
+    assert run(["--compress", "--progress", "--jobs", "2", "--input", str(cfg_dir)]) == EXIT_OK
+    assert seen["jobs"] == 2

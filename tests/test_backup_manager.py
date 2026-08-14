@@ -168,3 +168,25 @@ def test_find_config_files_is_sorted_and_top_level_only(tmp_path: Path) -> None:
 
     found = [os.path.basename(p) for p in BackupManager(str(tmp_path)).find_config_files(str(cfg_dir))]
     assert found == ["a.yml", "m.json", "z.yaml"]
+
+
+def test_worker_count_is_capped_at_the_number_of_configs(
+    tmp_path: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process pool for a single configuration is measurably slower than doing
+    the work inline (docs/BENCHMARKS.md), so it must not be created."""
+    data = fake_home / "data"
+    data.mkdir()
+    (data / "f.txt").write_text("x")
+    cfg_dir = tmp_path / "configs"
+    cfg_dir.mkdir()
+    write_config(cfg_dir / "only.yaml", [str(data)])
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("ProcessPoolExecutor must not be used for a single configuration")
+
+    monkeypatch.setattr("config_saver.lib.backup_manager.backup_manager.ProcessPoolExecutor", fail)
+    batch = BackupManager(str(tmp_path / "saves")).compress_directory_of_configs(
+        str(cfg_dir), "20260101-000000", jobs=8
+    )
+    assert len(batch.created) == 1

@@ -269,10 +269,16 @@ class BackupManager:
         With jobs > 1 the configurations are compressed in separate processes
         (gzip is CPU-bound and each archive is independent); output order always
         follows the configuration filename order regardless of completion order.
+        The worker count is capped at the number of configurations, so a single
+        configuration never pays for a pool. See docs/BENCHMARKS.md.
         """
         cfg_files = self.find_config_files(input_dir)
         if not cfg_files:
             raise FileNotFoundError(f"No YAML/JSON configuration files found in {input_dir}.")
+
+        # More workers than configurations buys nothing, and a process pool for a
+        # single configuration is measurably slower than doing it here.
+        jobs = max(1, min(jobs, len(cfg_files)))
 
         self.ensure_saves_dir()
 

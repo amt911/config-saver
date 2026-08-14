@@ -6,8 +6,10 @@ import io
 import json
 import os
 import tarfile
+import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
+from typing import IO
 
 from config_saver import __version__
 from config_saver.lib.models.model import Model
@@ -23,6 +25,13 @@ METADATA_FORMAT = 1
 
 # Archives may contain secrets (ssh keys, cloud tokens): never rely on the umask.
 ARCHIVE_MODE = 0o600
+
+# Bytes read to decide whether a file is text.
+_SNIFF_SIZE = 8192
+# Streaming chunk for content normalization.
+_CHUNK_SIZE = 256 * 1024
+# Normalized content above this size spills from memory to a temporary file.
+_SPOOL_MAX_SIZE = 8 * 1024 * 1024
 
 
 def _no_emit(_message: str) -> None:
@@ -95,8 +104,8 @@ class TarCompressor:
             arcname = arcname[1:]
         return arcname
 
-    def _is_text_file(self, file_path: str) -> bool:
-        """Check if a file is likely a text file (not binary)"""
+    def _has_binary_extension(self, file_path: str) -> bool:
+        """True for file types whose contents must never be rewritten."""
         # Known binary extensions (images, fonts, archives, etc.)
         binary_extensions = {
             # Images
@@ -115,46 +124,140 @@ class TarCompressor:
             ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
         }  # fmt: skip
 
-        # Check extension first (fast path)
         _, ext = os.path.splitext(file_path.lower())
-        if ext in binary_extensions:
-            return False
+        return ext in binary_extensions
 
-        try:
-            # Try to read first 8192 bytes and check for null bytes
-            with open(file_path, "rb") as f:
-                chunk = f.read(8192)
-        except OSError:
-            return False
+    @staticmethod
+    def _is_text_chunk(chunk: bytes) -> bool:
+        """Null bytes mean binary.
 
-        # Null bytes mean binary. Anything else is text: latin-1 decodes every
-        # byte string, and latin-1 is the fallback used when writing the
-        # normalized content back, so it must be accepted here too.
+        Anything else is text: latin-1 decodes every byte string, and latin-1 is
+        the encoding the normalized content is written back in, so it has to be
+        accepted here too.
+        """
         return b"\0" not in chunk
 
-    def _normalize_file_content(self, file_path: str) -> bytes | None:
-        """Read file content and replace user home paths with placeholder.
-
-        Returns None when the file must be archived unchanged.
-        """
-        if os.path.islink(file_path) or not self._is_text_file(file_path):
-            return None
-
+    def _is_text_file(self, file_path: str) -> bool:
+        """Check if a file is likely a text file (not binary)"""
+        if self._has_binary_extension(file_path):
+            return False
         try:
             with open(file_path, "rb") as f:
-                content = f.read()
+                chunk = f.read(_SNIFF_SIZE)
         except OSError:
-            return None
+            return False
+        return self._is_text_chunk(chunk)
 
+    def _home_replacements(self) -> list[tuple[bytes, bytes]]:
+        """The home path as it can appear on disk, in both supported encodings.
+
+        The replacement runs on bytes, so a home directory containing non-ASCII
+        characters needs one needle per encoding; the placeholder is ASCII, so it
+        is the same in both.
+        """
+        placeholder = HOME_CONTENT_PLACEHOLDER.encode("ascii")
+        needles: list[tuple[bytes, bytes]] = []
         for encoding in ("utf-8", "latin-1"):
             try:
-                text_content = content.decode(encoding)
-            except UnicodeDecodeError:
+                needle = self.user_home.encode(encoding)
+            except UnicodeEncodeError:
                 continue
-            if self.user_home in text_content:
-                return text_content.replace(self.user_home, HOME_CONTENT_PLACEHOLDER).encode(encoding)
-            return None  # decodes fine, nothing to replace
-        return None
+            if needle and all(needle != existing for existing, _ in needles):
+                needles.append((needle, placeholder))
+        return needles
+
+    def _normalized_stream(self, file_path: str) -> tuple[IO[bytes], int] | None:
+        """Return an open stream of the normalized content, and its size.
+
+        Returns None when the file must be archived unchanged, which is the
+        common case: nothing is buffered and nothing is copied, the file goes
+        straight to ``tar.add``.
+
+        Content is scanned chunk by chunk. Output is accumulated in memory while
+        it is small and spills into a temporary file past
+        ``_SPOOL_MAX_SIZE``, so normalizing a large file no longer holds it in
+        memory three times over (raw bytes, decoded text, re-encoded bytes).
+        """
+        if os.path.islink(file_path) or self._has_binary_extension(file_path):
+            return None
+
+        needles = self._home_replacements()
+        if not needles:
+            return None
+        # A match can straddle a chunk boundary; hold back the longest partial prefix.
+        carry_size = max(len(needle) for needle, _ in needles) - 1
+
+        parts: list[bytes] = []
+        buffered = 0
+        spilled: IO[bytes] | None = None
+        replaced = False
+
+        def flush(data: bytes) -> None:
+            nonlocal buffered, spilled
+            if spilled is not None:
+                spilled.write(data)
+                return
+            parts.append(data)
+            buffered += len(data)
+            if buffered > _SPOOL_MAX_SIZE:
+                # Deliberately not a context manager: the caller consumes and closes it.
+                spilled = tempfile.TemporaryFile()  # noqa: SIM115
+                for part in parts:
+                    spilled.write(part)
+                parts.clear()
+
+        def replace(data: bytes) -> bytes:
+            nonlocal replaced
+            for needle, placeholder in needles:
+                if needle in data:
+                    data = data.replace(needle, placeholder)
+                    replaced = True
+            return data
+
+        try:
+            with open(file_path, "rb") as handle:
+                buffer = handle.read(_SNIFF_SIZE)
+                if not self._is_text_chunk(buffer):
+                    return None
+
+                # A short first read means the whole file already fits in the sniff
+                # buffer: skip the loop so small files never allocate a chunk buffer.
+                more_to_read = len(buffer) == _SNIFF_SIZE
+                while more_to_read:
+                    chunk = handle.read(_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    buffer = replace(buffer + chunk)
+                    if len(buffer) > carry_size:
+                        flush(buffer[: len(buffer) - carry_size])
+                        buffer = buffer[len(buffer) - carry_size :]
+
+                flush(replace(buffer))
+        except OSError:
+            if spilled is not None:
+                spilled.close()
+            return None
+
+        if not replaced:
+            if spilled is not None:
+                spilled.close()
+            return None
+
+        if spilled is not None:
+            size = spilled.tell()
+            spilled.seek(0)
+            return spilled, size
+        content = b"".join(parts)
+        return io.BytesIO(content), len(content)
+
+    def _normalize_file_content(self, file_path: str) -> bytes | None:
+        """The normalized content of a file, or None when it is archived as-is."""
+        normalized = self._normalized_stream(file_path)
+        if normalized is None:
+            return None
+        stream, _size = normalized
+        with stream:
+            return stream.read()
 
     def _iter_entries(self, result: CompressResult) -> Iterator[tuple[str, bool]]:
         """Yield (path, is_dir) for every configured input, deterministically.
@@ -264,15 +367,17 @@ class TarCompressor:
                         result.added += 1
                         continue
 
-                    normalized_content = None
+                    normalized = None
                     if self.yaml_data.normalize_content:
-                        normalized_content = self._normalize_file_content(path)
+                        normalized = self._normalized_stream(path)
 
-                    if normalized_content is not None:
+                    if normalized is not None:
+                        stream, size = normalized
                         emit(f"Compressing (normalized): {path} -> {arcname}")
                         tarinfo = tar.gettarinfo(path, arcname=arcname)
-                        tarinfo.size = len(normalized_content)
-                        tar.addfile(tarinfo, fileobj=io.BytesIO(normalized_content))
+                        tarinfo.size = size
+                        with stream:
+                            tar.addfile(tarinfo, fileobj=stream)
                     else:
                         emit(f"Compressing: {path} -> {arcname}")
                         tar.add(path, arcname=arcname)
