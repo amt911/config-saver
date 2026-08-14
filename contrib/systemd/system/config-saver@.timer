@@ -3,11 +3,19 @@ Description=Run config-saver compression daily for user %i
 
 [Timer]
 Unit=config-saver@%i.service
-# Daily, at 03:00 local time. Persistent=true catches up after a suspended/off machine.
+# Daily at 03:00 local time.
 OnCalendar=*-*-* 03:00:00
+# If the machine was off (or asleep) at 03:00, run the missed backup as soon as
+# the timer starts again — that is what Persistent= does, and it only works if
+# nothing delays the catch-up, hence the two settings below.
 Persistent=true
-# Reduce randomized delay to limit spread while avoiding exact simultaneous runs
-RandomizedDelaySec=10m
+# No randomized spread: a delayed catch-up is exactly what we do not want.
+# If you instantiate this for many users on one machine and care more about not
+# starting every backup at the same second than about starting immediately,
+# raise this.
+RandomizedDelaySec=0
+# No coalescing slack either (the default is 1 minute).
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target
