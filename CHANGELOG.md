@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.3.1] - 2026-08-14
+
+### Added
+
+- `configs/own-configs.yaml`, a shipped example that backs up
+  `~/.config/config-saver/configs.d`. Personal configurations live inside `$HOME`, so they travel
+  inside an archive — but only if some configuration actually archives that directory. Copying this
+  example makes every run produce a self-sufficient archive: restore it on a clean machine and the
+  configurations that say what to back up come back too. Nothing is added to archives implicitly.
+
 ## [3.3.0] - 2026-08-14
 
 ### Changed

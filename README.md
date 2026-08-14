@@ -288,9 +288,17 @@ daily timer, because a package was installed. Backups of things nobody chose are
 security weight; one `cp` is not a burden. The examples stay one explicit flag away:
 `config-saver --compress --input /usr/share/config-saver/configs`.
 
-Because your level lives inside `$HOME`, any configuration that backs up your home directory also
-carries **the configurations themselves**: restoring such an archive on a clean machine brings back
-what to back up, not only the data.
+Because your level lives inside `$HOME`, a configuration that backs up that directory also carries
+**the configurations themselves**: restoring such an archive on a clean machine brings back what to
+back up, not only the data. That is what the shipped `own-configs.yaml` example is for — copy it
+next to your own configurations and every run keeps a self-sufficient archive:
+
+```sh
+cp /usr/share/config-saver/configs/own-configs.yaml ~/.config/config-saver/configs.d/
+```
+
+Nothing is added to your archives implicitly: if no configuration mentions
+`~/.config/config-saver/configs.d`, nothing from it is archived.
 
 `/etc` is different — see [System configurations in archives](#system-configurations-in-archives).
 

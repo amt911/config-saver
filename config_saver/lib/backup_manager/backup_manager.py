@@ -351,6 +351,12 @@ class BackupManager:
             )
 
         if jobs > 1:
+            # The interpreter default start method is deliberate: forcing spawn
+            # costs an interpreter startup per worker and measured *slower* than
+            # sequential on many small configurations (docs/BENCHMARKS.md). The
+            # environment is fixed for the lifetime of a CLI run, so the
+            # forkserver's frozen environment (3.14+) never matters in practice —
+            # only to tests that change $HOME mid-process, which run with jobs=1.
             with ProcessPoolExecutor(max_workers=jobs) as pool:
                 outcomes = list(pool.map(_compress_job, jobs_spec))
         else:

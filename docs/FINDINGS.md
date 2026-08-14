@@ -51,3 +51,19 @@ The `pytest` hook is `language: system` (the suite needs the project and its dep
 installed). It resolves `python` from the shell you push from, so `pip install -e '.[dev]'` must be
 active there; otherwise the hook fails with "Executable `python` not found" style errors rather
 than a test failure.
+
+## 2026-08-14 — Batch workers can see a stale environment on Python 3.14
+
+Python 3.14 made `forkserver` the default multiprocessing start method on Linux
+(it was `fork` up to 3.13). A forkserver process is created once and its
+environment is frozen at that moment, so workers do **not** see a later change
+to `$HOME`. A test that points `$HOME` at a temporary directory and then runs
+batch mode in parallel gets workers still resolving `~` to the *previous*
+test's home — the archive comes out containing another test's files, which
+looks like data corruption and is not.
+
+Production is unaffected: the environment of a CLI run does not change while it
+runs. Forcing `spawn` would make it uniform but costs an interpreter startup per
+worker, and measured *slower than sequential* for many small configurations
+(×0.44 on the 12-config corpus in `docs/BENCHMARKS.md`), so the interpreter
+default stays. Tests that move `$HOME` run batch mode with `--jobs 1`.
