@@ -66,6 +66,8 @@ directories:
         - touchpadxlibinputrc
         - kgammarc
         - powermanagementprofilesrc
+        # Energy saving: the "do nothing" AC/battery profiles live here.
+        - powerdevilrc
         - bluedevilglobalrc
         - kdeconnect
         - device_automounter_kcmrc
