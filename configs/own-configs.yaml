@@ -1,0 +1,18 @@
+# Back up config-saver's own configurations, so an archive is self-sufficient.
+#
+# Restoring a backup on a clean machine brings back the data, but it only brings
+# back *what to back up* if something archived the directory the configurations
+# live in. That directory is inside $HOME, so this one-line configuration is all
+# it takes:
+#
+#   config-saver --decompress --input own-configs-<timestamp>.tar.gz
+#   config-saver --compress          # the restored configurations are already active
+#
+# /etc/config-saver/configs is deliberately not here: that level belongs to the
+# administrator (or to a declarative installer, which rebuilds it itself). Use
+# --include-system-configs if you really want it in the archive.
+
+normalize_content: false
+
+directories:
+    - "$CONFIG_DIR/config-saver/configs.d"

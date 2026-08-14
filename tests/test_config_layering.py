@@ -94,3 +94,32 @@ def test_examples_can_still_be_used_explicitly(levels: dict[str, Path], data_dir
     write_config(levels["examples"] / "default-config.yaml", [str(data_dir)])
     assert CLI(["--compress", "--input", str(levels["examples"])]).run() == EXIT_OK
     assert _archives(fake_home) == ["default-config"]
+
+
+def test_the_shipped_example_makes_an_archive_self_sufficient(
+    levels: dict[str, Path], fake_home: Path, tmp_path: Path
+) -> None:
+    """Personal configurations only travel inside an archive if something backs
+    up the directory they live in; the shipped example does exactly that."""
+    import shutil
+    import tarfile
+
+    repo_example = Path(__file__).resolve().parent.parent / "configs" / "own-configs.yaml"
+    assert repo_example.is_file(), "configs/own-configs.yaml is part of the shipped examples"
+
+    user_dir = levels["user"]
+    shutil.copy(repo_example, user_dir / "own-configs.yaml")
+    write_config(user_dir / "other.yaml", [str(fake_home / "data")])
+    (fake_home / "data").mkdir()
+    (fake_home / "data" / "f.txt").write_text("x", encoding="utf-8")
+
+    # Sequential on purpose: this test changes $HOME, and on Python 3.14 the
+    # forkserver hands workers the environment it was started with
+    # (docs/FINDINGS.md). Parallel batch mode is covered elsewhere.
+    assert CLI(["--compress", "--jobs", "1"]).run() == EXIT_OK
+
+    archive = next((fake_home / ".config" / "config-saver" / "configs" / "own-configs").rglob("*.tar.gz"))
+    with tarfile.open(archive, "r:gz") as tar:
+        names = tar.getnames()
+    assert any(name.endswith("configs.d/own-configs.yaml") for name in names), names
+    assert any(name.endswith("configs.d/other.yaml") for name in names), names
