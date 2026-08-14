@@ -6,7 +6,39 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Configurations are resolved from three layered levels** instead of "the first directory that
+  exists wins": `<prefix>/share/config-saver/configs` (examples shipped with the package),
+  `/etc/config-saver/configs` (system policy) and `~/.config/config-saver/configs.d` (yours). The
+  two lower levels are **merged by configuration name** (extension ignored), with the more specific
+  one winning, as systemd layers its drop-ins. Previously `/etc` short-circuited the lookup, which
+  made `~/.config/config-saver/configs.d` unreachable by construction.
+- **The shipped examples are never used on their own.** With no configuration at either active
+  level the run now stops with exit `6` and prints the copy command, instead of backing up whatever
+  the examples happen to list. Falling back to them meant a fresh install quietly archiving
+  `~/.ssh` and `~/.config/rclone` on a daily timer because a package was installed; a backup nobody
+  chose is a surprise with security weight, and one `cp` is not a burden. They remain available
+  explicitly: `--input /usr/share/config-saver/configs`.
+
+  *Migration note.* Up to 3.2.0 the AUR package installed those examples into
+  `/etc/config-saver/configs`, so machines that relied on them will report "No configurations
+  found" after upgrading until a configuration exists at one of the two active levels. Because the
+  package never declared a `backup=()` array, pacman would delete an example the administrator had
+  **edited in place** without leaving the usual `.pacsave`; the 3.3.0 package therefore ships a
+  `pre_upgrade` scriptlet that makes that `.pacsave` copy itself before pacman removes anything.
+  Unmodified examples are simply removed, which is the intended outcome.
+
 ### Added
+
+- **`--include-system-configs` / `--restore-system-configs`.** `/etc/config-saver/configs` is
+  neither archived nor restored by default. That directory belongs to whatever manages the system —
+  on a machine installed with `dasik` it is generated from the installer's own JSON — and a restore
+  that overwrote it would leave the machine differing from its declared configuration, so every
+  subsequent `plan` would show changes: precisely what an idempotent installer must not do. Both
+  directions are therefore opt-in and explicit, and skipped members are reported rather than
+  dropped silently. Personal configurations need none of this: they live under `$HOME`, so they
+  already travel inside any archive that backs up the home directory and come back with it.
 
 - `--input` is repeatable in directory mode, so a private repository of personal configurations can
   be combined with the system directory in one run:
