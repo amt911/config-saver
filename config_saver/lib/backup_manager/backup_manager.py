@@ -115,9 +115,11 @@ def _chmod_private(path: str) -> None:
         pass
 
 
-def _compress_job(job: tuple[str, str, str, str | None, bool, EncryptionModel | None]) -> ConfigOutcome:
+def _compress_job(
+    job: tuple[str, str, str, str | None, bool, EncryptionModel | None, tuple[str, ...]],
+) -> ConfigOutcome:
     """Compress one configuration. Top-level so ProcessPoolExecutor can pickle it."""
-    config_path, dest_dir, archive_name, description, show_progress, encryption = job
+    config_path, dest_dir, archive_name, description, show_progress, encryption, extra_directories = job
     outcome = ConfigOutcome(config_path=config_path)
     try:
         manager = BackupManager()
@@ -128,6 +130,7 @@ def _compress_job(job: tuple[str, str, str, str | None, bool, EncryptionModel | 
             description=description,
             show_progress=show_progress,
             encryption=encryption,
+            extra_directories=extra_directories,
         )
     except RootRequiredError:
         outcome.skipped_root_only = True
@@ -183,16 +186,20 @@ class BackupManager:
         out_path: str,
         show_progress: bool = False,
         encryption: EncryptionModel | None = None,
+        extra_directories: tuple[str, ...] = (),
     ) -> CompressResult:
         """Compress a single configuration into the provided output path.
 
         `encryption` overrides whatever the configuration file declares, which is
-        what --encrypt-to does.
+        what --encrypt-to does. `extra_directories` are appended to every
+        configuration, which is how --include-system-configs works.
         """
         parser = Parser(config_path)
         model = parser.get_model()
         if encryption is not None:
             model = model.model_copy(update={"encrypt": encryption})
+        if extra_directories:
+            model = model.model_copy(update={"directories": [*model.directories, *extra_directories]})
         compressor = TarCompressor(model, out_path, show_progress=show_progress)
         result = compressor.compress()
         # A placeholder that matched nothing never becomes a path; report it as missing.
@@ -210,6 +217,7 @@ class BackupManager:
         description: str | None = None,
         show_progress: bool = False,
         encryption: EncryptionModel | None = None,
+        extra_directories: tuple[str, ...] = (),
     ) -> tuple[str, CompressResult]:
         """Compress a config into dest_dir, optionally writing a description.txt.
 
@@ -239,6 +247,7 @@ class BackupManager:
         description: str | None = None,
         show_progress: bool = False,
         encryption: EncryptionModel | None = None,
+        extra_directories: tuple[str, ...] = (),
     ) -> tuple[str, CompressResult]:
         """Compress a configuration into <base_cfg_dir>/<timestamp>/."""
         ts_dir = os.path.join(base_cfg_dir, timestamp)
@@ -286,6 +295,7 @@ class BackupManager:
         description: str | None = None,
         jobs: int = 1,
         encryption: EncryptionModel | None = None,
+        extra_directories: tuple[str, ...] = (),
     ) -> BatchResult:
         """Compress each configuration inside input_dir into its own archive.
 
@@ -306,6 +316,7 @@ class BackupManager:
             description=description,
             jobs=jobs,
             encryption=encryption,
+            extra_directories=extra_directories,
         )
 
     def compress_config_files(
@@ -316,6 +327,7 @@ class BackupManager:
         description: str | None = None,
         jobs: int = 1,
         encryption: EncryptionModel | None = None,
+        extra_directories: tuple[str, ...] = (),
     ) -> BatchResult:
         """Compress an explicit list of configurations, one archive each.
 
@@ -329,12 +341,14 @@ class BackupManager:
 
         self.ensure_saves_dir()
 
-        jobs_spec: list[tuple[str, str, str, str | None, bool, EncryptionModel | None]] = []
+        jobs_spec: list[tuple[str, str, str, str | None, bool, EncryptionModel | None, tuple[str, ...]]] = []
         for cfg in cfg_files:
             cfg_basename = os.path.splitext(os.path.basename(cfg))[0]
             ts_dir = os.path.join(self.saves_dir, "configs", cfg_basename, timestamp)
             archive_name = f"{cfg_basename}-{timestamp}.tar.gz"
-            jobs_spec.append((cfg, ts_dir, archive_name, description, show_progress and jobs == 1, encryption))
+            jobs_spec.append(
+                (cfg, ts_dir, archive_name, description, show_progress and jobs == 1, encryption, extra_directories)
+            )
 
         if jobs > 1:
             with ProcessPoolExecutor(max_workers=jobs) as pool:
