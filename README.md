@@ -11,6 +11,10 @@ Python CLI tool for compressing and decompressing directories or files by using 
 - Optional progress bar for compression/decompression (`--progress`/`-P`).
 - Parallel compression of independent configurations (`--jobs`/`-j`).
 - Missing inputs are reported, never silently skipped (`--strict` turns them into a non-zero exit).
+- Several configuration directories in one run, so your own configs can live in a
+  [private repository](#personal-configurations-from-a-private-repository) instead of `/etc`.
+- Optional archive [encryption](#encryption-optional) with `age` or `gpg`.
+- Scheduled daily backups that [catch up immediately](#scheduling) after downtime.
 - Stable exit codes for scripting (see [Exit codes](#exit-codes)).
 
 > **⚠ A plain `.tar.gz` is compressed, not encrypted.** An archive produced from a config that lists
@@ -182,7 +186,7 @@ config-saver --compress
 `--export-config`/`-e NAME`: Export the latest config archive by name
 `--export-all-configs`: Export the latest archive for every saved configuration
 `--show-configs`: Show available configuration names
-`--input`/`-i INPUT`: Input YAML/JSON config **or config directory** (for compress) or tar file (for decompress). Defaults to `/etc/config-saver/configs`, falling back to the examples shipped with a pip install (`<prefix>/share/config-saver/configs`)
+`--input`/`-i PATH`: Input YAML/JSON config **or config directory** (for compress) or tar file (for decompress). **Repeatable** when every value is a directory, to combine the system configs with your own. Defaults to `/etc/config-saver/configs`, falling back to the examples shipped with a pip install (`<prefix>/share/config-saver/configs`)
 `--output`/`-o OUTPUT`: Output tar file (for compress), extraction directory (for decompress), or destination directory (for export-all-configs)
 - `--progress`/`-P`: Show progress bar during compression/decompression
 - `--jobs`/`-j N`: Worker count for directory mode. Default `auto` (one per CPU, capped at the number of configurations); `1` forces sequential
@@ -244,6 +248,52 @@ normalized.
 - Archives are written to a temporary file in the destination directory and moved into place with
   `os.replace()` only after a clean close — an interrupted run never leaves a truncated file that
   looks like a valid backup.
+
+## Personal configurations from a private repository
+
+`--input` is repeatable in directory mode, so a private repository of personal configurations sits
+next to the system ones without copying anything:
+
+```sh
+git clone git@github.com:you/private-configs.git ~/repos/private-configs
+config-saver --compress -i /etc/config-saver/configs -i ~/repos/private-configs/config-saver
+```
+
+Every directory contributes its configurations, they are compressed in parallel as usual, and each
+still produces its own archive under `~/.config/config-saver/configs/<name>/`. A configuration name
+defined in two directories is rejected (exit `6`) rather than silently overwritten — rename one.
+
+Keeping the YAML files in the private repo is the low-friction part: they are the definitions, so a
+`git pull` on a new machine is the whole setup. Two ways to make the scheduled run see them:
+
+```sh
+# 1. Point the user timer at both directories
+systemctl --user edit config-saver.service
+# [Service]
+# ExecStart=
+# ExecStart=/usr/bin/config-saver --compress \
+#     --input /etc/config-saver/configs \
+#     --input %h/repos/private-configs/config-saver \
+#     --description "Automated backup by systemd timer"
+
+# 2. Or symlink them into the system directory, once
+sudo ln -s ~/repos/private-configs/config-saver/*.yaml /etc/config-saver/configs/
+```
+
+If the private repo also holds *files* you want in the backup (not just definitions), point a
+configuration at them like any other path — and remember that a repository working tree includes
+`.git`, so list the subdirectories you actually want:
+
+```yaml
+directories:
+  - source: "$HOME/repos/private-configs"
+    files:
+      - dotfiles
+      - ssh-config
+```
+
+Anything sensitive in there deserves [encryption](#encryption-optional); the repository being
+private protects the remote, not the archive sitting on your disk.
 
 ## Encryption (optional)
 
@@ -542,6 +592,38 @@ Files included in `contrib/systemd/`:
 - `config-saver@.service` - templated system-wide service. When instantiated as `config-saver@alice.service` it will run as user `alice`, so archives are written to that user's home.
 - `config-saver@.timer` - templated system timer that triggers `config-saver@<user>.service` on schedule.
 
+### Scheduling
+
+Both timers run **daily at 03:00**, and a backup the machine slept through runs **as soon as the
+timer starts again** — not at the next 03:00:
+
+```ini
+OnCalendar=*-*-* 03:00:00
+Persistent=true        # catch up a missed run
+RandomizedDelaySec=0   # ...without spreading it over ten minutes
+AccuracySec=1s         # ...and without the default one-minute coalescing slack
+```
+
+Check what is actually scheduled:
+
+```sh
+systemctl list-timers 'config-saver*' --all     # system template
+systemctl --user list-timers 'config-saver*'    # user unit
+```
+
+**An empty `NEXT` column means the timer will never fire again.** That is the signature of the
+pre-3.2.0 unit, which used `OnActiveSec=3h`: it fires once, three hours after activation, and then
+nothing. Upgrade, reload, and confirm `NEXT` is populated:
+
+```sh
+sudo systemctl daemon-reload          # or `systemctl --user daemon-reload`
+systemctl list-timers 'config-saver*' --all
+```
+
+The user timer only fires while your user manager is running. If you want it to run on a machine
+you are not logged into, enable lingering: `loginctl enable-linger $USER`. The system template does
+not need this — it runs from the system manager as `User=%i`.
+
 ### Install (user-level)
 
 1. Copy the files to your user systemd unit directory:
@@ -613,6 +695,9 @@ Notes:
   running that version.)
 - Both services set `UMask=0077` so scheduled runs never create world-readable archives.
 - For virtualenv usage, change `ExecStart` to the absolute python path in the venv.
+- To make the scheduled run also pick up configurations kept outside `/etc/config-saver/configs`
+  (a private repository, for instance), override `ExecStart` with several `--input` values — see
+  [Personal configurations from a private repository](#personal-configurations-from-a-private-repository).
 
 ## Credits
 

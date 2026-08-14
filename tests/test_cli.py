@@ -275,13 +275,13 @@ def test_directory_mode_is_parallel_by_default(tmp_path: Path, data_dir: Path, m
     write_config(cfg_dir / "one.yaml", [str(data_dir)])
     seen: dict[str, int] = {}
 
-    original = BackupManager.compress_directory_of_configs
+    original = BackupManager.compress_config_files
 
-    def spy(self, input_dir, timestamp, **kwargs):
+    def spy(self, cfg_files, timestamp, **kwargs):
         seen["jobs"] = kwargs.get("jobs", 1)
-        return original(self, input_dir, timestamp, **kwargs)
+        return original(self, cfg_files, timestamp, **kwargs)
 
-    monkeypatch.setattr(BackupManager, "compress_directory_of_configs", spy)
+    monkeypatch.setattr(BackupManager, "compress_config_files", spy)
     assert run(["--compress", "--input", str(cfg_dir)]) == EXIT_OK
     assert seen["jobs"] == (os.cpu_count() or 1)
 
@@ -293,16 +293,73 @@ def test_progress_falls_back_to_sequential(tmp_path: Path, data_dir: Path, monke
     write_config(cfg_dir / "one.yaml", [str(data_dir)])
     seen: dict[str, int] = {}
 
-    original = BackupManager.compress_directory_of_configs
+    original = BackupManager.compress_config_files
 
-    def spy(self, input_dir, timestamp, **kwargs):
+    def spy(self, cfg_files, timestamp, **kwargs):
         seen["jobs"] = kwargs.get("jobs", 1)
-        return original(self, input_dir, timestamp, **kwargs)
+        return original(self, cfg_files, timestamp, **kwargs)
 
-    monkeypatch.setattr(BackupManager, "compress_directory_of_configs", spy)
+    monkeypatch.setattr(BackupManager, "compress_config_files", spy)
     assert run(["--compress", "--progress", "--input", str(cfg_dir)]) == EXIT_OK
     assert seen["jobs"] == 1
 
     # Asking for both explicitly is still honoured.
     assert run(["--compress", "--progress", "--jobs", "2", "--input", str(cfg_dir)]) == EXIT_OK
     assert seen["jobs"] == 2
+
+
+# ------------------------------------------------- several config directories
+
+
+def test_several_config_directories_are_combined(tmp_path: Path, data_dir: Path, fake_home: Path) -> None:
+    """A private repo of personal configs alongside the system directory."""
+    system_dir = tmp_path / "system"
+    personal_dir = tmp_path / "personal"
+    system_dir.mkdir()
+    personal_dir.mkdir()
+    write_config(system_dir / "zsh.yaml", [str(data_dir)])
+    write_config(personal_dir / "work.yaml", [str(data_dir)])
+    write_config(personal_dir / "laptop.yaml", [str(data_dir)])
+
+    assert run(["--compress", "-i", str(system_dir), "-i", str(personal_dir)]) == EXIT_OK
+    archives = sorted(p.name for p in (fake_home / ".config" / "config-saver" / "configs").rglob("*.tar.gz"))
+    assert [name.split("-")[0] for name in archives] == ["laptop", "work", "zsh"]
+
+
+def test_a_name_defined_twice_is_refused(tmp_path: Path, data_dir: Path, fake_home: Path) -> None:
+    """Both would write to <saves>/configs/<name>/<timestamp>/ and the second
+    would quietly overwrite the first."""
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
+    write_config(first / "zsh.yaml", [str(data_dir)])
+    write_config(second / "zsh.yaml", [str(data_dir)])
+
+    assert run(["--compress", "-i", str(first), "-i", str(second)]) == EXIT_USAGE
+
+
+def test_an_empty_extra_directory_is_reported(tmp_path: Path, data_dir: Path, fake_home: Path) -> None:
+    good = tmp_path / "good"
+    empty = tmp_path / "empty"
+    good.mkdir()
+    empty.mkdir()
+    write_config(good / "one.yaml", [str(data_dir)])
+
+    assert run(["--compress", "-i", str(good), "-i", str(empty)]) == EXIT_USAGE
+
+
+def test_mixing_a_file_and_a_directory_is_refused(tmp_path: Path, data_dir: Path, fake_home: Path) -> None:
+    cfg_dir = tmp_path / "dir"
+    cfg_dir.mkdir()
+    write_config(cfg_dir / "one.yaml", [str(data_dir)])
+    single = write_config(tmp_path / "single.yaml", [str(data_dir)])
+
+    assert run(["--compress", "-i", str(cfg_dir), "-i", str(single)]) == EXIT_USAGE
+
+
+def test_decompress_takes_a_single_archive(tmp_path: Path, data_dir: Path) -> None:
+    cfg = write_config(tmp_path / "c.yaml", [str(data_dir)])
+    archive = tmp_path / "a.tar.gz"
+    assert run(["--compress", "-i", str(cfg), "-o", str(archive)]) == EXIT_OK
+    assert run(["--decompress", "-i", str(archive), "-i", str(archive), "-o", str(tmp_path / "out")]) == EXIT_USAGE

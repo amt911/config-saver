@@ -299,7 +299,30 @@ class BackupManager:
         cfg_files = self.find_config_files(input_dir)
         if not cfg_files:
             raise FileNotFoundError(f"No YAML/JSON configuration files found in {input_dir}.")
+        return self.compress_config_files(
+            cfg_files,
+            timestamp,
+            show_progress=show_progress,
+            description=description,
+            jobs=jobs,
+            encryption=encryption,
+        )
 
+    def compress_config_files(
+        self,
+        cfg_files: list[str],
+        timestamp: str,
+        show_progress: bool = False,
+        description: str | None = None,
+        jobs: int = 1,
+        encryption: EncryptionModel | None = None,
+    ) -> BatchResult:
+        """Compress an explicit list of configurations, one archive each.
+
+        Directory mode is one caller; another is a command line naming several
+        configuration directories (a system one plus your own), which is why the
+        list is passed in rather than discovered here.
+        """
         # More workers than configurations buys nothing, and a process pool for a
         # single configuration is measurably slower than doing it here.
         jobs = max(1, min(jobs, len(cfg_files)))
