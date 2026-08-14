@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `--input` is repeatable in directory mode, so a private repository of personal configurations can
+  be combined with the system directory in one run:
+  `config-saver --compress -i /etc/config-saver/configs -i ~/repos/private-configs/config-saver`.
+  A configuration name defined in two directories is rejected instead of silently overwritten.
+
+### Fixed
+
+- The systemd timers caught up a missed backup only after `RandomizedDelaySec=10m` and the default
+  one-minute accuracy; both are now zero, so a backup the machine slept through runs as soon as the
+  timer starts.
+
 ## [3.2.0] - 2026-08-11
 
 ### Security

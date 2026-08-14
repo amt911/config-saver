@@ -180,8 +180,13 @@ class CLI:
             "--input",
             "-i",
             type=str,
+            action="append",
             default=None,
-            help="Input YAML/JSON config or config directory (compress), or tar file (decompress)",
+            metavar="PATH",
+            help=(
+                "Input YAML/JSON config or config directory (compress), or tar file (decompress). "
+                "Repeatable in directory mode, to combine e.g. the system directory with your own"
+            ),
         )
         parser.add_argument(
             "--output",
@@ -256,6 +261,29 @@ class CLI:
                 raise ValueError("--encrypt-method needs at least one --encrypt-to RECIPIENT.")
             return None
         return EncryptionModel(method=args.encrypt_method or "age", recipients=list(args.encrypt_to))
+
+    @staticmethod
+    def _collect_configs(manager: BackupManager, directories: list[str]) -> list[str]:
+        """Every configuration across the given directories, in a stable order.
+
+        Two directories may not define the same configuration name: both would
+        write to <saves>/configs/<name>/<timestamp>/, and the second would
+        quietly overwrite the first.
+        """
+        by_name: dict[str, str] = {}
+        for directory in directories:
+            found = manager.find_config_files(directory)
+            if not found:
+                raise ValueError(f"No YAML/JSON configuration files found in {directory}.")
+            for path in found:
+                name = os.path.splitext(os.path.basename(path))[0]
+                if name in by_name:
+                    raise ValueError(
+                        f"Two configurations are both named '{name}': {by_name[name]} and {path}. "
+                        "Rename one, or they would overwrite each other's archive."
+                    )
+                by_name[name] = path
+        return [by_name[name] for name in sorted(by_name)]
 
     @staticmethod
     def _resolve_jobs(raw: str) -> int:
@@ -456,10 +484,10 @@ class CLI:
             print(Fore.RED + str(e))
             return EXIT_USAGE
 
-        input_path = args.input
-        if input_path is None:
-            input_path = default_config_dir()
-            if input_path is None:
+        inputs = list(args.input or [])
+        if not inputs:
+            fallback = default_config_dir()
+            if fallback is None:
                 print(
                     Fore.RED
                     + f"No configuration directory found. Looked in {self.DEFAULT_SYSTEM_CONFIG} and "
@@ -468,8 +496,15 @@ class CLI:
                 )
                 print(Fore.YELLOW + "Pass --input <config.yaml|dir>, or install the 'config-saver' AUR package.")
                 return EXIT_USAGE
+            inputs = [fallback]
 
-        if os.path.isdir(input_path):
+        directories = [p for p in inputs if os.path.isdir(p)]
+        if len(inputs) > 1 and len(directories) != len(inputs):
+            print(Fore.RED + "Several --input paths are only supported when every one is a configuration directory.")
+            return EXIT_USAGE
+
+        input_path = inputs[0]
+        if directories:
             if args.output is not None:
                 print(
                     Fore.RED + "When --input is a directory you may not provide --output. "
@@ -477,8 +512,14 @@ class CLI:
                 )
                 return EXIT_USAGE
 
-            batch = manager.compress_directory_of_configs(
-                input_path,
+            try:
+                cfg_files = self._collect_configs(manager, directories)
+            except ValueError as e:
+                print(Fore.RED + str(e))
+                return EXIT_USAGE
+
+            batch = manager.compress_config_files(
+                cfg_files,
                 timestamp,
                 show_progress=args.progress,
                 description=args.description,
@@ -529,10 +570,14 @@ class CLI:
         return EXIT_OK
 
     def _decompress(self, args: argparse.Namespace) -> int:
-        if args.input is None:
+        inputs = args.input or []
+        if not inputs:
             print(Fore.RED + "--decompress requires --input <archive.tar.gz>.")
             return EXIT_USAGE
-        decompressor = TarDecompressor(args.input, args.output, show_progress=args.progress, identity=args.identity)
+        if len(inputs) > 1:
+            print(Fore.RED + "--decompress takes a single --input archive.")
+            return EXIT_USAGE
+        decompressor = TarDecompressor(inputs[0], args.output, show_progress=args.progress, identity=args.identity)
         result = decompressor.decompress()
         if result.decrypted_with:
             print(Fore.GREEN + f"Archive decrypted with {result.decrypted_with}.")

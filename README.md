@@ -182,7 +182,7 @@ config-saver --compress
 `--export-config`/`-e NAME`: Export the latest config archive by name
 `--export-all-configs`: Export the latest archive for every saved configuration
 `--show-configs`: Show available configuration names
-`--input`/`-i INPUT`: Input YAML/JSON config **or config directory** (for compress) or tar file (for decompress). Defaults to `/etc/config-saver/configs`, falling back to the examples shipped with a pip install (`<prefix>/share/config-saver/configs`)
+`--input`/`-i PATH`: Input YAML/JSON config **or config directory** (for compress) or tar file (for decompress). **Repeatable** when every value is a directory, to combine the system configs with your own. Defaults to `/etc/config-saver/configs`, falling back to the examples shipped with a pip install (`<prefix>/share/config-saver/configs`)
 `--output`/`-o OUTPUT`: Output tar file (for compress), extraction directory (for decompress), or destination directory (for export-all-configs)
 - `--progress`/`-P`: Show progress bar during compression/decompression
 - `--jobs`/`-j N`: Worker count for directory mode. Default `auto` (one per CPU, capped at the number of configurations); `1` forces sequential
@@ -244,6 +244,52 @@ normalized.
 - Archives are written to a temporary file in the destination directory and moved into place with
   `os.replace()` only after a clean close — an interrupted run never leaves a truncated file that
   looks like a valid backup.
+
+## Personal configurations from a private repository
+
+`--input` is repeatable in directory mode, so a private repository of personal configurations sits
+next to the system ones without copying anything:
+
+```sh
+git clone git@github.com:you/private-configs.git ~/repos/private-configs
+config-saver --compress -i /etc/config-saver/configs -i ~/repos/private-configs/config-saver
+```
+
+Every directory contributes its configurations, they are compressed in parallel as usual, and each
+still produces its own archive under `~/.config/config-saver/configs/<name>/`. A configuration name
+defined in two directories is rejected (exit `6`) rather than silently overwritten — rename one.
+
+Keeping the YAML files in the private repo is the low-friction part: they are the definitions, so a
+`git pull` on a new machine is the whole setup. Two ways to make the scheduled run see them:
+
+```sh
+# 1. Point the user timer at both directories
+systemctl --user edit config-saver.service
+# [Service]
+# ExecStart=
+# ExecStart=/usr/bin/config-saver --compress \
+#     --input /etc/config-saver/configs \
+#     --input %h/repos/private-configs/config-saver \
+#     --description "Automated backup by systemd timer"
+
+# 2. Or symlink them into the system directory, once
+sudo ln -s ~/repos/private-configs/config-saver/*.yaml /etc/config-saver/configs/
+```
+
+If the private repo also holds *files* you want in the backup (not just definitions), point a
+configuration at them like any other path — and remember that a repository working tree includes
+`.git`, so list the subdirectories you actually want:
+
+```yaml
+directories:
+  - source: "$HOME/repos/private-configs"
+    files:
+      - dotfiles
+      - ssh-config
+```
+
+Anything sensitive in there deserves [encryption](#encryption-optional); the repository being
+private protects the remote, not the archive sitting on your disk.
 
 ## Encryption (optional)
 
