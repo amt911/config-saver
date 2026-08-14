@@ -22,7 +22,7 @@ All notable changes to this project are documented here. The format follows
 
 - `tests/` — pytest suite covering round-trip integrity, one regression per extraction-attack
   vector, parser/models, path expander, backup manager, CLI exit codes, systemd units and packaging
-  metadata (#20). CI gate: 80% coverage.
+  metadata (#20). CI gate: 90% coverage.
 - `--jobs N` / `--jobs auto`: compress independent configurations in parallel processes, with output
   ordered by config filename regardless of completion order (#13).
 - `--strict`: exit with code `8` when a configured path was missing from the backup.
@@ -31,12 +31,18 @@ All notable changes to this project are documented here. The format follows
   applied, so restores no longer rewrite files that merely contain the placeholder string.
 - Empty directories are archived and restored.
 - `LICENSE` (MIT), `CHANGELOG.md`, `docs/FINDINGS.md`, `docs/RELEASING.md`.
+- Property-based tests (Hypothesis) for the round-trip, path-normalization and expander
+  invariants, plus a mutation-testing setup (mutmut) scoped to the pure logic and documented in
+  `docs/TESTING.md`.
 - Dev tooling: `ruff` (lint + format), `pre-commit` hooks (pre-commit + pre-push), CI matrix on
   Python 3.10–3.13, wheel/sdist install smoke tests, `systemd-analyze verify`, and a tag-vs-version
   consistency check (#21).
 
 ### Fixed
 
+- Latin-1 files were normalized on compression but never denormalized on restore: the
+  decompressor's text detection rejected everything that was not UTF-8, so the placeholder was
+  left in the restored file. Found by a test written against the compressor/decompressor asymmetry.
 - `--list` showed file mtimes instead of backup timestamps: `_parse_ts()` parsed the config name
   (`group(1)`) instead of the timestamp (`group(2)`) (#16).
 - Home-prefix detection used `startswith()`, so `/home/andres2/x` was normalized as if it lived in
@@ -72,6 +78,7 @@ All notable changes to this project are documented here. The format follows
 - The compression loop is written once (the progress/headless duplication is gone), the file list is
   streamed when no progress bar needs a total, and `BackupTable` scans the archive tree once instead
   of once per configuration (#23).
+- The coverage gate is 90% and `pip-audit` is a blocking CI check rather than advisory.
 - `pip install`ed environments fall back to the example configs shipped under
   `<prefix>/share/config-saver/configs` and print an actionable error when no config directory
   exists at all (#19).

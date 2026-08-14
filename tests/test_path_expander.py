@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from config_saver.lib.utils.path_expander import PathExpander
 
@@ -61,3 +64,49 @@ def test_placeholder_in_the_middle_of_a_path(tmp_path: Path) -> None:
 def test_custom_vars_can_be_injected() -> None:
     expander = PathExpander(custom_vars={"HOME": "/srv/user"})
     assert expander.expand("$HOME/.config") == "/srv/user/.config"
+
+
+@pytest.mark.parametrize(
+    ("variable", "expected"),
+    [
+        ("HOME", ""),
+        ("CONFIG_DIR", ".config"),
+        ("SHARE_DIR", ".local/share"),
+        ("LOCALSHARE_DIR", ".local/share"),
+        ("BIN_DIR", ".local/bin"),
+    ],
+)
+def test_every_home_relative_variable_resolves(fake_home: Path, variable: str, expected: str) -> None:
+    """Each documented variable is part of the contract; renaming one must fail."""
+    expected_path = fake_home.joinpath(*expected.split("/"), "x") if expected else fake_home / "x"
+    assert PathExpander().expand(f"${variable}/x") == str(expected_path)
+
+
+def test_root_home_and_etc_config_dir_resolve(fake_home: Path) -> None:
+    expander = PathExpander()
+    assert expander.expand("$ROOT_HOME/.histfile") == os.path.join(os.path.expanduser("~root"), ".histfile")
+    assert expander.expand("$ETC_CONFIG_DIR") == "/etc/config-saver/configs"
+
+
+def test_a_single_match_is_not_recorded_as_ambiguous(tmp_path: Path) -> None:
+    (tmp_path / "only.match").mkdir()
+    expander = PathExpander()
+    assert expander.expand(str(tmp_path / '${ENDS_WITH=".match"}')) == str(tmp_path / "only.match")
+    assert expander.ambiguities == []
+    assert expander.unresolved == []
+
+
+def test_two_matches_are_recorded_as_ambiguous(tmp_path: Path) -> None:
+    (tmp_path / "b.match").mkdir()
+    (tmp_path / "a.match").mkdir()
+    expander = PathExpander()
+    assert expander.expand(str(tmp_path / '${ENDS_WITH=".match"}')) == str(tmp_path / "a.match")
+    assert expander.ambiguities == [(str(tmp_path / '${ENDS_WITH=".match"}'), ["a.match", "b.match"])]
+
+
+def test_home_expands_even_when_the_environment_has_no_HOME(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A systemd service can run without HOME in its environment; $HOME must
+    still resolve, via the passwd entry."""
+    monkeypatch.delenv("HOME", raising=False)
+    expected = os.path.expanduser("~")
+    assert PathExpander().expand("$HOME/.config") == os.path.join(expected, ".config")

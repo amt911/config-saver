@@ -127,21 +127,10 @@ class TarCompressor:
         except OSError:
             return False
 
-        # Null bytes mean binary; otherwise anything that decodes as UTF-8 or as
-        # latin-1 is treated as text (latin-1 is the fallback used when writing
-        # the normalized content back, so it must be accepted here too).
-        if b"\0" in chunk:
-            return False
-        try:
-            chunk.decode("utf-8")
-            return True
-        except UnicodeDecodeError:
-            pass
-        try:
-            chunk.decode("latin-1")
-            return True
-        except UnicodeDecodeError:
-            return False
+        # Null bytes mean binary. Anything else is text: latin-1 decodes every
+        # byte string, and latin-1 is the fallback used when writing the
+        # normalized content back, so it must be accepted here too.
+        return b"\0" not in chunk
 
     def _normalize_file_content(self, file_path: str) -> bytes | None:
         """Read file content and replace user home paths with placeholder.

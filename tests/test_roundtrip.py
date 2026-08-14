@@ -114,3 +114,23 @@ def test_specific_files_entry_round_trips(fake_home: Path, tmp_path: Path) -> No
     assert (base / "appdir" / "inner.conf").read_text() == "a"
     assert (base / "single.conf").read_text() == "b"
     assert not (base / "ignored.conf").exists()
+
+
+def test_latin1_file_round_trips_across_homes(fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The compressor normalizes latin-1 files, so the restore must denormalize them."""
+    tree = fake_home / "t"
+    tree.mkdir()
+    body = f"café={fake_home}/música\n"
+    (tree / "latin.conf").write_bytes(body.encode("latin-1"))
+
+    archive = tmp_path / "l.tar.gz"
+    TarCompressor(make_model([str(tree)], normalize_content=True), str(archive)).compress()
+
+    other_home = tmp_path / "home" / "otra"
+    other_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(other_home))
+    out = tmp_path / "out"
+    TarDecompressor(str(archive), str(out)).decompress()
+
+    restored = (out / "home" / "user" / "t" / "latin.conf").read_bytes().decode("latin-1")
+    assert restored == f"café={other_home}/música\n"

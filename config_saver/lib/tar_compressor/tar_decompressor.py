@@ -140,14 +140,15 @@ class TarDecompressor:
     # -------------------------------------------------------------- contents
 
     def _is_text_file_content(self, content: bytes) -> bool:
-        """Check if content is likely text (not binary)"""
-        if b"\0" in content[:8192]:
-            return False
-        try:
-            content[:8192].decode("utf-8")
-            return True
-        except UnicodeDecodeError:
-            return False
+        """Check if content is likely text (not binary).
+
+        Latin-1 counts as text, mirroring the compressor: it normalizes latin-1
+        files, so rejecting them here would leave the placeholder in place on
+        restore and break the round trip for exactly those files.
+        """
+        # Latin-1 decodes every byte string, so once there is no null byte there
+        # is nothing left that would make the content binary.
+        return b"\0" not in content[:8192]
 
     def _denormalize_file_content(self, content: bytes) -> bytes:
         """Replace HOME_CONTENT_PLACEHOLDER with actual user home in file content"""

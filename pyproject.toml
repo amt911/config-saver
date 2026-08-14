@@ -53,6 +53,8 @@ dev = [
     "types-tqdm",
     "pytest",
     "pytest-cov",
+    "hypothesis",
+    "mutmut",
     "ruff",
     "pre-commit"
 ]
@@ -73,9 +75,21 @@ python_version = "3.10"
 check_untyped_defs = true
 warn_unused_ignores = true
 
+# Mutation testing is scoped to the pure logic (path normalization, the expander,
+# archive-name parsing): mutating the I/O shells mostly produces timeouts, and a
+# timeout is scored as "killed", which inflates the result. Run it inside the
+# memory cgroup, see docs/TESTING.md.
+[tool.mutmut]
+# The whole package is copied so imports resolve inside the mutants tree; the
+# run is scoped by mutant name on the command line (see docs/TESTING.md).
+source_paths = ["config_saver/"]
+also_copy = ["configs/", "contrib/", "pyproject.toml", "README.md", "LICENSE"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"
+# mutmut writes a mutated copy of the tree here.
+extend-exclude = ["mutants"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]

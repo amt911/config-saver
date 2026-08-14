@@ -11,3 +11,7 @@ venv
 .coverage
 htmlcov
 graphify-out/
+mutants/
+.mutmut-cache
+mutmut-stats.json
+.hypothesis/

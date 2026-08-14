@@ -51,6 +51,10 @@ mypy config_saver
 The hooks run `ruff`, `ruff format` and `mypy` before each commit, and the full test suite before
 each push, so activate this environment in the shell you commit and push from.
 
+The suite includes property-based tests (Hypothesis) for the round-trip and path-normalization
+invariants. Mutation testing (mutmut) is available for the pure logic and is run by hand, not in CI
+— see [docs/TESTING.md](docs/TESTING.md).
+
 
 ### As an Arch Linux package
 You can install `config-saver` from the AUR using an AUR helper like `yay`:
@@ -367,8 +371,12 @@ directories:
 **When enabled**, the tool will:
 
 - Check if the current user is root (`uid == 0`) before processing
-- Reject execution with a clear error message if run by a non-root user
-- Allow compression/decompression only when executed with `sudo` or as root
+- Reject execution with a clear error message (exit code `4`) if run by a non-root user
+- Allow the **compression** of that configuration only when executed with `sudo` or as root
+
+The option gates *compression*, which is what reads the configuration file. `--decompress` takes an
+archive, not a config, so `only_root_user` does not apply to it: restoring files into root-owned
+locations succeeds or fails on the filesystem permissions of the process doing it.
 
 **Important behaviors:**
 

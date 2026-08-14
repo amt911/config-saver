@@ -169,3 +169,42 @@ def test_symlinks_are_never_content_normalized(fake_home: Path) -> None:
     link.symlink_to(target)
     compressor = TarCompressor(make_model([], normalize_content=True), "unused.tar.gz")
     assert compressor._normalize_file_content(str(link)) is None
+
+
+BINARY_EXTENSIONS = sorted(
+    {
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp", ".tiff", ".tif",
+        ".ttf", ".otf", ".woff", ".woff2", ".eot",
+        ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+        ".so", ".a", ".o", ".pyc", ".pyo", ".exe", ".dll", ".dylib",
+        ".db", ".sqlite", ".sqlite3",
+        ".mp3", ".mp4", ".avi", ".mkv", ".wav", ".flac", ".ogg",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    }
+)  # fmt: skip
+
+
+@pytest.mark.parametrize("extension", BINARY_EXTENSIONS)
+def test_every_binary_extension_is_excluded_from_normalization(fake_home: Path, extension: str) -> None:
+    """The extension list is the contract: dropping one silently starts
+    rewriting the contents of that file type."""
+    compressor = TarCompressor(make_model([], normalize_content=True), "unused.tar.gz")
+    target = fake_home / f"file{extension}"
+    target.write_text(f"path={fake_home}\n", encoding="utf-8")
+    assert compressor._is_text_file(str(target)) is False
+    assert compressor._normalize_file_content(str(target)) is None
+
+
+@pytest.mark.parametrize("extension", [".conf", ".txt", ".xml", ".json", ".yaml", ".sh", ""])
+def test_configuration_like_extensions_are_text(fake_home: Path, extension: str) -> None:
+    compressor = TarCompressor(make_model([]), "unused.tar.gz")
+    target = fake_home / f"file{extension}"
+    target.write_text("plain\n", encoding="utf-8")
+    assert compressor._is_text_file(str(target)) is True
+
+
+def test_extension_matching_is_case_insensitive(fake_home: Path) -> None:
+    compressor = TarCompressor(make_model([]), "unused.tar.gz")
+    target = fake_home / "IMAGE.PNG"
+    target.write_text("not really a png", encoding="utf-8")
+    assert compressor._is_text_file(str(target)) is False

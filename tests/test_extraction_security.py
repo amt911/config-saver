@@ -37,8 +37,9 @@ def test_parent_traversal_is_refused(tmp_path: Path, fake_home: Path) -> None:
     out = tmp_path / "out" / "a" / "b"
     out.mkdir(parents=True)
 
-    with pytest.raises(UnsafeArchiveError, match="traversal"):
+    with pytest.raises(UnsafeArchiveError, match="traversal") as excinfo:
         TarDecompressor(str(archive), str(out)).decompress()
+    assert excinfo.value.member_name == "../../escaped.txt"
     assert not (tmp_path / "out" / "escaped.txt").exists()
     assert not (tmp_path / "escaped.txt").exists()
 
@@ -48,8 +49,9 @@ def test_absolute_member_name_is_refused(tmp_path: Path, fake_home: Path) -> Non
     out = tmp_path / "out"
     out.mkdir()
 
-    with pytest.raises(UnsafeArchiveError, match="absolute"):
+    with pytest.raises(UnsafeArchiveError, match="absolute") as excinfo:
         TarDecompressor(str(archive), str(out)).decompress()
+    assert excinfo.value.member_name.endswith("config-saver-absolute-escape.txt")
     assert not Path("/tmp/config-saver-absolute-escape.txt").exists()
 
 
@@ -64,8 +66,9 @@ def test_symlink_escaping_the_root_is_refused(tmp_path: Path, fake_home: Path) -
     out = tmp_path / "out" / "deep"
     out.mkdir(parents=True)
 
-    with pytest.raises(UnsafeArchiveError, match="link target"):
+    with pytest.raises(UnsafeArchiveError, match="link target") as excinfo:
         TarDecompressor(str(archive), str(out)).decompress()
+    assert excinfo.value.member_name == "link"
     assert not (out / "link").exists()
 
 
@@ -114,8 +117,9 @@ def test_hardlink_escaping_the_archive_is_refused(tmp_path: Path, fake_home: Pat
     archive = _archive(tmp_path, build)
     out = tmp_path / "out"
     out.mkdir()
-    with pytest.raises(UnsafeArchiveError, match="hard link"):
+    with pytest.raises(UnsafeArchiveError, match="hard link") as excinfo:
         TarDecompressor(str(archive), str(out)).decompress()
+    assert excinfo.value.member_name == "hard"
 
 
 def test_device_nodes_are_refused(tmp_path: Path, fake_home: Path) -> None:
@@ -173,3 +177,87 @@ def test_output_directory_is_created_even_for_an_empty_archive(tmp_path: Path, f
     result = TarDecompressor(str(archive), str(out)).decompress()
     assert result.extracted == 0
     assert out.is_dir()
+
+
+@pytest.mark.parametrize(
+    "member_type",
+    [tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.FIFOTYPE],
+    ids=["character-device", "block-device", "fifo"],
+)
+def test_every_special_member_type_is_refused(tmp_path: Path, fake_home: Path, member_type: bytes) -> None:
+    def build(tar: tarfile.TarFile) -> None:
+        info = tarfile.TarInfo("special")
+        info.type = member_type
+        tar.addfile(info)
+
+    archive = _archive(tmp_path, build)
+    out = tmp_path / "out"
+    out.mkdir()
+    with pytest.raises(UnsafeArchiveError, match="device") as excinfo:
+        TarDecompressor(str(archive), str(out)).decompress()
+    assert excinfo.value.member_name == "special"
+    assert not (out / "special").exists()
+
+
+@pytest.mark.parametrize("name", ["/etc/passwd", "\\windows\\system32", "//double", "\\"])
+def test_absolute_or_rooted_member_names_are_refused(tmp_path: Path, fake_home: Path, name: str) -> None:
+    """Both POSIX and Windows-style roots: a member name may never start at a root."""
+    archive = _archive(tmp_path, lambda tar: _add_file(tar, name))
+    out = tmp_path / "out"
+    out.mkdir()
+    with pytest.raises(UnsafeArchiveError, match="absolute"):
+        TarDecompressor(str(archive), str(out)).decompress()
+
+
+def test_restore_in_place_writes_absolute_members(tmp_path: Path, fake_home: Path) -> None:
+    """Restore without --output targets absolute paths outside the home; that is
+    the /etc use case, and it must still work."""
+    target = tmp_path / "system" / "conf.d"
+    target.mkdir(parents=True)
+    member_name = str(target / "app.conf").lstrip("/")
+
+    archive = tmp_path / "abs.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        _add_file(tar, member_name, b"restored\n", mode=0o640)
+
+    result = TarDecompressor(str(archive)).decompress()
+    assert result.extracted == 1
+    assert (target / "app.conf").read_bytes() == b"restored\n"
+    assert (target / "app.conf").stat().st_mode & 0o777 == 0o640
+
+
+def test_is_within_allows_everything_only_for_the_filesystem_root() -> None:
+    """The root=/ shortcut is what makes restore-in-place possible; anything
+    narrower must still confine."""
+    decompressor = TarDecompressor("unused.tar.gz")
+    assert decompressor._is_within("/anywhere/at/all", os.sep) is True
+    assert decompressor._is_within("/other/place", "/root/dir") is False
+    assert decompressor._is_within("/root/dir", "/root/dir") is True
+    assert decompressor._is_within("/root/dir/child", "/root/dir/") is True
+    assert decompressor._is_within("/root/dirsibling", "/root/dir") is False
+
+
+def test_member_landing_in_a_symlinked_directory_is_refused(tmp_path: Path, fake_home: Path) -> None:
+    """The destination's parent may not be a symlink out of the root, even when
+    the archive itself contains no link member."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "linkdir").symlink_to(outside)
+
+    archive = _archive(tmp_path, lambda tar: _add_file(tar, "linkdir/payload.txt"))
+    with pytest.raises(UnsafeArchiveError, match="parent directory escapes") as excinfo:
+        TarDecompressor(str(archive), str(out)).decompress()
+    assert excinfo.value.member_name == "linkdir/payload.txt"
+    assert not (outside / "payload.txt").exists()
+
+
+def test_home_lookalike_member_is_refused_in_restore_in_place_mode(tmp_path: Path, fake_home: Path) -> None:
+    """`home/username/...` claims the home extraction root but denormalizes
+    somewhere else entirely; it must not be written."""
+    archive = _archive(tmp_path, lambda tar: _add_file(tar, "home/userland/evil.txt"))
+    with pytest.raises(UnsafeArchiveError, match="resolves outside the extraction root") as excinfo:
+        TarDecompressor(str(archive)).decompress()
+    assert excinfo.value.member_name == "home/userland/evil.txt"
+    assert not Path("/home/userland/evil.txt").exists()
