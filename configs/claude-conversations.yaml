@@ -1,0 +1,25 @@
+# Claude Code CLI conversation transcripts.
+#
+# ⚠ Size: ~700 MB across 766 .jsonl files today, and it only grows. Kept out of
+# claude.yaml so the settings backup stays small and fast; run this one on its
+# own schedule.
+#
+# ⚠ Contents: transcripts include whatever was pasted into a session — file
+# contents, command output, occasionally credentials. Treat the archive as
+# sensitive: encrypt it if it leaves this machine.
+#
+# encrypt:
+#   method: age
+#   recipients:
+#     - age1...
+#
+# normalize_content is off on purpose: rewriting home paths inside 700 MB of
+# transcripts costs time and would edit the recorded history.
+
+normalize_content: false
+
+directories:
+    - source: "$HOME/.claude"
+      files:
+        - projects
+        - history.jsonl

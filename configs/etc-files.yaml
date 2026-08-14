@@ -12,3 +12,20 @@ directories:
     - "$ETC_CONFIG_DIR"
     # System connections (NetworkManager) - outside user home
     - /etc/NetworkManager/system-connections
+
+    # libvirt/KVM: daemon configuration, virtual machine definitions, virtual
+    # networks and nwfilters. The disk images under /var/lib/libvirt/images are
+    # NOT here on purpose - they are data, not configuration, and huge.
+    - /etc/libvirt
+
+    # Locale and console keymap, the system half of the KDE locale/keyboard
+    # settings (the user half is plasma-localerc / kxkbrc in default-config).
+    - /etc/locale.conf
+    - /etc/vconsole.conf
+
+    # NFS server exports. Not present on this machine yet (nfs-utils is not
+    # installed); uncomment once /etc/exports exists, or the run will report it
+    # as a missing input on every pass.
+    # - /etc/exports
+    # - /etc/exports.d
+    # - /etc/nfs.conf
