@@ -290,7 +290,9 @@ longer parses, a config that fails to validate, a broken round-trip.
 - **Never push** (default) — no `git push` under any circumstance, and never `git push --force` /
   `--force-with-lease`. Leave pushing to the user. **Exception:** with **"modo desatendido"**
   active, you may push the feature branches you create (never `main`/protected, never force).
-- **Never merge — no permission** — no `git merge`, no fast-forward integration, no `gh pr merge`,
-  and no merging of any pull request, in every mode incl. **"modo desatendido"**. Leave every
-  merge to the user.
+- **Never merge unless the user asks for it in that conversation** — no `git merge`, no
+  fast-forward integration, no `gh pr merge`, and no merging of any pull request. This holds in
+  every mode, **"modo desatendido"** included: unattended autonomy covers branches and PRs, never
+  merges. Only an explicit "merge this" from the user in the current session lifts it, and it
+  covers exactly what they named — not the next PR.
 - **GitHub via `gh`** — open PRs, issues, comments, and labels over branches already pushed.
