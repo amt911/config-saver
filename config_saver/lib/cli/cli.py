@@ -22,8 +22,10 @@ from rich.console import Console
 from rich.table import Table
 
 from config_saver import __version__
+from config_saver.lib import crypto
 from config_saver.lib.backup_manager.backup_manager import BackupManager, BatchResult
-from config_saver.lib.errors import ArchiveError, RootRequiredError, UnsafeArchiveError
+from config_saver.lib.errors import ArchiveError, EncryptionError, RootRequiredError, UnsafeArchiveError
+from config_saver.lib.models.encryption_model import EncryptionModel
 from config_saver.lib.tar_compressor.tar_compressor import CompressResult
 from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
 
@@ -38,10 +40,11 @@ EXIT_RUNTIME = 5
 EXIT_USAGE = 6
 EXIT_NO_SUCH_CONFIG = 7
 EXIT_INCOMPLETE = 8
+EXIT_ENCRYPTION = 9
 EXIT_IO = 10
 
-# Matches <name>-YYYYMMDD-HHMMSS.tar.gz
-FILENAME_PATTERN = re.compile(r"(.+)-(\d{8}-\d{6})\.tar\.gz$")
+# Matches <name>-YYYYMMDD-HHMMSS.tar.gz, optionally encrypted (.age / .gpg)
+FILENAME_PATTERN = re.compile(r"(.+)-(\d{8}-\d{6})\.tar\.gz(?:\.age|\.gpg)?$")
 
 
 class BackupTable:
@@ -207,6 +210,25 @@ class CLI:
             ),
         )
         parser.add_argument(
+            "--encrypt-to",
+            action="append",
+            metavar="RECIPIENT",
+            default=None,
+            help="Encrypt the archive for this recipient (age public key or gpg key id). Repeatable",
+        )
+        parser.add_argument(
+            "--encrypt-method",
+            choices=sorted(crypto.SUFFIXES),
+            default=None,
+            help="Backend for --encrypt-to (default: age)",
+        )
+        parser.add_argument(
+            "--identity",
+            type=str,
+            default=None,
+            help="Key file used to decrypt an encrypted archive (required for age)",
+        )
+        parser.add_argument(
             "--strict",
             action="store_true",
             help=f"Exit with {EXIT_INCOMPLETE} when a configured path was missing from the backup",
@@ -221,6 +243,19 @@ class CLI:
         return parser.parse_args(self.argv)
 
     # ------------------------------------------------------------- rendering
+
+    @staticmethod
+    def _encryption_override(args: argparse.Namespace) -> EncryptionModel | None:
+        """Build the encryption settings the command line asks for, if any.
+
+        Returning None means "whatever the configuration file says", so a config
+        that declares `encrypt:` keeps working without any flag.
+        """
+        if not args.encrypt_to:
+            if args.encrypt_method:
+                raise ValueError("--encrypt-method needs at least one --encrypt-to RECIPIENT.")
+            return None
+        return EncryptionModel(method=args.encrypt_method or "age", recipients=list(args.encrypt_to))
 
     @staticmethod
     def _resolve_jobs(raw: str) -> int:
@@ -238,6 +273,9 @@ class CLI:
     @staticmethod
     def _report_result(result: CompressResult, label: str = "") -> None:
         prefix = f"[{label}] " if label else ""
+        if result.encryption is not None:
+            recipients = ", ".join(result.encryption.recipients)
+            print(Fore.GREEN + f"{prefix}Encrypted with {result.encryption.method} for: {recipients}")
         if result.missing_inputs:
             print(Fore.YELLOW + f"{prefix}⚠ {len(result.missing_inputs)} configured path(s) were missing:")
             for path in result.missing_inputs[:10]:
@@ -298,6 +336,9 @@ class CLI:
         except PermissionError as e:
             print(Fore.RED + f"Permission error: {e}")
             return EXIT_PERMISSION
+        except EncryptionError as e:
+            print(Fore.RED + f"Encryption error: {e}")
+            return EXIT_ENCRYPTION
         except (UnsafeArchiveError, ArchiveError) as e:
             print(Fore.RED + f"Archive error: {e}")
             return EXIT_RUNTIME
@@ -348,7 +389,7 @@ class CLI:
             return EXIT_NO_SUCH_CONFIG
 
         def extract_ts(path: str) -> str:
-            m = re.search(r"-(\d{8}-\d{6})\.tar\.gz$", os.path.basename(path))
+            m = re.search(r"-(\d{8}-\d{6})\.tar\.gz(?:\.age|\.gpg)?$", os.path.basename(path))
             return m.group(1) if m else "00000000-000000"
 
         latest = sorted(matching, key=extract_ts, reverse=True)[0]
@@ -409,6 +450,12 @@ class CLI:
         if args.progress and args.jobs == "auto":
             jobs = 1
 
+        try:
+            encryption = self._encryption_override(args)
+        except ValueError as e:
+            print(Fore.RED + str(e))
+            return EXIT_USAGE
+
         input_path = args.input
         if input_path is None:
             input_path = default_config_dir()
@@ -436,6 +483,7 @@ class CLI:
                 show_progress=args.progress,
                 description=args.description,
                 jobs=jobs,
+                encryption=encryption,
             )
             self._report_batch(batch)
             if batch.failures:
@@ -464,10 +512,15 @@ class CLI:
                 timestamp,
                 description=args.description,
                 show_progress=args.progress,
+                encryption=encryption,
             )
         else:
             out_path = args.output or os.path.join(saves_dir, f"config-saver-{timestamp}.tar.gz")
-            result = manager.compress_config_file(input_path, out_path, show_progress=args.progress)
+            result = manager.compress_config_file(
+                input_path, out_path, show_progress=args.progress, encryption=encryption
+            )
+            # Encryption appends a suffix, so the archive is not at `out_path`.
+            out_path = result.output_path
 
         print(Fore.GREEN + f"Compression completed successfully. Output: {out_path}")
         self._report_result(result)
@@ -479,8 +532,10 @@ class CLI:
         if args.input is None:
             print(Fore.RED + "--decompress requires --input <archive.tar.gz>.")
             return EXIT_USAGE
-        decompressor = TarDecompressor(args.input, args.output, show_progress=args.progress)
+        decompressor = TarDecompressor(args.input, args.output, show_progress=args.progress, identity=args.identity)
         result = decompressor.decompress()
+        if result.decrypted_with:
+            print(Fore.GREEN + f"Archive decrypted with {result.decrypted_with}.")
         if args.output:
             print(Fore.GREEN + f"Extraction completed successfully in '{args.output}' ({result.extracted} members).")
         else:

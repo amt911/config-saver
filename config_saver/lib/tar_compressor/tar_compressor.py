@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import IO
 
 from config_saver import __version__
+from config_saver.lib import crypto
 from config_saver.lib.models.model import Model
 
 # Placeholder for user home directory in file contents
@@ -50,6 +51,7 @@ class CompressResult:
     added: int = 0
     skipped_root_owned: list[str] = field(default_factory=list)
     missing_inputs: list[str] = field(default_factory=list)
+    encryption: crypto.EncryptionInfo | None = None
 
     @property
     def complete(self) -> bool:
@@ -335,7 +337,16 @@ class TarCompressor:
         and moved into place with ``os.replace`` only after a clean close, so an
         interrupted run never leaves a truncated file that looks like a backup.
         """
-        result = CompressResult(output_path=self.output_path)
+        encryption = self.yaml_data.encrypt
+        final_path = self.output_path
+        if encryption is not None:
+            # Fail before doing the work if the backend is missing.
+            crypto.require_binary(encryption.method)
+            suffix = crypto.suffix_for(encryption.method)
+            if not final_path.endswith(suffix):
+                final_path += suffix
+
+        result = CompressResult(output_path=final_path)
 
         emit: Callable[[str], None] = _no_emit
         items: Iterable[tuple[str, str, bool]] = self._collect(result)
@@ -347,9 +358,10 @@ class TarCompressor:
             items = tqdm(list(items), desc="Compressing files", unit="file")
             emit = tqdm.write
 
-        out_dir = os.path.dirname(os.path.abspath(self.output_path)) or "."
+        out_dir = os.path.dirname(os.path.abspath(final_path)) or "."
         os.makedirs(out_dir, exist_ok=True)
-        tmp_path = os.path.join(out_dir, f".{os.path.basename(self.output_path)}.{os.getpid()}.part")
+        tmp_path = os.path.join(out_dir, f".{os.path.basename(final_path)}.{os.getpid()}.part")
+        encrypted_tmp = tmp_path + ".enc"
 
         try:
             fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, ARCHIVE_MODE)
@@ -383,13 +395,21 @@ class TarCompressor:
                         tar.add(path, arcname=arcname)
                     result.added += 1
             os.chmod(tmp_path, ARCHIVE_MODE)
-            os.replace(tmp_path, self.output_path)
-        except BaseException:
-            # Never leave a partial archive behind, whatever went wrong.
-            try:
+            if encryption is None:
+                os.replace(tmp_path, final_path)
+            else:
+                # Encrypt the finished archive, then remove the plaintext before
+                # anything is published under the final name.
+                result.encryption = crypto.encrypt_file(tmp_path, encrypted_tmp, encryption)
                 os.unlink(tmp_path)
-            except OSError:
-                pass
+                os.replace(encrypted_tmp, final_path)
+        except BaseException:
+            # Never leave a partial (or plaintext) archive behind, whatever went wrong.
+            for leftover in (tmp_path, encrypted_tmp):
+                try:
+                    os.unlink(leftover)
+                except OSError:
+                    pass
             raise
 
         return result

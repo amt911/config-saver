@@ -3,6 +3,15 @@
 # Set to false (or omit) to only normalize file paths in the archive
 normalize_content: true
 
+# Optional: encrypt the resulting archive. gzip is compression, not
+# confidentiality, so a configuration that backs up credentials should set this.
+# Needs the `age` (or `gnupg`) binary. Restore with:
+#   config-saver --decompress -i <archive>.tar.gz.age --identity ~/.config/age/key.txt
+# encrypt:
+#   method: age              # or gpg
+#   recipients:
+#     - age1qz...            # age public key, or a gpg key id / user id
+
 directories:
     - source: "$CONFIG_DIR"
       files:

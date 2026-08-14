@@ -36,6 +36,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # The encryption round-trip tests drive the real binaries; without them
+      # those tests skip and the feature is untested.
+      - run: sudo apt-get update && sudo apt-get install -y age gnupg
       - run: pip install '.[dev]'
       - run: mypy config_saver
       # The gate is the behavioural suite; ratchet --cov-fail-under as coverage grows.

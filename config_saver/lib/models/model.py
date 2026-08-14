@@ -2,6 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .encryption_model import EncryptionModel
 from .specific_files_model import SpecificFilesModel
 
 
@@ -18,3 +19,7 @@ class Model(BaseModel):
         description="Enable content normalization (replace home paths in text files)",
     )
     only_root_user: bool = Field(default=False, description="Restrict execution to root user only")
+    encrypt: EncryptionModel | None = Field(
+        default=None,
+        description="Encrypt the resulting archive with age or gpg (a .tar.gz is not confidential)",
+    )

@@ -31,6 +31,10 @@ class UnsafeArchiveError(RuntimeError, ConfigSaverError):
         super().__init__(f"Refusing to extract unsafe archive member '{member_name}': {reason}")
 
 
+class EncryptionError(RuntimeError, ConfigSaverError):
+    """The configured encryption backend is missing, or refused to run."""
+
+
 class ArchiveError(RuntimeError, ConfigSaverError):
     """The archive is missing, truncated or otherwise unreadable."""
 

@@ -14,7 +14,9 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 
+from config_saver.lib import crypto
 from config_saver.lib.errors import RootRequiredError
+from config_saver.lib.models.encryption_model import EncryptionModel
 from config_saver.lib.parser.parser import Parser
 from config_saver.lib.tar_compressor.tar_compressor import (
     ARCHIVE_MODE,
@@ -27,6 +29,9 @@ PRIVATE_DIR_MODE = 0o700
 
 # Config files accepted in directory (batch) mode. YAML parsing also accepts JSON.
 CONFIG_GLOBS = ("*.yaml", "*.yml", "*.json")
+
+# Archive names, plain and encrypted.
+ARCHIVE_GLOBS = ("*.tar.gz", *(f"*.tar.gz{suffix}" for suffix in crypto.SUFFIXES.values()))
 
 
 @dataclass
@@ -110,9 +115,9 @@ def _chmod_private(path: str) -> None:
         pass
 
 
-def _compress_job(job: tuple[str, str, str, str | None, bool]) -> ConfigOutcome:
+def _compress_job(job: tuple[str, str, str, str | None, bool, EncryptionModel | None]) -> ConfigOutcome:
     """Compress one configuration. Top-level so ProcessPoolExecutor can pickle it."""
-    config_path, dest_dir, archive_name, description, show_progress = job
+    config_path, dest_dir, archive_name, description, show_progress, encryption = job
     outcome = ConfigOutcome(config_path=config_path)
     try:
         manager = BackupManager()
@@ -122,6 +127,7 @@ def _compress_job(job: tuple[str, str, str, str | None, bool]) -> ConfigOutcome:
             archive_name,
             description=description,
             show_progress=show_progress,
+            encryption=encryption,
         )
     except RootRequiredError:
         outcome.skipped_root_only = True
@@ -165,15 +171,28 @@ class BackupManager:
         """
         configs_root = os.path.join(self.saves_dir, "configs")
         files: set[str] = set()
-        if os.path.isdir(configs_root):
-            files.update(glob.glob(os.path.join(configs_root, "**", "*.tar.gz"), recursive=True))
-        files.update(glob.glob(os.path.join(self.saves_dir, "*.tar.gz")))
+        for pattern in ARCHIVE_GLOBS:
+            if os.path.isdir(configs_root):
+                files.update(glob.glob(os.path.join(configs_root, "**", pattern), recursive=True))
+            files.update(glob.glob(os.path.join(self.saves_dir, pattern)))
         return sorted(files)
 
-    def compress_config_file(self, config_path: str, out_path: str, show_progress: bool = False) -> CompressResult:
-        """Compress a single configuration into the provided output path."""
+    def compress_config_file(
+        self,
+        config_path: str,
+        out_path: str,
+        show_progress: bool = False,
+        encryption: EncryptionModel | None = None,
+    ) -> CompressResult:
+        """Compress a single configuration into the provided output path.
+
+        `encryption` overrides whatever the configuration file declares, which is
+        what --encrypt-to does.
+        """
         parser = Parser(config_path)
         model = parser.get_model()
+        if encryption is not None:
+            model = model.model_copy(update={"encrypt": encryption})
         compressor = TarCompressor(model, out_path, show_progress=show_progress)
         result = compressor.compress()
         # A placeholder that matched nothing never becomes a path; report it as missing.
@@ -190,6 +209,7 @@ class BackupManager:
         archive_name: str,
         description: str | None = None,
         show_progress: bool = False,
+        encryption: EncryptionModel | None = None,
     ) -> tuple[str, CompressResult]:
         """Compress a config into dest_dir, optionally writing a description.txt.
 
@@ -199,7 +219,9 @@ class BackupManager:
         _ensure_private_dir(dest_dir)
 
         out_path = os.path.join(dest_dir, archive_name)
-        result = self.compress_config_file(config_path, out_path, show_progress=show_progress)
+        result = self.compress_config_file(config_path, out_path, show_progress=show_progress, encryption=encryption)
+        # Encryption appends a suffix, so the real path comes from the result.
+        out_path = result.output_path
 
         if description:
             desc_path = os.path.join(dest_dir, "description.txt")
@@ -216,6 +238,7 @@ class BackupManager:
         timestamp: str,
         description: str | None = None,
         show_progress: bool = False,
+        encryption: EncryptionModel | None = None,
     ) -> tuple[str, CompressResult]:
         """Compress a configuration into <base_cfg_dir>/<timestamp>/."""
         ts_dir = os.path.join(base_cfg_dir, timestamp)
@@ -262,6 +285,7 @@ class BackupManager:
         show_progress: bool = False,
         description: str | None = None,
         jobs: int = 1,
+        encryption: EncryptionModel | None = None,
     ) -> BatchResult:
         """Compress each configuration inside input_dir into its own archive.
 
@@ -282,12 +306,12 @@ class BackupManager:
 
         self.ensure_saves_dir()
 
-        jobs_spec: list[tuple[str, str, str, str | None, bool]] = []
+        jobs_spec: list[tuple[str, str, str, str | None, bool, EncryptionModel | None]] = []
         for cfg in cfg_files:
             cfg_basename = os.path.splitext(os.path.basename(cfg))[0]
             ts_dir = os.path.join(self.saves_dir, "configs", cfg_basename, timestamp)
             archive_name = f"{cfg_basename}-{timestamp}.tar.gz"
-            jobs_spec.append((cfg, ts_dir, archive_name, description, show_progress and jobs == 1))
+            jobs_spec.append((cfg, ts_dir, archive_name, description, show_progress and jobs == 1, encryption))
 
         if jobs > 1:
             with ProcessPoolExecutor(max_workers=jobs) as pool:

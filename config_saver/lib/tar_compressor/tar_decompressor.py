@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import tarfile
+import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from config_saver.lib import crypto
 from config_saver.lib.errors import ArchiveError, UnsafeArchiveError
 from config_saver.lib.tar_compressor.tar_compressor import (
     HOME_CONTENT_PLACEHOLDER,
@@ -30,6 +32,7 @@ class DecompressResult:
     output_dir: str | None = None
     extracted: int = 0
     normalized_content: bool = False
+    decrypted_with: str | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -41,10 +44,18 @@ class TarDecompressor:
     (CVE-2007-4559 / "zip slip").
     """
 
-    def __init__(self, tar_path: str, output_dir: str | None = None, show_progress: bool = False):
+    def __init__(
+        self,
+        tar_path: str,
+        output_dir: str | None = None,
+        show_progress: bool = False,
+        identity: str | None = None,
+    ):
         self.tar_path = tar_path
         self.output_dir = output_dir
         self.show_progress = show_progress
+        # Key material for encrypted archives (age needs it; gpg uses its agent).
+        self.identity = identity
         # Get current user's home directory for path denormalization
         self.user_home = os.path.expanduser("~")
 
@@ -235,6 +246,31 @@ class TarDecompressor:
 
         result = DecompressResult(tar_path=self.tar_path, output_dir=self.output_dir)
 
+        # An encrypted archive is decrypted into a private temporary file first;
+        # tarfile then reads a perfectly ordinary .tar.gz.
+        method = crypto.detect_method(self.tar_path)
+        archive_path = self.tar_path
+        plaintext_tmp: str | None = None
+        if method is not None:
+            handle, plaintext_tmp = tempfile.mkstemp(prefix="config-saver-", suffix=".tar.gz")
+            os.close(handle)
+            crypto.decrypt_file(self.tar_path, plaintext_tmp, method=method, identity=self.identity)
+            archive_path = plaintext_tmp
+            result.decrypted_with = method
+
+        try:
+            self._extract(archive_path, result)
+        finally:
+            if plaintext_tmp is not None:
+                try:
+                    os.unlink(plaintext_tmp)
+                except OSError:
+                    pass
+        return result
+
+    def _extract(self, archive_path: str, result: DecompressResult) -> None:
+        """Extract every member of an already-decrypted archive."""
+
         if self.output_dir:
             # Create it up front: an archive with no extractable member would
             # otherwise report success into a directory that does not exist.
@@ -242,7 +278,7 @@ class TarDecompressor:
 
         emit: Callable[[str], None] = _no_emit
         try:
-            with tarfile.open(self.tar_path, "r:gz") as tar:
+            with tarfile.open(archive_path, "r:gz") as tar:
                 metadata = self._read_metadata(tar)
                 # Archives written before the metadata member existed are assumed
                 # to have been normalized, which is the historical behaviour.
@@ -269,5 +305,3 @@ class TarDecompressor:
                     result.extracted += 1
         except tarfile.TarError as e:
             raise ArchiveError(f"Could not read archive '{self.tar_path}': {e}") from e
-
-        return result

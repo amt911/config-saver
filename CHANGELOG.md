@@ -20,6 +20,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Optional archive encryption** with `age` or `gpg`, per configuration (`encrypt:` block) or from
+  the command line (`--encrypt-to`, `--encrypt-method`), restored with `--decompress --identity`.
+  The plaintext archive never survives the run, encrypted archives keep mode `0600`, and failures
+  exit with the new code `9`. This is what makes a backup of `~/.ssh` or `~/.config/rclone` safe to
+  copy anywhere.
+
 - `tests/` — pytest suite covering round-trip integrity, one regression per extraction-attack
   vector, parser/models, path expander, backup manager, CLI exit codes, systemd units and packaging
   metadata (#20). CI gate: 90% coverage.
