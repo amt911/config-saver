@@ -1,0 +1,42 @@
+# Claude Code CLI configuration — settings, instructions, skills, hooks, plans.
+#
+# ⚠ Deliberately excluded, and why:
+#   ~/.claude/.credentials.json   OAuth credentials. Never in a plain archive.
+#   ~/.claude.json                Holds account/token material next to the MCP
+#                                 server list and per-project history. If you
+#                                 want it, back it up with `encrypt:` below and
+#                                 add `- .claude.json` under the $HOME source.
+#   ~/.claude/plugins/cache       Re-downloadable; 4.6 MB of nothing.
+#   ~/.claude/plugins/marketplaces  Git clones (7 MB), restored by reinstalling.
+#   ~/.claude/shell-snapshots, file-history, cache, paste-cache, session-env
+#                                 Machine-local scratch, worthless on restore.
+#
+# Conversations live in ~/.claude/projects and are ~700 MB, so they get their
+# own configuration: claude-conversations.yaml.
+#
+# To encrypt this archive (recommended if you add .claude.json):
+# encrypt:
+#   method: age
+#   recipients:
+#     - age1...
+
+normalize_content: true
+
+directories:
+    - source: "$HOME/.claude"
+      files:
+        - settings.json
+        - settings.local.json
+        - CLAUDE.md
+        - hooks
+        - plans
+        - tasks
+        # Plugin manifests only: what is installed and from which marketplace.
+        - plugins/installed_plugins.json
+        - plugins/known_marketplaces.json
+        - plugins/blocklist.json
+        # Entries here are symlinks into ~/.agents/skills; both are archived.
+        - skills
+
+    # The real skill/agent definitions the ~/.claude/skills symlinks point at.
+    - "$HOME/.agents"

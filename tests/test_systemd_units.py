@@ -59,8 +59,22 @@ def test_timers_are_actually_recurring(path: Path) -> None:
     """OnActiveSec= fires once, 3h after activation: it is not a daily schedule."""
     timer = _unit(path)
     assert not timer.has_option("Timer", "OnActiveSec")
-    assert timer.get("Timer", "OnCalendar")
+    assert timer.get("Timer", "OnCalendar") == "*-*-* 03:00:00"
     assert timer.get("Timer", "Persistent") == "true"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [CONTRIB / "user" / "config-saver.timer", CONTRIB / "system" / "config-saver@.timer"],
+    ids=["user", "system"],
+)
+def test_a_missed_backup_runs_immediately(path: Path) -> None:
+    """Persistent= catches up a backup the machine slept through, but a
+    randomized delay or the default one-minute accuracy would make that
+    catch-up wait. Both are pinned to zero on purpose."""
+    timer = _unit(path)
+    assert timer.get("Timer", "RandomizedDelaySec") == "0"
+    assert timer.get("Timer", "AccuracySec") == "1s"
 
 
 @pytest.mark.parametrize(

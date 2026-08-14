@@ -650,8 +650,13 @@ Notes:
   so outputs land in that user's `~/.config/config-saver` even with a non-standard home directory.
 - The user units are plain (non-templated) units: they set no `User=`, no `HOME=`, and install into
   `default.target`.
-- Both timers use `OnCalendar=*-*-* 03:00:00` with `Persistent=true`, i.e. daily at 03:00 with a
-  catch-up run after downtime. (They previously used `OnActiveSec=3h`, which fires **once**.)
+- Both timers use `OnCalendar=*-*-* 03:00:00` with `Persistent=true`, i.e. daily at 03:00, and a
+  backup the machine slept through runs **as soon as the timer starts again**, not at the next
+  03:00. `RandomizedDelaySec=0` and `AccuracySec=1s` keep that catch-up immediate; raise the former
+  if you instantiate the system template for many users and would rather spread the load.
+  (They previously used `OnActiveSec=3h`, which fires **once**, 3 h after activation, and never
+  again — check `systemctl list-timers 'config-saver*'`: an empty `NEXT` column means you are still
+  running that version.)
 - Both services set `UMask=0077` so scheduled runs never create world-readable archives.
 - For virtualenv usage, change `ExecStart` to the absolute python path in the venv.
 
