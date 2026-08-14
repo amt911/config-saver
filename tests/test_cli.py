@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from config_saver.lib import paths
 from config_saver.lib.backup_manager.backup_manager import BackupManager
-from config_saver.lib.cli import cli as cli_module
 from config_saver.lib.cli.cli import (
     CLI,
     EXIT_INCOMPLETE,
@@ -124,10 +124,14 @@ def test_invalid_jobs_value(tmp_path: Path, data_dir: Path) -> None:
 def test_no_config_directory_available_is_actionable(
     tmp_path: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(CLI, "DEFAULT_SYSTEM_CONFIG", str(tmp_path / "absent"))
-    monkeypatch.setattr(cli_module.sys, "prefix", str(tmp_path / "prefix"))
+    """With nothing configured the run must say what to do, not back up whatever
+    examples happen to be installed."""
+    monkeypatch.setattr(paths, "SYSTEM_CONFIG_DIR", str(tmp_path / "absent"))
+    monkeypatch.setattr(paths, "example_config_dir", lambda: str(tmp_path / "examples"))
     assert run(["--compress"]) == EXIT_USAGE
-    assert "AUR" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "No configurations found." in out
+    assert "configs.d" in out
 
 
 # --------------------------------------------------------------- decompress
