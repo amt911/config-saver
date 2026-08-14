@@ -11,6 +11,8 @@ Python CLI tool for compressing and decompressing directories or files by using 
 - Optional progress bar for compression/decompression (`--progress`/`-P`).
 - Parallel compression of independent configurations (`--jobs`/`-j`).
 - Missing inputs are reported, never silently skipped (`--strict` turns them into a non-zero exit).
+- Three layered configuration levels ([examples, system policy, yours](#where-configurations-live)),
+  merged with the most specific one winning.
 - Several configuration directories in one run, so your own configs can live in a
   [private repository](#personal-configurations-from-a-private-repository) instead of `/etc`.
 - Optional archive [encryption](#encryption-optional) with `age` or `gpg`.
@@ -191,6 +193,8 @@ config-saver --compress
 - `--progress`/`-P`: Show progress bar during compression/decompression
 - `--jobs`/`-j N`: Worker count for directory mode. Default `auto` (one per CPU, capped at the number of configurations); `1` forces sequential
 - `--strict`: Exit with code 8 when a configured path was missing from the backup
+- `--include-system-configs`: Also archive `/etc/config-saver/configs` (off by default)
+- `--restore-system-configs`: Restore members landing in `/etc/config-saver/configs` (off by default)
 - `--encrypt-to RECIPIENT`: Encrypt the archive for this age public key or gpg key id (repeatable)
 - `--encrypt-method {age,gpg}`: Backend for `--encrypt-to` (default `age`)
 - `--identity FILE`: Key file used to decrypt an encrypted archive (required for `age`)
@@ -249,6 +253,47 @@ normalized.
   `os.replace()` only after a clean close — an interrupted run never leaves a truncated file that
   looks like a valid backup.
 
+## Where configurations live
+
+Three levels, layered the way systemd and `tmpfiles.d` layer their drop-ins:
+
+| Level | Path | Owner |
+| --- | --- | --- |
+| Examples | `/usr/share/config-saver/configs` (`<prefix>/share/…` for a pip install) | the package |
+| System policy | `/etc/config-saver/configs` | the administrator, or a declarative installer |
+| Yours | `~/.config/config-saver/configs.d` | you |
+
+Running `config-saver --compress` with no `--input` **merges the two lower levels**, and the more
+specific one wins: with `/etc/config-saver/configs/zsh.json` and
+`~/.config/config-saver/configs.d/zsh.yaml` present, yours is used and the system one is ignored —
+not both. Configurations are matched by name without extension, so a `.yaml` of yours overrides a
+`.json` of the system's.
+
+**The examples are never used on their own.** With nothing configured at either active level the
+run stops with exit `6` and tells you what to copy:
+
+```console
+$ config-saver --compress
+No configurations found.
+  system policy : /etc/config-saver/configs
+  yours         : /home/you/.config/config-saver/configs.d
+  examples      : /usr/share/config-saver/configs (never used on their own)
+Copy an example to your own directory to get started:
+  mkdir -p /home/you/.config/config-saver/configs.d && cp /usr/share/config-saver/configs/zsh.yaml /home/you/.config/config-saver/configs.d/
+```
+
+That is deliberate. Falling back to the shipped examples would mean a fresh install quietly backs
+up whatever they happen to list — the default example reaches `~/.ssh` and `~/.config/rclone` — on a
+daily timer, because a package was installed. Backups of things nobody chose are a surprise with
+security weight; one `cp` is not a burden. The examples stay one explicit flag away:
+`config-saver --compress --input /usr/share/config-saver/configs`.
+
+Because your level lives inside `$HOME`, any configuration that backs up your home directory also
+carries **the configurations themselves**: restoring such an archive on a clean machine brings back
+what to back up, not only the data.
+
+`/etc` is different — see [System configurations in archives](#system-configurations-in-archives).
+
 ## Personal configurations from a private repository
 
 `--input` is repeatable in directory mode, so a private repository of personal configurations sits
@@ -294,6 +339,39 @@ directories:
 
 Anything sensitive in there deserves [encryption](#encryption-optional); the repository being
 private protects the remote, not the archive sitting on your disk.
+
+## System configurations in archives
+
+`/etc/config-saver/configs` is **not** archived by default, and members that would land there are
+**not** restored by default either:
+
+```sh
+config-saver --compress --include-system-configs      # archive them
+config-saver --decompress -i backup.tar.gz --restore-system-configs   # restore them
+```
+
+The reason is ownership. On a machine managed by a declarative installer (`dasik` writes that
+directory from its own JSON), a restore that overwrote `/etc` would leave the machine differing
+from what the installer declares, and the next `plan` would show changes after every restore —
+exactly what an idempotent installer must not do. If nothing else manages `/etc` on your machine,
+the two flags are there and they are explicit.
+
+Skipped members are reported, never silent:
+
+```console
+$ config-saver --decompress -i backup.tar.gz
+Skipped 3 system configuration file(s) under /etc/config-saver/configs. Pass
+--restore-system-configs to write them; leave it alone if a declarative installer owns that
+directory.
+```
+
+Two details worth knowing:
+
+- `--include-system-configs` as a normal user hits the root-owned skip: those files belong to
+  `root`, so they are reported as skipped unless you run `sudo config-saver --compress
+  --include-system-configs`.
+- Extraction into a directory (`--output`) is unaffected: nothing there can reach the real `/etc`,
+  so the members are extracted normally.
 
 ## Encryption (optional)
 

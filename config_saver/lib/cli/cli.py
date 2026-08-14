@@ -11,7 +11,6 @@ import argparse
 import os
 import re
 import shutil
-import sys
 from datetime import datetime
 
 from colorama import Fore, init
@@ -22,7 +21,7 @@ from rich.console import Console
 from rich.table import Table
 
 from config_saver import __version__
-from config_saver.lib import crypto
+from config_saver.lib import crypto, paths
 from config_saver.lib.backup_manager.backup_manager import BackupManager, BatchResult
 from config_saver.lib.errors import ArchiveError, EncryptionError, RootRequiredError, UnsafeArchiveError
 from config_saver.lib.models.encryption_model import EncryptionModel
@@ -118,20 +117,14 @@ class BackupTable:
         console.rule()
 
 
-def default_config_dir() -> str | None:
-    """Return the first configuration directory that exists, if any.
+def default_config_dirs() -> list[str]:
+    """The active configuration levels, least specific first.
 
-    The AUR package installs /etc/config-saver/configs; a pip install ships the
-    example configs under <prefix>/share/config-saver/configs.
+    System policy and the user's own configurations are merged (see
+    config_saver.lib.paths); the shipped examples are deliberately absent, so
+    installing a package never decides what a machine backs up.
     """
-    for candidate in (
-        CLI.DEFAULT_SYSTEM_CONFIG,
-        os.path.join(sys.prefix, "share", "config-saver", "configs"),
-        os.path.expanduser("~/.config/config-saver/configs.d"),
-    ):
-        if os.path.isdir(candidate):
-            return candidate
-    return None
+    return [d for d in (paths.SYSTEM_CONFIG_DIR, paths.user_config_dir()) if os.path.isdir(d)]
 
 
 class CLI:
@@ -234,6 +227,22 @@ class CLI:
             help="Key file used to decrypt an encrypted archive (required for age)",
         )
         parser.add_argument(
+            "--include-system-configs",
+            action="store_true",
+            help=(
+                f"Also archive {paths.SYSTEM_CONFIG_DIR} (compress). Off by default: that directory "
+                "usually belongs to a declarative installer, which rebuilds it itself"
+            ),
+        )
+        parser.add_argument(
+            "--restore-system-configs",
+            action="store_true",
+            help=(
+                f"Restore members that land in {paths.SYSTEM_CONFIG_DIR} (decompress). Off by "
+                "default, so a restore cannot make the machine diverge from its installer"
+            ),
+        )
+        parser.add_argument(
             "--strict",
             action="store_true",
             help=f"Exit with {EXIT_INCOMPLETE} when a configured path was missing from the backup",
@@ -263,21 +272,46 @@ class CLI:
         return EncryptionModel(method=args.encrypt_method or "age", recipients=list(args.encrypt_to))
 
     @staticmethod
-    def _collect_configs(manager: BackupManager, directories: list[str]) -> list[str]:
+    def _report_no_configurations() -> int:
+        """Explain what to do instead of backing up whatever happens to exist."""
+        print(Fore.RED + "No configurations found.")
+        print(Fore.YELLOW + f"  system policy : {paths.SYSTEM_CONFIG_DIR}")
+        print(Fore.YELLOW + f"  yours         : {paths.user_config_dir()}")
+        print(Fore.YELLOW + f"  examples      : {paths.example_config_dir()} (never used on their own)")
+        print(
+            Fore.YELLOW + "Copy an example to your own directory to get started:\n"
+            f"  mkdir -p {paths.user_config_dir()} && "
+            f"cp {paths.example_config_dir()}/zsh.yaml {paths.user_config_dir()}/"
+        )
+        return EXIT_USAGE
+
+    @staticmethod
+    def _collect_configs(
+        manager: BackupManager,
+        directories: list[str],
+        *,
+        allow_override: bool = False,
+    ) -> list[str]:
         """Every configuration across the given directories, in a stable order.
 
-        Two directories may not define the same configuration name: both would
-        write to <saves>/configs/<name>/<timestamp>/, and the second would
-        quietly overwrite the first.
+        With allow_override — the layered default, system policy then the user's
+        own — a later directory replaces an earlier configuration of the same
+        name: that is what makes ~/.config/.../zsh.yaml win over
+        /etc/.../zsh.json instead of both running.
+
+        Without it (directories named explicitly on the command line, where no
+        precedence is defined) a duplicate name is an error: both would write to
+        <saves>/configs/<name>/<timestamp>/ and the second would quietly
+        overwrite the first.
         """
         by_name: dict[str, str] = {}
         for directory in directories:
             found = manager.find_config_files(directory)
-            if not found:
+            if not found and not allow_override:
                 raise ValueError(f"No YAML/JSON configuration files found in {directory}.")
             for path in found:
                 name = os.path.splitext(os.path.basename(path))[0]
-                if name in by_name:
+                if name in by_name and not allow_override:
                     raise ValueError(
                         f"Two configurations are both named '{name}': {by_name[name]} and {path}. "
                         "Rename one, or they would overwrite each other's archive."
@@ -484,26 +518,24 @@ class CLI:
             print(Fore.RED + str(e))
             return EXIT_USAGE
 
+        extra_directories: tuple[str, ...] = ()
+        if args.include_system_configs:
+            extra_directories = (paths.SYSTEM_CONFIG_DIR,)
+
+        # With no --input the levels are resolved and merged; with --input the
+        # user said exactly what to process, so no precedence is invented.
         inputs = list(args.input or [])
-        if not inputs:
-            fallback = default_config_dir()
-            if fallback is None:
-                print(
-                    Fore.RED
-                    + f"No configuration directory found. Looked in {self.DEFAULT_SYSTEM_CONFIG} and "
-                    + os.path.join(sys.prefix, "share", "config-saver", "configs")
-                    + "."
-                )
-                print(Fore.YELLOW + "Pass --input <config.yaml|dir>, or install the 'config-saver' AUR package.")
-                return EXIT_USAGE
-            inputs = [fallback]
+        layered = not inputs
+        if layered:
+            inputs = default_config_dirs()
+            if not inputs:
+                return self._report_no_configurations()
 
         directories = [p for p in inputs if os.path.isdir(p)]
         if len(inputs) > 1 and len(directories) != len(inputs):
             print(Fore.RED + "Several --input paths are only supported when every one is a configuration directory.")
             return EXIT_USAGE
 
-        input_path = inputs[0]
         if directories:
             if args.output is not None:
                 print(
@@ -513,10 +545,13 @@ class CLI:
                 return EXIT_USAGE
 
             try:
-                cfg_files = self._collect_configs(manager, directories)
+                cfg_files = self._collect_configs(manager, directories, allow_override=layered)
             except ValueError as e:
                 print(Fore.RED + str(e))
                 return EXIT_USAGE
+
+            if not cfg_files:
+                return self._report_no_configurations()
 
             batch = manager.compress_config_files(
                 cfg_files,
@@ -525,6 +560,7 @@ class CLI:
                 description=args.description,
                 jobs=jobs,
                 encryption=encryption,
+                extra_directories=extra_directories,
             )
             self._report_batch(batch)
             if batch.failures:
@@ -533,6 +569,7 @@ class CLI:
                 return EXIT_INCOMPLETE
             return EXIT_OK
 
+        input_path = inputs[0]
         if args.jobs != "auto" and self._resolve_jobs(args.jobs) > 1:
             print(Fore.RED + "--jobs only applies when --input is a directory of configurations.")
             return EXIT_USAGE
@@ -554,11 +591,16 @@ class CLI:
                 description=args.description,
                 show_progress=args.progress,
                 encryption=encryption,
+                extra_directories=extra_directories,
             )
         else:
             out_path = args.output or os.path.join(saves_dir, f"config-saver-{timestamp}.tar.gz")
             result = manager.compress_config_file(
-                input_path, out_path, show_progress=args.progress, encryption=encryption
+                input_path,
+                out_path,
+                show_progress=args.progress,
+                encryption=encryption,
+                extra_directories=extra_directories,
             )
             # Encryption appends a suffix, so the archive is not at `out_path`.
             out_path = result.output_path
@@ -577,10 +619,22 @@ class CLI:
         if len(inputs) > 1:
             print(Fore.RED + "--decompress takes a single --input archive.")
             return EXIT_USAGE
-        decompressor = TarDecompressor(inputs[0], args.output, show_progress=args.progress, identity=args.identity)
+        decompressor = TarDecompressor(
+            inputs[0],
+            args.output,
+            show_progress=args.progress,
+            identity=args.identity,
+            restore_system_configs=args.restore_system_configs,
+        )
         result = decompressor.decompress()
         if result.decrypted_with:
             print(Fore.GREEN + f"Archive decrypted with {result.decrypted_with}.")
+        if result.skipped_system_configs:
+            print(
+                Fore.YELLOW + f"Skipped {result.skipped_system_configs} system configuration file(s) under "
+                f"{paths.SYSTEM_CONFIG_DIR}. Pass --restore-system-configs to write them; leave it "
+                "alone if a declarative installer owns that directory."
+            )
         if args.output:
             print(Fore.GREEN + f"Extraction completed successfully in '{args.output}' ({result.extracted} members).")
         else:

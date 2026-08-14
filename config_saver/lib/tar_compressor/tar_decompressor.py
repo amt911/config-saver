@@ -9,7 +9,7 @@ import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
-from config_saver.lib import crypto
+from config_saver.lib import crypto, paths
 from config_saver.lib.errors import ArchiveError, UnsafeArchiveError
 from config_saver.lib.tar_compressor.tar_compressor import (
     HOME_CONTENT_PLACEHOLDER,
@@ -33,6 +33,7 @@ class DecompressResult:
     extracted: int = 0
     normalized_content: bool = False
     decrypted_with: str | None = None
+    skipped_system_configs: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -50,12 +51,17 @@ class TarDecompressor:
         output_dir: str | None = None,
         show_progress: bool = False,
         identity: str | None = None,
+        restore_system_configs: bool = False,
     ):
         self.tar_path = tar_path
         self.output_dir = output_dir
         self.show_progress = show_progress
         # Key material for encrypted archives (age needs it; gpg uses its agent).
         self.identity = identity
+        # /etc/config-saver/configs is system policy, usually owned by a
+        # declarative installer: restoring over it would make the machine
+        # diverge from what that installer declares, so it is opt-in.
+        self.restore_system_configs = restore_system_configs
         # Get current user's home directory for path denormalization
         self.user_home = os.path.expanduser("~")
 
@@ -149,6 +155,16 @@ class TarDecompressor:
             raise UnsafeArchiveError(member.name, f"link target '{link_target}' escapes the extraction root")
 
     # -------------------------------------------------------------- contents
+
+    def _is_system_config(self, destination: str) -> bool:
+        """True for a member that would land in the system configuration tree.
+
+        Only in restore-in-place mode: with --output nothing can reach the real
+        /etc, so there is nothing to protect and the member is extracted.
+        """
+        if self.restore_system_configs or self.output_dir:
+            return False
+        return self._is_within(os.path.normpath(destination), paths.SYSTEM_CONFIG_DIR)
 
     def _is_text_file_content(self, content: bytes) -> bool:
         """Check if content is likely text (not binary).
@@ -297,6 +313,9 @@ class TarDecompressor:
 
                 for member in iterator:
                     destination = self._validate_member(member)
+                    if self._is_system_config(destination):
+                        result.skipped_system_configs += 1
+                        continue
                     emit(f"Extracting: {member.name} -> {destination}")
                     if member.isfile():
                         self._write_file(tar, member, destination, denormalize)
