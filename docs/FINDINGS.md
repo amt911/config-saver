@@ -3,6 +3,24 @@
 Non-obvious things that cost time and are not deducible from the code. Add an entry when you hit
 one; keep each entry short and dated.
 
+## 2026-08-19 — the pre-push pytest hook runs whatever `python` is on PATH
+
+The `pytest` hook in `.pre-commit-config.yaml` is `language: system` with
+`entry: python -m pytest -q`, so it resolves `python` from the PATH of the shell that runs
+`git push`. Pushing from a shell where `.venv` is not activated gets
+
+```text
+pytest (full suite)......................................................Failed
+/usr/bin/python: No module named pytest
+```
+
+which reads like a broken gate rather than a missing environment, and `--no-verify` is the wrong
+answer. Push from the shell where you installed `.[dev]`, or prefix the PATH:
+
+```sh
+PATH="$PWD/.venv/bin:$PATH" git push
+```
+
 ## 2026-08-11 — `os.makedirs(mode=…)` only applies to the leaf directory
 
 Since Python 3.7, the `mode` argument of `os.makedirs()` is ignored for the intermediate
