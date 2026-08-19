@@ -55,6 +55,10 @@ class Parser:
                     loc = out[section][item].get("location")
                     if loc:
                         out[section][item]["location"] = expander.expand(loc)
+        # Exclude patterns name paths too ($HOME/repos/*/build), so they go through
+        # the same expander; a bare pattern like 'node_modules' comes back unchanged.
+        if "exclude" in out:
+            out["exclude"] = [expander.expand(str(pattern)) for pattern in out["exclude"]]
         # Expand the entries of the 'directories' list when present.
         if "directories" in out:
             new_dirs: list[str | dict[str, Any]] = []

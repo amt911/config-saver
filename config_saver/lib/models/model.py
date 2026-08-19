@@ -14,6 +14,14 @@ class Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     directories: list[str | SpecificFilesModel]
+    exclude: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Patterns pruned from every archived tree. A pattern without a '/' matches the "
+            "name of any path component at any depth (node_modules, *.log); one with a '/' "
+            "is matched against the whole expanded path ($HOME/repos/*/build)."
+        ),
+    )
     normalize_content: bool = Field(
         default=False,
         description="Enable content normalization (replace home paths in text files)",

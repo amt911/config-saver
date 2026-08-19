@@ -1,0 +1,36 @@
+# Source code checkouts, minus everything a build can produce again.
+#
+# A projects directory is mostly not source: dependency trees, virtualenvs,
+# compiler output and editor indexes routinely outweigh the code by an order of
+# magnitude. `exclude` prunes them during the walk, so the run never descends
+# what it is not going to archive.
+#
+# Adjust the patterns to the languages you actually use, and remember that this
+# is a backup of the *working tree* — the history in .git is what a remote
+# already holds.
+
+normalize_content: false
+
+directories:
+    - "$HOME/repos"
+
+exclude:
+    # JavaScript / TypeScript
+    - node_modules
+    - .next
+    - .nuxt
+    # Python
+    - .venv
+    - venv
+    - __pycache__
+    - .mypy_cache
+    - .pytest_cache
+    - .ruff_cache
+    # Rust / Java / C
+    - target
+    - build
+    - dist
+    - .gradle
+    # Editors and tooling
+    - .cache
+    - "*.log"
