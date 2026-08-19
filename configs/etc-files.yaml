@@ -9,7 +9,12 @@ only_root_user: true
 normalize_content: true
 
 directories:
-    - "$ETC_CONFIG_DIR"
+    # /etc/config-saver/configs is deliberately absent. It is the system policy
+    # level, written by whoever administers the machine (a declarative installer
+    # on this one), and --include-system-configs is the flag that archives it.
+    # An example that lists it outright hands it back by the front door, and
+    # examples are what people copy.
+
     # System connections (NetworkManager) - outside user home
     - /etc/NetworkManager/system-connections
 
