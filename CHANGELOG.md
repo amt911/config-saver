@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-08-19
+
+### Added
+
+- **`exclude`: prune subtrees a backup must not carry.** A configuration that archives a whole
+  tree — a repositories directory, an editor profile — was forced to enumerate what it wanted, or
+  to carry the regenerable bulk (`node_modules`, downloaded SDKs, build output) that usually
+  outweighs the configuration itself. `exclude` names those patterns once. A pattern without a `/`
+  matches the name of any path component at any depth (`node_modules`, `*.log`); one with a `/` is
+  matched against the whole expanded path (`$HOME/repos/*/build`). Path variables expand as they do
+  in `directories`, and a trailing slash still names a component.
+- Excluded directories are **pruned during the walk**, so an excluded tree is never descended —
+  the reason the key exists at all on a 25 GB directory.
+- An excluded path is not a missing input: it stays out of `missing_inputs`, keeps the backup
+  `complete`, and does not fail `--strict`. It is still counted and reported
+  (`N path(s) excluded by pattern.`), because a backup must not skip anything in silence.
+- `configs/projects.yaml`, a shipped example that archives `$HOME/repos` with the usual
+  build-artifact patterns excluded.
+
 ## [3.3.1] - 2026-08-14
 
 ### Added

@@ -11,6 +11,7 @@ Python CLI tool for compressing and decompressing directories or files by using 
 - Optional progress bar for compression/decompression (`--progress`/`-P`).
 - Parallel compression of independent configurations (`--jobs`/`-j`).
 - Missing inputs are reported, never silently skipped (`--strict` turns them into a non-zero exit).
+- Prune regenerable subtrees with [`exclude`](#excluding-subtrees-optional) patterns, without descending them.
 - Three layered configuration levels ([examples, system policy, yours](#where-configurations-live)),
   merged with the most specific one winning.
 - Several configuration directories in one run, so your own configs can live in a
@@ -544,6 +545,46 @@ directories:
       files:
         - WSDL.pdf
         - WSDL-1.pdf
+```
+
+### Excluding subtrees (optional)
+
+A configuration that archives a whole tree — a repositories directory, an editor profile — carries
+mostly regenerable bulk: `node_modules`, downloaded SDKs, build output. `exclude` names those once
+instead of forcing the tree to be enumerated by hand:
+
+```yaml
+directories:
+    - "$HOME/repos"
+
+exclude:
+    - node_modules
+    - .venv
+    - target
+    - "*.log"
+    - "$HOME/repos/scratch"
+```
+
+Two shapes, decided by whether the pattern contains a `/`:
+
+| Pattern | Matched against | Example |
+| --- | --- | --- |
+| no `/` | the **name** of a path component, at any depth | `node_modules` prunes every `node_modules` in the tree; `*.log` skips every log file |
+| contains `/` | the **whole expanded path** | `$HOME/repos/scratch` excludes that one directory; `$HOME/repos/*/build` excludes one level of them |
+
+Both are `fnmatch` patterns (`*`, `?`, `[abc]`), matched case-sensitively. Path variables are
+expanded exactly as in `directories`. A trailing slash is stripped, so `node_modules/` still names a
+component rather than becoming a path pattern.
+
+Excluded directories are **pruned during the walk**, never descended — that is the point on a large
+tree, and it is why the run does not pay for what it is not archiving.
+
+An excluded path is **not** a missing input: it was never asked for, so it does not appear in the
+missing-path warning, does not make the backup incomplete, and does not fail `--strict`. It is still
+reported, because a backup must not skip anything in silence:
+
+```text
+3 path(s) excluded by pattern.
 ```
 
 ### Root-only configurations (optional)

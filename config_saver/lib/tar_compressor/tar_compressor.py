@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import io
 import json
 import os
@@ -49,6 +50,9 @@ class CompressResult:
 
     output_path: str
     added: int = 0
+    # Paths pruned by an ``exclude`` pattern. Not a failure: they were never asked
+    # for, so they stay out of ``missing_inputs`` and out of ``complete``.
+    excluded: int = 0
     skipped_root_owned: list[str] = field(default_factory=list)
     missing_inputs: list[str] = field(default_factory=list)
     encryption: crypto.EncryptionInfo | None = None
@@ -261,6 +265,25 @@ class TarCompressor:
         with stream:
             return stream.read()
 
+    def _is_excluded(self, path: str) -> bool:
+        """True when ``path`` matches an ``exclude`` pattern.
+
+        Two shapes, decided by whether the pattern contains a separator:
+
+        * ``node_modules``, ``*.log`` — matched against the *name* of the path,
+          so they hit at any depth.
+        * ``/home/me/repos/*/build`` — matched against the whole path.
+
+        A trailing slash is how directories are usually written; it is stripped
+        so ``node_modules/`` keeps meaning the name, not a path.
+        """
+        for raw in self.yaml_data.exclude:
+            pattern = raw.rstrip("/") or raw
+            target = path if "/" in pattern else os.path.basename(path)
+            if fnmatch.fnmatchcase(target, pattern):
+                return True
+        return False
+
     def _iter_entries(self, result: CompressResult) -> Iterator[tuple[str, bool]]:
         """Yield (path, is_dir) for every configured input, deterministically.
 
@@ -275,13 +298,29 @@ class TarCompressor:
             for dirpath, dirnames, filenames in os.walk(root):
                 dirnames.sort()
                 filenames.sort()
+                kept: list[str] = []
                 for d in dirnames:
-                    yield os.path.join(dirpath, d), True
+                    path = os.path.join(dirpath, d)
+                    if self._is_excluded(path):
+                        result.excluded += 1
+                        continue
+                    # Pruning happens here, not after the walk: os.walk reads what
+                    # stays in dirnames, so an excluded tree is never descended.
+                    kept.append(d)
+                    yield path, True
+                dirnames[:] = kept
                 for f in filenames:
-                    yield os.path.join(dirpath, f), False
+                    path = os.path.join(dirpath, f)
+                    if self._is_excluded(path):
+                        result.excluded += 1
+                        continue
+                    yield path, False
 
         for entry in self.yaml_data.directories:
             if isinstance(entry, str):
+                if self._is_excluded(entry):
+                    result.excluded += 1
+                    continue
                 if "${" in entry or not os.path.lexists(entry):
                     result.missing_inputs.append(entry)
                     continue
@@ -292,11 +331,17 @@ class TarCompressor:
                 continue
 
             source = entry.source
+            if self._is_excluded(source):
+                result.excluded += 1
+                continue
             if "${" in source or not os.path.isdir(source):
                 result.missing_inputs.append(source)
                 continue
             for file in entry.files:
                 file_path = os.path.join(source, file)
+                if self._is_excluded(file_path):
+                    result.excluded += 1
+                    continue
                 if not os.path.lexists(file_path):
                     result.missing_inputs.append(file_path)
                     continue

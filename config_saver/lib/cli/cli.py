@@ -338,6 +338,10 @@ class CLI:
         if result.encryption is not None:
             recipients = ", ".join(result.encryption.recipients)
             print(Fore.GREEN + f"{prefix}Encrypted with {result.encryption.method} for: {recipients}")
+        if result.excluded:
+            # Not a warning: excluded is what the configuration asked for. Still
+            # printed, because a backup must never skip anything in silence.
+            print(Fore.CYAN + f"{prefix}{result.excluded} path(s) excluded by pattern.")
         if result.missing_inputs:
             print(Fore.YELLOW + f"{prefix}⚠ {len(result.missing_inputs)} configured path(s) were missing:")
             for path in result.missing_inputs[:10]:
