@@ -46,3 +46,15 @@ repos:
         language: system
         pass_filenames: false
         stages: [pre-push]
+
+      # La mutación va DESPUÉS de pytest y la última de todo: es el paso más lento,
+      # y no tiene sentido mutar sobre una suite roja. Pregunta lo que la cobertura
+      # no puede — no "¿se ejecutó esta línea?" sino "¿se habría enterado algún test
+      # de que estaba mal?". Un test sin asserts da 100% de cobertura y 0% aquí.
+      # Umbral y scope: scripts/mutation-gate.sh (CLAUDE.md § Tests and quality).
+      - id: mutation-gate
+        name: gate de mutación (lógica pura, 60%)
+        entry: scripts/mutation-gate.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

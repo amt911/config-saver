@@ -144,6 +144,13 @@ mode), CLI exit codes, the systemd units and the packaging metadata. `mypy` runs
   `~/.config/config-saver`. A test that writes outside its `tmp_path` is a bug in the test.
 - **Coverage gate: 80%** (statements/branches), critical logic ≥90%. Don't lower it to ship —
   exclude a module in config with a written reason instead.
+- **Mutation gate: 93%** sobre la lógica pura (`scripts/mutation-gate.sh`), bloqueante en `pre-push`
+  y **advisory** en CI hasta verlo pasar dos veces. El 93 no es un deseo: es el score **medido** en
+  CI el 2026-09-03 — **243 mutantes muertos / 18 vivos = 93,1%** — redondeado hacia abajo, sobre el
+  suelo de 60 que fija la plantilla. La cobertura no puede ver un test sin asserts; esto
+  sí. Es un **trinquete**: el umbral sube con el score real y no baja nunca para dejar pasar un push.
+  Si la corrida se hace pesada, se estrecha el **scope** (`SCOPE` en el script), nunca el umbral.
+  Detalle de cómo leer un superviviente: `docs/TESTING.md` § 3.
 
 ### The invariant that matters most
 
@@ -203,10 +210,18 @@ both encode the same mistake and the test passes happily. These gates attack tha
   well suited to it: `decompress(compress(tree)) == tree` is a textbook round-trip property, and
   `PathExpander.expand` is a pure function over strings. Let it generate the filenames, encodings and
   nesting nobody thinks of by hand.
-- **Mutation testing** — **mutmut** or **cosmic-ray**, scoped to the pure logic (path normalization,
-  the expander, the filename/timestamp parsing), not to the I/O shells. A surviving mutant means the
-  code is *covered but not verified*. Run it **inside the memory cgroup** — see the section above for
-  what happens otherwise.
+- **Mutation testing** — **mutmut**, scoped to the pure logic (path normalization, the expander,
+  member validation), not to the I/O shells. A surviving mutant means the code is *covered but not
+  verified*. **Now a gate, not advice:** `scripts/mutation-gate.sh` runs the scoped set inside the
+  memory cgroup and fails under **60%** (killed / killed+survived — timeouts deliberately do NOT
+  count as kills: a starved run once scored 139 of 142 mutants "killed" purely by timing out, which
+  reads as a triumph and means nothing). Blocking in `pre-push`, advisory in CI until the baseline
+  is measured. **De dónde sale el veredicto, y por qué no de `mutmut results`:** en esta versión
+  `mutmut results` lista **solo los supervivientes**, así que leerlo como si fuera el recuento
+  completo da "0 muertos / 18 vivos = 0%" sobre una corrida que mató 243. El recuento bueno es el
+  marcador que `mutmut run` imprime al terminar (`261/2533 🎉 243 … 🙁 18`), que es lo que parsea el
+  script — y si no encuentra marcador, **falla**: una puerta que no puntúa nada no está limpia,
+  está rota.
 - **Runtime boundary validation** — **Pydantic** is already used for the YAML models; keep every new
   config shape a model. The other boundary is the **archive**, and it is currently unvalidated: every
   member name coming out of a tar is untrusted input and must be checked before use.
@@ -296,9 +311,10 @@ What "real environment" means here, concretely:
 
 **Policy — heavy checks run locally on push, CI stays lean.**
 
-- **Pre-push** runs the full local gate via `pre-commit` (`pytest`), on top of the per-commit
-  `ruff check`, `ruff format` and `mypy`. Emergency bypass only via `--no-verify`, and then you own
-  the breakage.
+- **Pre-push** runs the full local gate via `pre-commit` (`pytest`, then the **mutation gate at
+  60%** — el paso más lento va el último, y no se muta sobre una suite roja), on top of the
+  per-commit `ruff check`, `ruff format` and `mypy`. Emergency bypass only via `--no-verify`, and
+  then you own the breakage.
 - **GitHub Actions** (`.github/workflows/ci.yml`) — only the cheap, important checks:
   - `lint` → `ruff check` + `ruff format --check`.
   - `test` → `mypy` + `pytest --cov --cov-fail-under=80` on a Python 3.10–3.13 matrix.
@@ -306,6 +322,9 @@ What "real environment" means here, concretely:
   - `systemd` → `systemd-analyze verify` on the shipped units.
   - `release-consistency` → on a `v*` tag, the tag must equal `project.version`.
   - `sast` → **Semgrep** `p/python`, currently blocking (`--error`). Keep it that way.
+  - `mutation` → `scripts/mutation-gate.sh` (93% sobre la lógica pura, medido), **solo en PRs** y con
+    `continue-on-error: true` mientras no haya baseline medido. Se promueve a bloqueante cuando el
+    score supere el umbral en dos runs seguidos; anota aquí la fecha, o "advisory" será permanente.
   - `audit` → **`pip-audit`**, currently `continue-on-error: true`. Promote it to a blocking gate
     once the findings are triaged, and fix a failure by bumping the dependency, never by relaxing the
     threshold.

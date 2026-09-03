@@ -45,6 +45,33 @@ jobs:
       # The gate is the behavioural suite; ratchet --cov-fail-under as coverage grows.
       - run: pytest --cov=config_saver --cov-report=term-missing --cov-fail-under=90
 
+  # Puerta de mutación — CLAUDE.md § "Mutation gate — el suelo del 60%". La cobertura
+  # ya está gateada al 90% arriba, y aun así no puede ver un test sin asserts: esto sí.
+  #
+  # Solo en PRs contra main: mutmut reejecuta la suite una vez por mutante y es caro de
+  # más para cada push de rama. Pagar eso en cada push es como se consigue que la gente
+  # empuje con --no-verify.
+  #
+  # Nace ADVISORY (`continue-on-error`) porque el baseline real de este repo aún no se ha
+  # medido. Se le quita cuando el score haya superado el umbral en dos runs seguidos, y se
+  # anota aquí la fecha: si no, "advisory" es para siempre.
+  mutation:
+    name: Mutación (lógica pura, umbral 93%)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install '.[dev]'
+      - name: Gate de mutación
+        run: scripts/mutation-gate.sh
+      - name: Resultados (también cuando falla — el porcentaje solo no es accionable)
+        if: always()
+        run: mutmut results || true
+
   packaging:
     name: Build · install smoke
     runs-on: ubuntu-latest
