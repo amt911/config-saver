@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-THRESHOLD="${MUTATION_THRESHOLD:-60}"
+THRESHOLD="${MUTATION_THRESHOLD:-93}"   # medido 2026-09-03 en CI: 243 muertos / 18 vivos = 93.1%
 
 # El scope son los módulos PUROS (docs/TESTING.md § 3). Mutar las cáscaras de I/O
 # produce sobre todo timeouts, y un timeout se apunta como "killed": el número
@@ -47,19 +47,39 @@ fi
 # El veredicto se calcula sobre killed vs survived y NO cuenta los timeouts como
 # muertos, justo por lo de arriba: si la corrida se ahoga, el gate tiene que
 # notarse ahogado, no aprobar con matrícula.
+# El veredicto se calcula sobre killed vs survived y NO cuenta los timeouts como
+# muertos, justo por lo de arriba: si la corrida se ahoga, el gate tiene que
+# notarse ahogado, no aprobar con matrícula.
+#
+# mutmut 3.x lista cada mutante con un EMOJI, no con `nombre: estado`:
+#   🎉 killed   🙁 survived   🫥 no tests   ⏰ timeout   🤔 suspicious   🔇 skipped
+# Parsear "nombre: estado" (el formato de mutmut 2.x) no encuentra NADA aquí, que
+# es como la primera versión de este script puntuó 0/0 sobre una corrida de 261
+# mutantes. Se aceptan las dos formas para que un cambio de versión no vuelva a
+# hacer que la puerta puntúe el vacío.
 mutmut results | THRESHOLD="$THRESHOLD" python3 -c '
 import re, sys, os
+EMOJI = {"\U0001F389": "killed", "\U0001F641": "survived", "\U0001FAE5": "no tests",
+         "\u23F0": "timeout", "\U0001F914": "suspicious", "\U0001F507": "skipped"}
 statuses = {}
 for line in sys.stdin:
-    m = re.search(r":\s*(killed|survived|timeout|suspicious|skipped|no tests)\b", line.strip())
-    if m:
-        statuses[m.group(1)] = statuses.get(m.group(1), 0) + 1
+    line = line.strip()
+    if not line:
+        continue
+    key = EMOJI.get(line[0])
+    if key is None:
+        m = re.search(r":\s*(killed|survived|timeout|suspicious|skipped|no tests)\b", line)
+        key = m.group(1) if m else None
+    if key:
+        statuses[key] = statuses.get(key, 0) + 1
 killed, survived = statuses.get("killed", 0), statuses.get("survived", 0)
 graded = killed + survived
 thr = float(os.environ["THRESHOLD"])
 print("   " + (", ".join(f"{k}={v}" for k, v in sorted(statuses.items())) or "(sin mutantes)"))
 if graded == 0:
-    print("!! mutmut no puntuó ni un mutante: la corrida está rota, no limpia.", file=sys.stderr)
+    print("!! mutmut no puntuó ni un mutante: la corrida está rota, o esta versión de", file=sys.stderr)
+    print("   mutmut imprime los resultados en un formato que este script no entiende.", file=sys.stderr)
+    print("   Compruébalo a mano con `mutmut results` antes de tocar los tests.", file=sys.stderr)
     sys.exit(1)
 score = 100.0 * killed / graded
 print(f"   score = {killed}/{graded} = {score:.1f}%  (umbral {thr:.0f}%)")

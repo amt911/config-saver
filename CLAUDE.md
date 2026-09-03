@@ -144,8 +144,10 @@ mode), CLI exit codes, the systemd units and the packaging metadata. `mypy` runs
   `~/.config/config-saver`. A test that writes outside its `tmp_path` is a bug in the test.
 - **Coverage gate: 80%** (statements/branches), critical logic ≥90%. Don't lower it to ship —
   exclude a module in config with a written reason instead.
-- **Mutation gate: 60%** sobre la lógica pura (`scripts/mutation-gate.sh`), bloqueante en `pre-push`
-  y **advisory** en CI hasta medir el baseline. La cobertura no puede ver un test sin asserts; esto
+- **Mutation gate: 93%** sobre la lógica pura (`scripts/mutation-gate.sh`), bloqueante en `pre-push`
+  y **advisory** en CI hasta verlo pasar dos veces. El 93 no es un deseo: es el score **medido** en
+  CI el 2026-09-03 — **243 mutantes muertos / 18 vivos = 93,1%** — redondeado hacia abajo, sobre el
+  suelo de 60 que fija la plantilla. La cobertura no puede ver un test sin asserts; esto
   sí. Es un **trinquete**: el umbral sube con el score real y no baja nunca para dejar pasar un push.
   Si la corrida se hace pesada, se estrecha el **scope** (`SCOPE` en el script), nunca el umbral.
   Detalle de cómo leer un superviviente: `docs/TESTING.md` § 3.
@@ -214,7 +216,10 @@ both encode the same mistake and the test passes happily. These gates attack tha
   memory cgroup and fails under **60%** (killed / killed+survived — timeouts deliberately do NOT
   count as kills: a starved run once scored 139 of 142 mutants "killed" purely by timing out, which
   reads as a triumph and means nothing). Blocking in `pre-push`, advisory in CI until the baseline
-  is measured.
+  is measured. **Ojo con el formato de `mutmut results`:** la 3.x lista cada mutante con un emoji
+  (🎉 killed, 🙁 survived), no como `nombre: estado`. Un veredicto que busca el texto `survived`
+  no encuentra nada y la puerta aprueba el vacío — pasó aquí en el primer intento, con 261 mutantes
+  puntuados como 0/0. El script acepta las dos formas y **falla si no puntúa ni un mutante**.
 - **Runtime boundary validation** — **Pydantic** is already used for the YAML models; keep every new
   config shape a model. The other boundary is the **archive**, and it is currently unvalidated: every
   member name coming out of a tar is untrusted input and must be checked before use.
@@ -315,7 +320,7 @@ What "real environment" means here, concretely:
   - `systemd` → `systemd-analyze verify` on the shipped units.
   - `release-consistency` → on a `v*` tag, the tag must equal `project.version`.
   - `sast` → **Semgrep** `p/python`, currently blocking (`--error`). Keep it that way.
-  - `mutation` → `scripts/mutation-gate.sh` (60% sobre la lógica pura), **solo en PRs** y con
+  - `mutation` → `scripts/mutation-gate.sh` (93% sobre la lógica pura, medido), **solo en PRs** y con
     `continue-on-error: true` mientras no haya baseline medido. Se promueve a bloqueante cuando el
     score supere el umbral en dos runs seguidos; anota aquí la fecha, o "advisory" será permanente.
   - `audit` → **`pip-audit`**, currently `continue-on-error: true`. Promote it to a blocking gate
