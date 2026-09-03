@@ -56,7 +56,7 @@ jobs:
   # medido. Se le quita cuando el score haya superado el umbral en dos runs seguidos, y se
   # anota aquí la fecha: si no, "advisory" es para siempre.
   mutation:
-    name: Mutación (lógica pura, umbral 60%)
+    name: Mutación (lógica pura, umbral 93%)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     continue-on-error: true

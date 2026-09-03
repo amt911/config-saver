@@ -38,48 +38,52 @@ fi
 command -v mutmut >/dev/null 2>&1 || {
   echo "error: mutmut no está instalado — pip install -e '.[dev]'" >&2; exit 127; }
 
-if [ "${1:-}" != "--report" ]; then
-  echo ">> mutación sobre la lógica pura (umbral ${THRESHOLD}%)…"
-  rm -rf mutants .mutmut-cache
-  "${RUN[@]}" mutmut run --max-children 4 "${SCOPE[@]}" || true   # mutmut sale 0 con supervivientes; el veredicto lo da `results`
+LOG="$(mktemp "${TMPDIR:-/tmp}/config-saver-mutation.XXXXXX.log")"
+trap 'rm -f "$LOG"' EXIT
+
+if [ "${1:-}" = "--report" ]; then
+  mutmut results
+  exit 0
 fi
 
+echo ">> mutación sobre la lógica pura (umbral ${THRESHOLD}%)…"
+rm -rf mutants .mutmut-cache
+# `mutmut run` sale 0 aunque sobrevivan mutantes: el veredicto NO puede ser su
+# código de salida. Y tampoco puede venir de `mutmut results`, que en esta versión
+# lista SOLO los supervivientes — leerlo como si fuera el recuento completo da
+# "0 muertos / 18 vivos = 0%" sobre una corrida que mató 243. El recuento bueno es
+# el marcador que `mutmut run` imprime al terminar:
+#     261/2533  🎉 243 🫥 0  ⏰ 0  🤔 0  🙁 18  🔇 0  🧙 0
+"${RUN[@]}" mutmut run --max-children 4 "${SCOPE[@]}" 2>&1 | tee "$LOG" | tail -3 || true
+
 # El veredicto se calcula sobre killed vs survived y NO cuenta los timeouts como
-# muertos, justo por lo de arriba: si la corrida se ahoga, el gate tiene que
-# notarse ahogado, no aprobar con matrícula.
-# El veredicto se calcula sobre killed vs survived y NO cuenta los timeouts como
-# muertos, justo por lo de arriba: si la corrida se ahoga, el gate tiene que
-# notarse ahogado, no aprobar con matrícula.
-#
-# mutmut 3.x lista cada mutante con un EMOJI, no con `nombre: estado`:
-#   🎉 killed   🙁 survived   🫥 no tests   ⏰ timeout   🤔 suspicious   🔇 skipped
-# Parsear "nombre: estado" (el formato de mutmut 2.x) no encuentra NADA aquí, que
-# es como la primera versión de este script puntuó 0/0 sobre una corrida de 261
-# mutantes. Se aceptan las dos formas para que un cambio de versión no vuelva a
-# hacer que la puerta puntúe el vacío.
-mutmut results | THRESHOLD="$THRESHOLD" python3 -c '
+# muertos: si la corrida se ahoga, el gate tiene que notarse ahogado, no aprobar
+# con matrícula. (Aquí ya pasó una vez: una corrida hambrienta puntuó 139 de 142
+# mutantes como "killed" porque expiraron.)
+THRESHOLD="$THRESHOLD" python3 - "$LOG" <<'PYEOF'
 import re, sys, os
-EMOJI = {"\U0001F389": "killed", "\U0001F641": "survived", "\U0001FAE5": "no tests",
-         "\u23F0": "timeout", "\U0001F914": "suspicious", "\U0001F507": "skipped"}
-statuses = {}
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    key = EMOJI.get(line[0])
-    if key is None:
-        m = re.search(r":\s*(killed|survived|timeout|suspicious|skipped|no tests)\b", line)
-        key = m.group(1) if m else None
-    if key:
-        statuses[key] = statuses.get(key, 0) + 1
-killed, survived = statuses.get("killed", 0), statuses.get("survived", 0)
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+# Última línea de marcador que imprime `mutmut run`. Se lee por PAREJAS emoji-número,
+# no por posición, para que añadir un estado nuevo no descoloque el recuento.
+EMOJI = {"🎉": "killed", "🫥": "no tests", "⏰": "timeout",
+         "🤔": "suspicious", "🙁": "survived", "🔇": "skipped",
+         "🧙": "skipped (mutmut)"}
+tallies = [l for l in text.splitlines() if "🎉" in l and re.search(r"\d+/\d+", l)]
+if not tallies:
+    print("!! mutmut no imprimió ningún marcador de resultados: la corrida está rota,", file=sys.stderr)
+    print("   o esta versión imprime en un formato que este script no entiende.", file=sys.stderr)
+    print("   Compruébalo a mano con `mutmut run` antes de tocar los tests.", file=sys.stderr)
+    sys.exit(1)
+counts = {}
+for emoji, num in re.findall(r"([🎉🫥⏰🤔🙁🔇🧙])\s*(\d+)", tallies[-1]):
+    counts[EMOJI[emoji]] = int(num)
+killed, survived = counts.get("killed", 0), counts.get("survived", 0)
 graded = killed + survived
 thr = float(os.environ["THRESHOLD"])
-print("   " + (", ".join(f"{k}={v}" for k, v in sorted(statuses.items())) or "(sin mutantes)"))
+print("   " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()) if v))
 if graded == 0:
-    print("!! mutmut no puntuó ni un mutante: la corrida está rota, o esta versión de", file=sys.stderr)
-    print("   mutmut imprime los resultados en un formato que este script no entiende.", file=sys.stderr)
-    print("   Compruébalo a mano con `mutmut results` antes de tocar los tests.", file=sys.stderr)
+    print("!! ni un mutante puntuado: corrida rota, no limpia.", file=sys.stderr)
     sys.exit(1)
 score = 100.0 * killed / graded
 print(f"   score = {killed}/{graded} = {score:.1f}%  (umbral {thr:.0f}%)")
@@ -93,4 +97,4 @@ if score < thr:
    con la misma expresión que el código, que se mueve con la mutación y le da la razón.
    NO bajes el umbral para pasar: es exactamente lo que esta puerta impide.""", file=sys.stderr)
     sys.exit(1)
-'
+PYEOF

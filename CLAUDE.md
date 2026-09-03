@@ -216,10 +216,12 @@ both encode the same mistake and the test passes happily. These gates attack tha
   memory cgroup and fails under **60%** (killed / killed+survived — timeouts deliberately do NOT
   count as kills: a starved run once scored 139 of 142 mutants "killed" purely by timing out, which
   reads as a triumph and means nothing). Blocking in `pre-push`, advisory in CI until the baseline
-  is measured. **Ojo con el formato de `mutmut results`:** la 3.x lista cada mutante con un emoji
-  (🎉 killed, 🙁 survived), no como `nombre: estado`. Un veredicto que busca el texto `survived`
-  no encuentra nada y la puerta aprueba el vacío — pasó aquí en el primer intento, con 261 mutantes
-  puntuados como 0/0. El script acepta las dos formas y **falla si no puntúa ni un mutante**.
+  is measured. **De dónde sale el veredicto, y por qué no de `mutmut results`:** en esta versión
+  `mutmut results` lista **solo los supervivientes**, así que leerlo como si fuera el recuento
+  completo da "0 muertos / 18 vivos = 0%" sobre una corrida que mató 243. El recuento bueno es el
+  marcador que `mutmut run` imprime al terminar (`261/2533 🎉 243 … 🙁 18`), que es lo que parsea el
+  script — y si no encuentra marcador, **falla**: una puerta que no puntúa nada no está limpia,
+  está rota.
 - **Runtime boundary validation** — **Pydantic** is already used for the YAML models; keep every new
   config shape a model. The other boundary is the **archive**, and it is currently unvalidated: every
   member name coming out of a tar is untrusted input and must be checked before use.
