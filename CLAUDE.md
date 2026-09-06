@@ -346,6 +346,13 @@ What "real environment" means here, concretely:
 - **TDD for new logic. Don't merge logic without tests**, and don't lower the coverage gate —
   exclude with a written justification instead.
 - **Config is validated with Pydantic** — add new config shapes as models; don't parse ad-hoc.
+- **Reuse before you write** — search `config_saver/lib/` before adding a helper, model or exception
+  (`rg -n "^(def|class) " config_saver/`). Every concern already owns a package (`cli/`, `models/`,
+  `parser/`, `tar_compressor/`, `backup_manager/`, `errors.py`): a new path-validation or archive
+  helper extends the one that exists instead of growing a private copy beside its caller, and tests
+  reuse the fixtures in `tests/` rather than rebuilding a tree each time. At the third copy, extract
+  into the owning package in the same PR, migrating the call sites. A second implementation of the
+  extraction guard is a security bug waiting for the fix to land in only one of them.
 - **Keep `--progress` optional** — the tool must run headless (systemd timer) without a TTY.
 - **Type-clean** — `mypy` must pass; the dev extra installs the stubs.
 - **Round-trip integrity** — compress → decompress must reproduce the original tree exactly.
