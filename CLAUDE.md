@@ -56,7 +56,7 @@ User instructions always take precedence over skills; skills override default be
 - **"lite mode"** — fully disables superpowers: no skill is invoked, not even the applicability
   check, until **"normal mode"** is said.
 - **"normal mode"** (default) — standard superpowers behavior, plus: when delegating coding work,
-  dispatch at most 1 agent at a time, and never use a model above Sonnet (no Opus).
+  dispatch at most 1 **implementation** agent at a time (a read-only review agent runs alongside it — see **Agent orchestration**), and never use a model above Sonnet (no Opus).
 - **"modo desatendido"** (unattended mode) — the user is away and delegates autonomy: work
   without waiting for confirmations and decide yourself instead of asking. You MAY **`git push`
   the feature branches you create** and **open PRs via `gh`**. The hard limits still hold:
@@ -331,6 +331,113 @@ What "real environment" means here, concretely:
 - **Git hooks:** `.pre-commit-config.yaml`; install with
   `pre-commit install --hook-type pre-commit --hook-type pre-push`.
 
+## Debugging — keep the loop from running away
+
+What a bug costs is not the fix. It is how many times you go around
+`build → deploy → reach the state → observe` before you know what to fix, times what one lap costs.
+Every rule below carries the number it came from; the ones this repo has not measured are marked
+`<!-- pendiente de medir -->` until someone does.
+
+- **Measure before you ablate.** Ablation costs one lap per hypothesis and answers yes/no;
+  instrumentation costs one lap total and answers *what is actually happening*. **Measured: 28
+  ablations over 1 h 42 min moved nothing; one 13-min batch of probes changed the question and the
+  bug fell on the next round.** The rule that came out of it: **if a pipeline completes every phase
+  with non-empty output, the output exists** — stop asking "why doesn't it appear" and ask "where
+  does it appear". Here that pipeline is `load/parse → validation → transform → write the result`.
+- **Budget the lap, then attack the dominant term.** Time the four phases once and write the real
+  seconds in; one dominates and the rest are noise. **If a bug needs more than three reproductions,
+  write the shortcut before the fourth** — here that means
+  a fixture that lands the tree/state already built, a VM snapshot, or a dev subcommand that skips
+  the earlier steps.
+  Commit it as `<scripts/repro-<bug>.sh>` and name it in `docs/FINDINGS.md`.
+
+  | Lap phase | Command here | Measured |
+  | --- | --- | --- |
+  | build / install | `<pip install -e . · none>` | `<n s>` |
+  | deploy | `<copy to the VM · none>` | `<n s>` |
+  | reach the state | `<sample config · VM at the starting state>` | `<n s>` |
+  | observe | `<stdout · resulting files · journalctl>` | `<n s>` |
+
+- **A review finding is not a reproduction.** Whoever reviewed read the code; they did not run it.
+  Reproduce it yourself before sending anyone to fix it, and **if the implementer says they cannot
+  reproduce it, believe the implementer** — one of them has the thing running. **Measured: 1 h 25 min
+  chasing a bug that did not exist.**
+- **A test that refuses to go red is data, not a failure.** The fourth failed attempt to pin down
+  that non-existent bug is what uncovered the real one, pointing the opposite way. "I cannot make
+  this fail" is a result and it gets reported; a green test papered over it throws the signal away.
+- **Before demanding a red, ask whether the mechanism can produce one.** If another layer masks the
+  effect there will be no red however hard you push, and the time goes into the test instead of the
+  bug. **Measured: over 1 h on two structurally impossible reds.**
+- **Assertions that are inert by construction** — none of these shows up as a failure, a warning or
+  a coverage drop. **Every assertion is watched failing once**, and expected values are written by
+  hand:
+
+  | Inert by | What it looks like here |
+  | --- | --- |
+  | `assert` under `-O` | `python -O` / `PYTHONOPTIMIZE` strips them from the bytecode: the test passes checking nothing |
+  | an unawaited coroutine | leaves a `RuntimeWarning: coroutine was never awaited` and the test stays green |
+  | snapshots with `--snapshot-update` | `syrupy` / `pytest-snapshot` record the current output as the reference |
+  | `MagicMock` | returns another `MagicMock` for any attribute: everything is truthy and everything looks called |
+  | expectation computed alike | the expected value is recomputed with the same function under test |
+
+- **Verify the resource limit reaches the process doing the work.** A job wrapped in a memory scope
+  can hand the work to a daemon or worker pool living outside it, and the tool still reports the
+  limit as applied — over a process that is idle. Check the **worker's** cgroup
+  (`cat /proc/<worker-pid>/cgroup`), not the scope's.
+- **Environment claims get measured or they don't get made.** "That heap sounds low" produced a
+  recommendation that was simply wrong; measuring it — three runs per setting, not one — gave a
+  **0.4% difference, below the run-to-run variance**. No performance tuning lands without a
+  before/after over more than one run.
+- **Locate which layer owns a rule before deciding which side gives.** A rule that lives in one
+  layer and isn't shared by the others fails where the assumption breaks, not where it is written,
+  which is why the fix keeps landing in the innocent layer.
+- **Replacing a component can remove capabilities in silence.** When you swap one API for another,
+  enumerate what the old one did that the new one does not, and say it in the PR — nothing will fail
+  to compile. An optional parameter that defaults to off is a capability that only exists if the
+  caller remembers it.
+
+## Agent orchestration — parallel where it's free, batched where it's yours
+
+Delegating to agents moves the bottleneck to **scheduling**: what waits on what, what each agent
+re-derives, and which decisions quietly stop being yours. Same convention — every rule carries its
+measured number.
+
+- **Review is not on the critical path.** Reviewing task N and starting N+1 are independent when
+  they touch different files. Serialized, review is **10-15% of the wall clock** and blocks
+  everything behind it; in parallel it is free. **On receiving an implementation report, dispatch
+  its review and the next implementation in the same turn.** This is the one exception to
+  *"at most 1 agent at a time"*: the cap counts **implementation** agents — a review agent reads and
+  reports, it writes nothing, so it cannot race the implementer. **The exclusive resource here is:**
+  the VM or target directory, and any real database or block device
+  — at most one agent touching it.
+- **Keep one shared facts file.** Every fresh agent re-derives the same things: the real selector,
+  which fake exists, what that helper accepts. Keep `docs/FACTS.md`, have each agent append to it
+  when it finishes, and hand it to the next one in its dispatch. Only **facts verified against the
+  repo or the running system**, with how they were verified. It is not the gotchas log: that holds
+  what is *not* deducible from the code and outlives the branch; this holds what is perfectly
+  deducible and merely expensive to look up, and it may die with the branch.
+- **Plans carry contracts, not literal code.** The agent **trusts** the code in the plan; code you
+  never compiled is an error wearing authority. **Measured: 4 wrong blocks, 15-40 min of detour
+  each.** Write exact names, exact signatures and "mirror the shape of `<X>`" — claims the agent can
+  check against the repo — and reserve literal code for what you have run.
+- **Batch the discretionary decisions.** Work that appears along the way — a capability being
+  dropped, a missing script, an adjacent bug — added **5-6 h of 15**. Each was justified; deciding
+  them on the fly is what takes them away from you. Accumulate and ask **once per batch, with the
+  estimated cost**. In **"modo desatendido"** the batch goes in the PR body instead, with its costs.
+- **What never gets cut.** Review was **1.5 h of 15** and found a `create()` silently discarding
+  fields, a 404 caused by SQL deduplication, a silent merge that corrupted data, a
+  delete-and-recreate with no transaction, and several inert assertions. **Cutting review does not
+  give time back; it defers it to production.** Cut reproduction (write the shortcut) and
+  serialization (dispatch review in parallel) instead.
+
+### Day one — the numbers that fill the blanks
+
+1. **The lap** — time `build → deploy → reach the state → observe` once and write the seconds into
+   the table above. The dominant phase gets the shortcut script; the rest stay unoptimized.
+2. **The exclusive resource** — confirm the one named above is really the only one.
+3. **The inert assertions** — break one assertion on purpose and run the suite; anything still green
+   is inert. Then prune the table above to what this stack can actually produce.
+
 ## Working rules
 
 - **Use superpowers skills whenever they apply** — invoke via `Skill` before acting; process skills
@@ -357,6 +464,7 @@ What "real environment" means here, concretely:
 - **Type-clean** — `mypy` must pass; the dev extra installs the stubs.
 - **Round-trip integrity** — compress → decompress must reproduce the original tree exactly.
 - **AUR packaging lives in `config-saver-aur`** — bump it when releasing.
+- **Instrument before you ablate, budget the lap, and dispatch review in parallel** — a pipeline that completes with non-empty output produced output; more than three reproductions means you owe a shortcut script; a review finding is not a reproduction; and the review of task N runs alongside the implementation of N+1. See **Debugging** and **Agent orchestration** above.
 
 ## Agentic PR verification (MANDATORY on every PR)
 
