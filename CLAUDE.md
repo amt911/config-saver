@@ -442,6 +442,10 @@ measured number.
 
 - **Use superpowers skills whenever they apply** — invoke via `Skill` before acting; process skills
   before implementation skills.
+- **New dependencies: ask first, then install** — adding a package is allowed when the task
+  genuinely needs one, but ask before installing (which package, why, what it replaces) and wait
+  for the go-ahead. Runtime deps are intentionally minimal, so check what is already in
+  `pyproject.toml` first. Exception: obvious test dev extras.
 - **Heavy or parallel jobs run inside a memory cgroup** — never launch a suite, build or
   compress/restore over a real tree on a bare estimate; wrap it in
   `systemd-run --user --scope -p MemoryHigh=5G -p MemoryMax=6G -p MemorySwapMax=0 -- <command>`
