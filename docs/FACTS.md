@@ -1,6 +1,6 @@
 # FACTS — verified facts an agent would otherwise re-derive
 
-> **Convention** (see `CLAUDE.md` § *Agent orchestration*): when you verify something against this
+> **Convention** (see `AGENTS.md` § *Agent orchestration*): when you verify something against this
 > repo or the running system that the next agent would otherwise have to look up again, append a
 > one-line fact here — with **how** you verified it. Facts only, never plans or opinions.
 >
