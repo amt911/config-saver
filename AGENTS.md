@@ -1,4 +1,4 @@
-# config-saver — Claude Guide
+# config-saver — Agent Guide
 
 Python CLI that compresses/decompresses directories and files driven by YAML/JSON config files,
 with Pydantic validation and an optional progress bar. Installable as a package and shipped as an
@@ -21,6 +21,33 @@ backups.
 - **`pytest` is the gate** (`tests/`, ~85% coverage, CI fails under 80%). "It type-checks" is not
   evidence: run `pytest`, and for compress/restore changes also run the CLI against a scratch config
   and inspect the resulting archive/tree.
+
+## Agent compatibility — Codex and Claude Code
+
+This file is `AGENTS.md`: the **one** instruction file for every coding agent in this repo. Codex reads
+it directly; Claude Code reads `CLAUDE.md`, which only imports this file (`@AGENTS.md`) and holds what
+applies to Claude alone. **Edit rules here, never in `CLAUDE.md`** — two copies of a rule drift apart
+on the first edit, and each agent then obeys a different one.
+
+| Concern | Claude Code | Codex |
+| --- | --- | --- |
+| Instruction file | `CLAUDE.md` → imports `AGENTS.md` | `AGENTS.md` (root down to the working directory) |
+| Invoke a skill | `Skill` tool, or `/<skill>` | mention it (`$<skill>`), or let it trigger from its description |
+| Skills on disk | `~/.claude/skills` (links into `~/.agents/skills`) | `.agents/skills`, then `~/.agents/skills` |
+| superpowers | `superpowers@claude-plugins-official` (`/plugin install`) | `superpowers@openai-curated` (install from `/plugins`; that id is its key in `~/.codex/config.toml`) |
+| MCP servers | `claude mcp add -s user <name> -- <cmd>` | `codex mcp add <name> -- <cmd>` (`~/.codex/config.toml`) |
+| File size | imports load whole | `project_doc_max_bytes`, **32 KiB by default** — raise it when this file is bigger, or the tail is silently dropped |
+
+- **Install shared skills once, for both agents:** `npx skills add <owner/repo> -g --skill <name>`
+  writes to `~/.agents/skills` and links it for Claude Code, so both run the same version.
+- **Names in this file are capabilities, not one agent's syntax.** "Invoke the `X` skill" means the
+  `Skill` tool in Claude Code and a skill mention in Codex. An MCP server named here is used when it is
+  registered for the agent you are running in; its absence never blocks ordinary work.
+- **Modes, model caps and Git rules bind both agents.** "lite mode", "normal mode" and "modo
+  desatendido" mean the same in Codex; a cap written as "no model above Sonnet" means "no model above
+  the mid tier" there.
+- **Claude-only commands** (`/graphify` and other slash commands that are not skills) are skipped by
+  Codex unless the same capability is installed as a skill in `~/.agents/skills`.
 
 ## ⚡ graphify — use every session
 
@@ -438,6 +465,43 @@ measured number.
 3. **The inert assertions** — break one assertion on purpose and run the suite; anything still green
    is inert. Then prune the table above to what this stack can actually produce.
 
+## Design principles — SOLID, applied with judgement
+
+SOLID is a list of **symptoms to look for**, not a pattern to apply. Every one of the five exists to
+keep a change local: the useful question is *how many files does the next plausible change touch, and
+how many of them do you have to understand first?* Applied by rote it produces the opposite — an
+interface per class, a factory for one product, an eight-file feature — so here it is bounded by YAGNI
+and by **Reuse before you write** (see *Working rules* below).
+
+| Principle | Checkable smell | Usual fix |
+| --- | --- | --- |
+| **S — Single responsibility**: one reason to change | the description needs "and"; the file changes in PRs about unrelated features; a test mocks things unrelated to what it asserts; a component both fetches and lays out | split along the reason to change — IO, decision, presentation |
+| **O — Open/closed**: extend without editing | adding a case edits a growing `switch`/`if` chain in several places; one boolean prop per variant | a variants map, strategy, slot or registry — introduced at the second real case, not the first |
+| **L — Liskov substitution**: subtypes keep the contract | an override throws "not supported"; callers check the concrete type before calling; a variant drops the base's disabled, focus or semantics | narrow the base contract, or stop inheriting and compose |
+| **I — Interface segregation**: clients see only what they use | a fake implements methods the test never calls; a whole entity is passed to read two fields; a `Service` with fifteen methods | split by client need; pass the fields, not the bag |
+| **D — Dependency inversion**: policy does not import mechanism | domain or UI code imports `fetch`, the ORM, Retrofit, `Date.now()` or `fs` directly; a unit test needs a network or a database | depend on a port the caller owns (interface, function, hook); wire the adapter at the edge |
+
+### Where the seams go, per stack
+
+| Stack | Seams |
+| --- | --- |
+| Python | pure functions for decisions; IO at the edges (CLI entry point, adapters); a `Protocol` only when a second implementation or a test fake needs it |
+| Shell | one function per job; side effects (`rm`, package managers, network) isolated in named functions a dry-run flag can skip |
+
+### Where SOLID stops
+
+- **No interface, abstract class or factory without one of:** a second real implementation, an IO
+  boundary (network, database, filesystem, clock, randomness, OS), or a test that cannot be written
+  without the seam. "We might swap it later" is not on the list.
+- **Reuse first beats speculative extension points:** add the parameter to the existing thing before
+  inventing a plugin system for it.
+- **Speculative abstraction is a review finding**, exactly like a violation: an interface with one
+  implementation and no IO behind it gets inlined.
+- **Refactor toward SOLID when a change hurts**, in the PR that felt the pain — not as a drive-by
+  rewrite of code nobody is changing.
+- **Repos without their own executable code** (packaging, fonts, LaTeX, configuration data,
+  byte-matching decompilation) state the exemption in one line under *Working rules*.
+
 ## Working rules
 
 - **Use superpowers skills whenever they apply** — invoke via `Skill` before acting; process skills
@@ -464,6 +528,11 @@ measured number.
   reuse the fixtures in `tests/` rather than rebuilding a tree each time. At the third copy, extract
   into the owning package in the same PR, migrating the call sites. A second implementation of the
   extraction guard is a security bug waiting for the fix to land in only one of them.
+- **SOLID where it pays, not by rote** — split by reason to change, extend through variants, slots or
+  strategies, keep subtypes and variants honest, keep interfaces and props narrow, and push IO
+  (network, database, clock, filesystem) behind ports at the edge. No abstraction without a second
+  implementation, an IO boundary or a test seam. See
+  [Design principles](#design-principles--solid-applied-with-judgement).
 - **Keep `--progress` optional** — the tool must run headless (systemd timer) without a TTY.
 - **Type-clean** — `mypy` must pass; the dev extra installs the stubs.
 - **Round-trip integrity** — compress → decompress must reproduce the original tree exactly.
@@ -485,6 +554,11 @@ longer parses, a config that fails to validate, a broken round-trip.
   and the resulting archive/output tree.
 - **Two layers.** `mypy` (and any tests) stay the hard merge gate; the agentic pass is advisory and
   never vetoes a merge on its own — but running it and posting the verdict comment is mandatory.
+- **The verdict reads structure too.** Besides driving the CLI, it names what the diff does to the
+  [Design principles](#design-principles--solid-applied-with-judgement): a new violation (business
+  logic importing `tarfile`/`os` directly instead of going through the existing module, one more
+  branch in a growing `if`/`elif` chain) or a new speculative abstraction. Findings, not a veto —
+  like the rest of the pass.
 - **Hard limits.** The verdict awaits your close; the agent never merges.
 
 ## Git & GitHub
