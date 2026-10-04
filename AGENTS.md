@@ -22,33 +22,6 @@ backups.
   evidence: run `pytest`, and for compress/restore changes also run the CLI against a scratch config
   and inspect the resulting archive/tree.
 
-## Agent compatibility — Codex and Claude Code
-
-This file is `AGENTS.md`: the **one** instruction file for every coding agent in this repo. Codex reads
-it directly; Claude Code reads `CLAUDE.md`, which only imports this file (`@AGENTS.md`) and holds what
-applies to Claude alone. **Edit rules here, never in `CLAUDE.md`** — two copies of a rule drift apart
-on the first edit, and each agent then obeys a different one.
-
-| Concern | Claude Code | Codex |
-| --- | --- | --- |
-| Instruction file | `CLAUDE.md` → imports `AGENTS.md` | `AGENTS.md` (root down to the working directory) |
-| Invoke a skill | `Skill` tool, or `/<skill>` | mention it (`$<skill>`), or let it trigger from its description |
-| Skills on disk | `~/.claude/skills` (links into `~/.agents/skills`) | `.agents/skills`, then `~/.agents/skills` |
-| superpowers | `superpowers@claude-plugins-official` (`/plugin install`) | `superpowers@openai-curated` (install from `/plugins`; that id is its key in `~/.codex/config.toml`) |
-| MCP servers | `claude mcp add -s user <name> -- <cmd>` | `codex mcp add <name> -- <cmd>` (`~/.codex/config.toml`) |
-| File size | imports load whole | `project_doc_max_bytes`, **32 KiB by default** — raise it when this file is bigger, or the tail is silently dropped |
-
-- **Install shared skills once, for both agents:** `npx skills add <owner/repo> -g --skill <name>`
-  writes to `~/.agents/skills` and links it for Claude Code, so both run the same version.
-- **Names in this file are capabilities, not one agent's syntax.** "Invoke the `X` skill" means the
-  `Skill` tool in Claude Code and a skill mention in Codex. An MCP server named here is used when it is
-  registered for the agent you are running in; its absence never blocks ordinary work.
-- **Modes, model caps and Git rules bind both agents.** "lite mode", "normal mode" and "modo
-  desatendido" mean the same in Codex; a cap written as "no model above Sonnet" means "no model above
-  the mid tier" there.
-- **Claude-only commands** (`/graphify` and other slash commands that are not skills) are skipped by
-  Codex unless the same capability is installed as a skill in `~/.agents/skills`.
-
 ## ⚡ graphify — use every session
 
 ```text
@@ -90,8 +63,47 @@ User instructions always take precedence over skills; skills override default be
   **never merge anything** (no `git merge`, no fast-forward, no `gh pr merge`), **never push to
   `main`**/protected, never `--force`. Deliver branches + PRs for the user to merge. Reverts to
   defaults on **"normal mode"**.
+  **Pace in this mode** (2026-10-04): intermediate tasks run only the tests of what they touched
+  (`pytest tests/test_<module>.py`); commits pile up locally and the branch is pushed **once, at the
+  end** — the push that runs the full `pre-push` hook (pytest + mutation gate), preceded by the final
+  full-suite pass. Each intermediate push paid the whole hook (minutes) to report nothing the next
+  one would not.
 
 Confirm the switch briefly when it happens.
+
+## Rules by topic — what always binds, and where the detail lives
+
+This file fits in the 32 KiB Codex reads by default (`wc -c AGENTS.md` ≤ 32768; when it grows, move
+detail to `docs/agents/`, never raise the limit). The detail of each topic was moved verbatim to
+`docs/agents/` on 2026-10-04. **The lines below bind even if you never open the document; open it
+before working on that topic.** A rule is edited in its document, not here and there at once —
+except for its one-line summary in this list.
+
+- **Quality beyond coverage** →
+  [docs/agents/quality-beyond-coverage.md](docs/agents/quality-beyond-coverage.md). Hypothesis
+  property tests first; mutation gate scored from the `mutmut run` tally (timeouts are not kills);
+  every archive member name is untrusted input; a smoke of the built wheel is mandatory; the AI never
+  defines the acceptance criteria.
+- **Real-environment verification** →
+  [docs/agents/real-environment-verification.md](docs/agents/real-environment-verification.md). What
+  no in-process test can prove (installed wheel, real filesystem, real systemd) gets a committed
+  script; every new check is seen failing once; never assert on a count you cannot predict; a test
+  never touches the real system.
+- **CI & git hooks** → [docs/agents/ci-and-hooks.md](docs/agents/ci-and-hooks.md). Pre-push runs
+  pytest, then the mutation gate; CI stays lean; `--no-verify` only in an emergency, and you own the
+  breakage.
+- **Agentic PR verification (mandatory)** → [docs/agents/pr-verification.md](docs/agents/pr-verification.md).
+  Every PR gets the verdict of a smoke of the affected CLI path as a PR comment; it never merges.
+- **Debugging** → [docs/agents/debugging.md](docs/agents/debugging.md), before chasing a bug. Measure
+  before ablating; a review finding is not a reproduction; environment claims get measured or they
+  don't get made.
+- **Agent orchestration** → [docs/agents/agent-orchestration.md](docs/agents/agent-orchestration.md).
+  Review in parallel with the next implementation; one shared facts file; plans carry contracts, not
+  literal code; discretionary decisions batched; review is never cut.
+- **Design principles (SOLID)** → [docs/agents/design-principles.md](docs/agents/design-principles.md).
+  No abstraction without a second implementation, an IO boundary or a test seam.
+- **Codex and Claude Code** → [docs/agents/agent-compatibility.md](docs/agents/agent-compatibility.md).
+  Rules are edited in `AGENTS.md` (or its `docs/agents/` document), never in `CLAUDE.md`.
 
 ## 🧠 Heavy jobs run inside a memory cgroup (MANDATORY)
 
@@ -197,6 +209,38 @@ accents, nested directories.
 | `backup_manager/` | manager tests + `--list` / `--show-configs` / `--export-*` by hand |
 | anything ambiguous or large | full suite + install the wheel in a scratch venv and smoke the CLI |
 
+### The pyramid per feature — one end-to-end test per journey, the rest one layer down
+
+**Rule since 2026-10-04**, ported from the Android client, where E2E ate days of agent time. A new
+feature gets **one end-to-end test per main journey**: the real command, run as a subprocess against
+a real tree in `tmp_path` and a temp `HOME` (compress → look at the archive → restore → diff the
+trees, or the `--list` / `--export-*` round trip). Everything else — each parser error, each model
+validation, every edge value of the path expander, each exit code's branch — goes one layer down, in
+unit tests of the pure functions and modules (`tests/test_parser.py`, `tests/test_path_expander.py`…),
+which cost milliseconds and touch no real filesystem outside `tmp_path`.
+
+- **When one more end-to-end test is right:** what no in-process test can answer — the real exit
+  code and stderr of the process, the installed entry point or packaging metadata, the systemd
+  units, a malicious archive that must be refused when the CLI extracts it, behaviour that depends
+  on real file modes, symlinks or ownership. The test says in a comment why it is not a unit test.
+- **A bug still gets its failing test first**, at the lowest layer that reproduces it.
+- **Existing tests are not migrated for this rule.** It applies to new work and to what a change touches.
+
+### Running the suites — the whole suite once at the end, only the reds in between
+
+- **While working:** only the tests of what you touched — `pytest tests/test_<module>.py`, or
+  `pytest -k <expression>`; leave out the slow ones with `pytest -m "not slow"` (the `slow` marker
+  is declared in `pyproject.toml`).
+- **The full suite runs once, at the end of the branch, alone** — in the background while you write
+  the PR, under `timeout --kill-after=60s <limit>` inside the memory cgroup above. Push and PR only
+  after it is green.
+- **Red pass → only the reds** (`pytest --lf`) until they are green or proven red on the base commit
+  too; then **one** full confirmation pass, the one that catches a fix breaking another test.
+- **Three reds in a row on one test → stop** and read the evidence (the assertion diff, the
+  archive, the tree on disk) before a fourth change.
+- **No fixed sleeps** — wait on the state. **Every heavy command** (the full suite, coverage,
+  `scripts/mutation-gate.sh`) runs under `timeout --kill-after=60s <limit>`, inside the cgroup.
+
 ### What to test per module
 
 | Module | What |
@@ -226,281 +270,6 @@ Exceptions: pure docs/comment changes and spikes — but add tests before mergin
 - **Never test against the real `$HOME` or `/etc`.** `tmp_path` or it doesn't run.
 - **Test over mock** — this tool's whole job is real filesystem behaviour; mocking `tarfile` or `os`
   proves nothing. Build a real tree in `tmp_path` and assert on it.
-
-## Quality beyond coverage
-
-**Coverage measures how much code runs, not whether it's correct.** This is especially treacherous
-with AI: it tends to write the test *and* the code in one move, so if it misread the requirement,
-both encode the same mistake and the test passes happily. These gates attack that blind spot.
-
-- **Property-based testing** *(highest priority here)* — **Hypothesis**. This codebase is unusually
-  well suited to it: `decompress(compress(tree)) == tree` is a textbook round-trip property, and
-  `PathExpander.expand` is a pure function over strings. Let it generate the filenames, encodings and
-  nesting nobody thinks of by hand.
-- **Mutation testing** — **mutmut**, scoped to the pure logic (path normalization, the expander,
-  member validation), not to the I/O shells. A surviving mutant means the code is *covered but not
-  verified*. **Now a gate, not advice:** `scripts/mutation-gate.sh` runs the scoped set inside the
-  memory cgroup and fails under **60%** (killed / killed+survived — timeouts deliberately do NOT
-  count as kills: a starved run once scored 139 of 142 mutants "killed" purely by timing out, which
-  reads as a triumph and means nothing). Blocking in `pre-push`, advisory in CI until the baseline
-  is measured. **De dónde sale el veredicto, y por qué no de `mutmut results`:** en esta versión
-  `mutmut results` lista **solo los supervivientes**, así que leerlo como si fuera el recuento
-  completo da "0 muertos / 18 vivos = 0%" sobre una corrida que mató 243. El recuento bueno es el
-  marcador que `mutmut run` imprime al terminar (`261/2533 🎉 243 … 🙁 18`), que es lo que parsea el
-  script — y si no encuentra marcador, **falla**: una puerta que no puntúa nada no está limpia,
-  está rota.
-- **Runtime boundary validation** — **Pydantic** is already used for the YAML models; keep every new
-  config shape a model. The other boundary is the **archive**, and it is currently unvalidated: every
-  member name coming out of a tar is untrusted input and must be checked before use.
-- **Strict types + static analysis** — `mypy` with `--check-untyped-defs` (and `--strict` as the
-  target), plus **Semgrep** in CI. SAST matters because AI introduces exactly the class of bug this
-  repo already has: unvalidated extraction paths and secrets written with loose permissions.
-- **Smoke tests** *(mandatory, not a nice-to-have)* — build the wheel, install it into a scratch
-  venv, run `--compress` then `--decompress` against a sample config. Code routinely passes every
-  unit test while the packaged CLI won't start (a missing package, a bad entry point).
-- **Dependency auditing** — `pip-audit` in CI. AI invents non-existent packages ("slopsquatting")
-  and pulls vulnerable versions; verify every new dependency actually exists and is the one you
-  think it is.
-- **Dead-code elimination** — **vulture** (unused code) and **deptry** (unused/undeclared
-  dependencies). Pruning dead code shrinks the surface every session has to reason about.
-
-**Process rule (worth more than any tool): don't let the AI define the acceptance criteria.** You
-write or review the important test cases yourself — at least the key asserts and the requirement's
-edge cases — and have the AI implement against them.
-
-## Real-environment verification — what no in-process test can prove
-
-Some properties are invisible to the entire pytest suite no matter how many tests you add, because
-**a monkeypatched `pathlib.Path` is not a filesystem and an installed wheel is not `pip install -e .`**.
-This tool's whole job is to move real files on a real machine and to be woken by systemd — and none
-of that exists inside the test process. A unit that parses is not a timer that fires; a `tarfile`
-call that was made is not an archive that restores.
-
-That layer needs a check that drives the **installed package on a real system** and asserts on what
-is externally observable: exit codes, files on disk with their permissions intact, journal lines.
-
-**Write that check as a script, commit it under `scripts/`, and name it here.** It runs by hand with
-no arguments, prints a per-phase `PASS`/`FAIL`, and exits non-zero on the first failure. Run it in a
-throwaway container or VM, never against your own `~/.config`.
-
-What "real environment" means here, concretely:
-
-- **The installed artifact**, not the source tree: build the wheel, install it the way the AUR
-  package does (`python -m installer`), and invoke `config-saver` from `PATH`. An editable install
-  hides missing package data, a wrong entry point and files the wheel never included.
-- **A real filesystem with awkward contents.** Symlinks (including dangling ones), hardlinks, FIFOs
-  and sockets, sparse files, files with no read permission, non-UTF-8 filenames, paths longer than
-  255 bytes, and a file that changes size *while* the tar is being written. A mocked `tarfile` sees
-  none of these; a backup tool meets all of them.
-- **Real systemd.** `systemd-analyze verify contrib/systemd/config-saver@.service`, then actually
-  start the unit and the timer and read the journal. A `.service` that parses can still fail on
-  `%i` expansion, a missing `WorkingDirectory`, or a `User=` that cannot read the source.
-- **A full round trip, compared byte for byte.** Compress a real tree, decompress into an empty
-  directory, and `diff -r` the two *including* modes and mtimes. "The function returned without
-  raising" is not a restore.
-
-### The names, so you can ask for them by name
-
-| Name | What it means here |
-| --- | --- |
-| **E2E / on-system acceptance test** | Runs the installed `config-saver` against a real directory tree in a throwaway container and asserts on observable results — exit code, the archive on disk, the restored tree, the journal — never on internals. |
-| **Contract test** | Checks that assumptions about a boundary you don't own actually hold. Two matter here: **the config people actually write** (does the Pydantic model accept the YAML in `/etc/config-saver/configs/`, or only the fixtures?) and **the standard library** (`tarfile` extraction filters changed default behaviour in recent CPython — a member path that used to extract now raises, or vice versa; absolute paths and `..` components are handled by the *runtime*, not by you). Pin what you assume and test it against the interpreter you actually ship on. |
-| **Mutation testing** (on system: by hand) | Revert the fix, re-run the check, confirm it goes red, restore. `mutmut`/`cosmic-ray` automate this in process; against a real filesystem you do it manually. **A check that has never failed has not been tested** — a restore check that has never seen a corrupt archive proves nothing. |
-| **State-invariant test** | Asserts a relationship **between two things** no unit test owns: an archive and the manifest that describes it; a timer's `OnCalendar` and the last-run stamp it writes; a backup and the schema/version of the config that produced it. Each side is individually fine; the pair is what breaks. |
-| **Test pollution / isolation leak** | A test writing to real state. For a backup/restore tool this is the dangerous one: a test that restores into the user's actual `~/.config`, or installs a system unit, does damage that no assertion will report. Run destructive paths **only** in a container or VM, and restore anything machine-global in a teardown that runs even when the test fails. |
-
-### Rules that came out of real bugs, not theory
-
-- **Prove every new check can fail before you trust it green.** Revert the fix, re-run, watch it go
-  red, restore. Applies to unit tests written after the fact *and* to on-system checks. A green you
-  have never seen turn red is not evidence.
-- **Never assert on a count you cannot predict.** "Backed up more than 5 files" or "the archive is
-  under 2 MB" passes against a genuinely broken build as soon as the machine's config directory
-  differs — the magnitude depends on the system, not on the bug. Assert the **invariant**: the
-  restored tree equals the source tree (`diff -r`, modes included), a symlink stays a symlink, the
-  archive contains no absolute paths, a second run over unchanged input produces an identical result.
-- **A manifest, timestamp or version marker must die with the data it describes.** An archive kept
-  after its manifest is regenerated, or a last-run stamp that survives a deleted backup, silently
-  makes the next restore restore the wrong thing — no crash, no log.
-- **Never let a test touch the real system.** No writes outside a temp dir, no `systemctl` against
-  the user's session, no restore into a real home. Container or VM for anything destructive.
-- **Run the suite the way that actually works on this machine** — `.[dev]` is not always installed,
-  so `--cov` may be unavailable until you install it — and run heavy steps under the memory cgroup
-  (see *Heavy jobs*):
-
-  ```bash
-  systemd-run --user --scope --quiet -p MemoryHigh=5G -p MemoryMax=6G -p MemorySwapMax=0 -- \
-    pytest --cov=config_saver
-  scripts/verify-<flow>-on-system.sh   # installed wheel, real FS, real systemd, in a container
-  ```
-
-## CI & git hooks
-
-**Policy — heavy checks run locally on push, CI stays lean.**
-
-- **Pre-push** runs the full local gate via `pre-commit` (`pytest`, then the **mutation gate at
-  60%** — el paso más lento va el último, y no se muta sobre una suite roja), on top of the
-  per-commit `ruff check`, `ruff format` and `mypy`. Emergency bypass only via `--no-verify`, and
-  then you own the breakage.
-- **GitHub Actions** (`.github/workflows/ci.yml`) — only the cheap, important checks:
-  - `lint` → `ruff check` + `ruff format --check`.
-  - `test` → `mypy` + `pytest --cov --cov-fail-under=80` on a Python 3.10–3.13 matrix.
-  - `packaging` → build wheel + sdist, install each into a clean venv, smoke the CLI.
-  - `systemd` → `systemd-analyze verify` on the shipped units.
-  - `release-consistency` → on a `v*` tag, the tag must equal `project.version`.
-  - `sast` → **Semgrep** `p/python`, currently blocking (`--error`). Keep it that way.
-  - `mutation` → `scripts/mutation-gate.sh` (93% sobre la lógica pura, medido), **solo en PRs** y con
-    `continue-on-error: true` mientras no haya baseline medido. Se promueve a bloqueante cuando el
-    score supere el umbral en dos runs seguidos; anota aquí la fecha, o "advisory" será permanente.
-  - `audit` → **`pip-audit`**, currently `continue-on-error: true`. Promote it to a blocking gate
-    once the findings are triaged, and fix a failure by bumping the dependency, never by relaxing the
-    threshold.
-- **Git hooks:** `.pre-commit-config.yaml`; install with
-  `pre-commit install --hook-type pre-commit --hook-type pre-push`.
-
-## Debugging — keep the loop from running away
-
-What a bug costs is not the fix. It is how many times you go around
-`build → deploy → reach the state → observe` before you know what to fix, times what one lap costs.
-Every rule below carries the number it came from; the ones this repo has not measured are marked
-`<!-- pendiente de medir -->` until someone does.
-
-- **Measure before you ablate.** Ablation costs one lap per hypothesis and answers yes/no;
-  instrumentation costs one lap total and answers *what is actually happening*. **Measured: 28
-  ablations over 1 h 42 min moved nothing; one 13-min batch of probes changed the question and the
-  bug fell on the next round.** The rule that came out of it: **if a pipeline completes every phase
-  with non-empty output, the output exists** — stop asking "why doesn't it appear" and ask "where
-  does it appear". Here that pipeline is `load/parse → validation → transform → write the result`.
-- **Budget the lap, then attack the dominant term.** Time the four phases once and write the real
-  seconds in; one dominates and the rest are noise. **If a bug needs more than three reproductions,
-  write the shortcut before the fourth** — here that means
-  a fixture that lands the tree/state already built, a VM snapshot, or a dev subcommand that skips
-  the earlier steps.
-  Commit it as `<scripts/repro-<bug>.sh>` and name it in `docs/FINDINGS.md`.
-
-  | Lap phase | Command here | Measured |
-  | --- | --- | --- |
-  | build / install | `<pip install -e . · none>` | `<n s>` |
-  | deploy | `<copy to the VM · none>` | `<n s>` |
-  | reach the state | `<sample config · VM at the starting state>` | `<n s>` |
-  | observe | `<stdout · resulting files · journalctl>` | `<n s>` |
-
-- **A review finding is not a reproduction.** Whoever reviewed read the code; they did not run it.
-  Reproduce it yourself before sending anyone to fix it, and **if the implementer says they cannot
-  reproduce it, believe the implementer** — one of them has the thing running. **Measured: 1 h 25 min
-  chasing a bug that did not exist.**
-- **A test that refuses to go red is data, not a failure.** The fourth failed attempt to pin down
-  that non-existent bug is what uncovered the real one, pointing the opposite way. "I cannot make
-  this fail" is a result and it gets reported; a green test papered over it throws the signal away.
-- **Before demanding a red, ask whether the mechanism can produce one.** If another layer masks the
-  effect there will be no red however hard you push, and the time goes into the test instead of the
-  bug. **Measured: over 1 h on two structurally impossible reds.**
-- **Assertions that are inert by construction** — none of these shows up as a failure, a warning or
-  a coverage drop. **Every assertion is watched failing once**, and expected values are written by
-  hand:
-
-  | Inert by | What it looks like here |
-  | --- | --- |
-  | `assert` under `-O` | `python -O` / `PYTHONOPTIMIZE` strips them from the bytecode: the test passes checking nothing |
-  | an unawaited coroutine | leaves a `RuntimeWarning: coroutine was never awaited` and the test stays green |
-  | snapshots with `--snapshot-update` | `syrupy` / `pytest-snapshot` record the current output as the reference |
-  | `MagicMock` | returns another `MagicMock` for any attribute: everything is truthy and everything looks called |
-  | expectation computed alike | the expected value is recomputed with the same function under test |
-
-- **Verify the resource limit reaches the process doing the work.** A job wrapped in a memory scope
-  can hand the work to a daemon or worker pool living outside it, and the tool still reports the
-  limit as applied — over a process that is idle. Check the **worker's** cgroup
-  (`cat /proc/<worker-pid>/cgroup`), not the scope's.
-- **Environment claims get measured or they don't get made.** "That heap sounds low" produced a
-  recommendation that was simply wrong; measuring it — three runs per setting, not one — gave a
-  **0.4% difference, below the run-to-run variance**. No performance tuning lands without a
-  before/after over more than one run.
-- **Locate which layer owns a rule before deciding which side gives.** A rule that lives in one
-  layer and isn't shared by the others fails where the assumption breaks, not where it is written,
-  which is why the fix keeps landing in the innocent layer.
-- **Replacing a component can remove capabilities in silence.** When you swap one API for another,
-  enumerate what the old one did that the new one does not, and say it in the PR — nothing will fail
-  to compile. An optional parameter that defaults to off is a capability that only exists if the
-  caller remembers it.
-
-## Agent orchestration — parallel where it's free, batched where it's yours
-
-Delegating to agents moves the bottleneck to **scheduling**: what waits on what, what each agent
-re-derives, and which decisions quietly stop being yours. Same convention — every rule carries its
-measured number.
-
-- **Review is not on the critical path.** Reviewing task N and starting N+1 are independent when
-  they touch different files. Serialized, review is **10-15% of the wall clock** and blocks
-  everything behind it; in parallel it is free. **On receiving an implementation report, dispatch
-  its review and the next implementation in the same turn.** This is the one exception to
-  *"at most 1 agent at a time"*: the cap counts **implementation** agents — a review agent reads and
-  reports, it writes nothing, so it cannot race the implementer. **The exclusive resource here is:**
-  the VM or target directory, and any real database or block device
-  — at most one agent touching it.
-- **Keep one shared facts file.** Every fresh agent re-derives the same things: the real selector,
-  which fake exists, what that helper accepts. Keep `docs/FACTS.md`, have each agent append to it
-  when it finishes, and hand it to the next one in its dispatch. Only **facts verified against the
-  repo or the running system**, with how they were verified. It is not the gotchas log: that holds
-  what is *not* deducible from the code and outlives the branch; this holds what is perfectly
-  deducible and merely expensive to look up, and it may die with the branch.
-- **Plans carry contracts, not literal code.** The agent **trusts** the code in the plan; code you
-  never compiled is an error wearing authority. **Measured: 4 wrong blocks, 15-40 min of detour
-  each.** Write exact names, exact signatures and "mirror the shape of `<X>`" — claims the agent can
-  check against the repo — and reserve literal code for what you have run.
-- **Batch the discretionary decisions.** Work that appears along the way — a capability being
-  dropped, a missing script, an adjacent bug — added **5-6 h of 15**. Each was justified; deciding
-  them on the fly is what takes them away from you. Accumulate and ask **once per batch, with the
-  estimated cost**. In **"modo desatendido"** the batch goes in the PR body instead, with its costs.
-- **What never gets cut.** Review was **1.5 h of 15** and found a `create()` silently discarding
-  fields, a 404 caused by SQL deduplication, a silent merge that corrupted data, a
-  delete-and-recreate with no transaction, and several inert assertions. **Cutting review does not
-  give time back; it defers it to production.** Cut reproduction (write the shortcut) and
-  serialization (dispatch review in parallel) instead.
-
-### Day one — the numbers that fill the blanks
-
-1. **The lap** — time `build → deploy → reach the state → observe` once and write the seconds into
-   the table above. The dominant phase gets the shortcut script; the rest stay unoptimized.
-2. **The exclusive resource** — confirm the one named above is really the only one.
-3. **The inert assertions** — break one assertion on purpose and run the suite; anything still green
-   is inert. Then prune the table above to what this stack can actually produce.
-
-## Design principles — SOLID, applied with judgement
-
-SOLID is a list of **symptoms to look for**, not a pattern to apply. Every one of the five exists to
-keep a change local: the useful question is *how many files does the next plausible change touch, and
-how many of them do you have to understand first?* Applied by rote it produces the opposite — an
-interface per class, a factory for one product, an eight-file feature — so here it is bounded by YAGNI
-and by **Reuse before you write** (see *Working rules* below).
-
-| Principle | Checkable smell | Usual fix |
-| --- | --- | --- |
-| **S — Single responsibility**: one reason to change | the description needs "and"; the file changes in PRs about unrelated features; a test mocks things unrelated to what it asserts; a component both fetches and lays out | split along the reason to change — IO, decision, presentation |
-| **O — Open/closed**: extend without editing | adding a case edits a growing `switch`/`if` chain in several places; one boolean prop per variant | a variants map, strategy, slot or registry — introduced at the second real case, not the first |
-| **L — Liskov substitution**: subtypes keep the contract | an override throws "not supported"; callers check the concrete type before calling; a variant drops the base's disabled, focus or semantics | narrow the base contract, or stop inheriting and compose |
-| **I — Interface segregation**: clients see only what they use | a fake implements methods the test never calls; a whole entity is passed to read two fields; a `Service` with fifteen methods | split by client need; pass the fields, not the bag |
-| **D — Dependency inversion**: policy does not import mechanism | domain or UI code imports `fetch`, the ORM, Retrofit, `Date.now()` or `fs` directly; a unit test needs a network or a database | depend on a port the caller owns (interface, function, hook); wire the adapter at the edge |
-
-### Where the seams go, per stack
-
-| Stack | Seams |
-| --- | --- |
-| Python | pure functions for decisions; IO at the edges (CLI entry point, adapters); a `Protocol` only when a second implementation or a test fake needs it |
-| Shell | one function per job; side effects (`rm`, package managers, network) isolated in named functions a dry-run flag can skip |
-
-### Where SOLID stops
-
-- **No interface, abstract class or factory without one of:** a second real implementation, an IO
-  boundary (network, database, filesystem, clock, randomness, OS), or a test that cannot be written
-  without the seam. "We might swap it later" is not on the list.
-- **Reuse first beats speculative extension points:** add the parameter to the existing thing before
-  inventing a plugin system for it.
-- **Speculative abstraction is a review finding**, exactly like a violation: an interface with one
-  implementation and no IO behind it gets inlined.
-- **Refactor toward SOLID when a change hurts**, in the PR that felt the pain — not as a drive-by
-  rewrite of code nobody is changing.
-- **Repos without their own executable code** (packaging, fonts, LaTeX, configuration data,
-  byte-matching decompilation) state the exemption in one line under *Working rules*.
 
 ## Working rules
 
@@ -532,34 +301,12 @@ and by **Reuse before you write** (see *Working rules* below).
   strategies, keep subtypes and variants honest, keep interfaces and props narrow, and push IO
   (network, database, clock, filesystem) behind ports at the edge. No abstraction without a second
   implementation, an IO boundary or a test seam. See
-  [Design principles](#design-principles--solid-applied-with-judgement).
+  [Design principles](docs/agents/design-principles.md#design-principles--solid-applied-with-judgement).
 - **Keep `--progress` optional** — the tool must run headless (systemd timer) without a TTY.
 - **Type-clean** — `mypy` must pass; the dev extra installs the stubs.
 - **Round-trip integrity** — compress → decompress must reproduce the original tree exactly.
 - **AUR packaging lives in `config-saver-aur`** — bump it when releasing.
 - **Instrument before you ablate, budget the lap, and dispatch review in parallel** — a pipeline that completes with non-empty output produced output; more than three reproductions means you owe a shortcut script; a review finding is not a reproduction; and the review of task N runs alongside the implementation of N+1. See **Debugging** and **Agent orchestration** above.
-
-## Agentic PR verification (MANDATORY on every PR)
-
-**Every PR MUST be verified end-to-end before merge, and the verdict MUST be posted as a PR
-comment** via `gh pr comment`. A headless agent (`claude -p`, local) builds/installs the CLI and
-runs a smoke of the affected path (e.g. `pip install .` then `python -m config_saver --compress
---input configs/<sample>.yaml --output /tmp/out.tar.gz` and a round-trip `--decompress`), then
-posts the verdict; it **never merges** — it waits for you. Running the pass and posting the
-verdict comment is **not optional**. It catches what the diff and `mypy` miss: a CLI flag that no
-longer parses, a config that fails to validate, a broken round-trip.
-
-- **Engine.** CLI (no browser, no service) → build/install the package into a scratch venv and run
-  a smoke of the affected command(s) against a sample config under `configs/`, inspecting stdout
-  and the resulting archive/output tree.
-- **Two layers.** `mypy` (and any tests) stay the hard merge gate; the agentic pass is advisory and
-  never vetoes a merge on its own — but running it and posting the verdict comment is mandatory.
-- **The verdict reads structure too.** Besides driving the CLI, it names what the diff does to the
-  [Design principles](#design-principles--solid-applied-with-judgement): a new violation (business
-  logic importing `tarfile`/`os` directly instead of going through the existing module, one more
-  branch in a growing `if`/`elif` chain) or a new speculative abstraction. Findings, not a veto —
-  like the rest of the pass.
-- **Hard limits.** The verdict awaits your close; the agent never merges.
 
 ## Git & GitHub
 
