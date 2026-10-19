@@ -286,7 +286,9 @@ config-saver --migrate --delete-migrated                   # the one-shot step: 
 recommended because it verifies every archive before deleting it. Until it has finished, the
 automatic prune after `--compress` is **deferred** for every configuration that still has archives
 on disk (a yellow line names them), so retention never forgets snapshots that a later `--migrate`
-would only copy in again. A manual `--prune` is not deferred.
+would only copy in again. A manual `--prune` is not deferred. An archive that permanently fails to
+migrate (corrupt, or encrypted to a key you no longer have) keeps that deferral in place: inspect the
+`failed:` line, then remove the archive (and its timestamp directory) yourself if it is worthless.
 
 - **Back up the age private key off this machine first.** After `--restic-init` that key is the
   only secret needed to read the whole store (the repository password is encrypted to it); lose it

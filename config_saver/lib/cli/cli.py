@@ -436,7 +436,7 @@ class CLI:
         if report.deferred:
             print(
                 Fore.YELLOW + f"automatic prune deferred for {', '.join(report.deferred)}: "
-                "unmigrated archives remain; run `config-saver --migrate --delete-migrated`"
+                "unmigrated archives remain; run `config-saver --migrate --delete-migrated` (or remove archives that cannot be migrated)"
             )
         for error in report.errors:
             print(Fore.RED + f"Pruning failed: {error}")

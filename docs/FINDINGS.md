@@ -3,16 +3,17 @@
 Non-obvious things that cost time and are not deducible from the code. Add an entry when you hit
 one; keep each entry short and dated.
 
-## 2026-10-19 — `--migrate --delete-migrated` re-migrates what retention already pruned
+## 2026-10-19 — prune → re-migrate churn (fixed in 3.5.0)
 
 Measured on a copy of the real store (zsh, firefox, claude-conversations; 70 archives, 3762 MB into
-a 1076 MB repository, migrate 2:31, verified delete 2:00). Running `--compress` between `--migrate`
-and `--migrate --delete-migrated` prunes old snapshots by retention (47 zsh ones). The next
-`--migrate` no longer finds them in the store, so it migrates those archives afresh, verifies and
-deletes them (the summary said "migrated 47, already in the store 23"), and the following
-`--compress` prunes them again. Harmless (the data was beyond retention anyway, and the archive is
-verified before deletion) but wasteful: run `--migrate --delete-migrated` before the first
-`--compress` that prunes. `restic check` at the end of a migration is silent on success.
+a 1076 MB repository, migrate 2:31, verified delete 2:00). Originally, a `--compress` between
+`--migrate` and `--migrate --delete-migrated` pruned old snapshots by retention (47 zsh ones); the
+next `--migrate` no longer found them in the store, re-migrated those archives, verified and
+deleted them, and the following `--compress` pruned them again. Wasteful, not lossy.
+
+Fixed in 3.5.0 by deferring the automatic prune for any configuration that still has archives on
+disk (a yellow line names it) until migration has finished; a manual `--prune` is not deferred.
+`restic check` at the end of a migration now prints `restic check: ok`.
 
 ## 2026-10-19 — migration: a failed decrypt surfaces as "Not a gzipped file"
 

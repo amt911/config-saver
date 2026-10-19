@@ -1087,5 +1087,5 @@ def test_cli_compress_names_the_configs_whose_prune_was_deferred(
     store = _CliFakeStore.instances[0]
     assert store.forgets == ["two"]
     assert (
-        "automatic prune deferred for one: unmigrated archives remain; run `config-saver --migrate --delete-migrated`"
+        "automatic prune deferred for one: unmigrated archives remain; run `config-saver --migrate --delete-migrated` (or remove archives that cannot be migrated)"
     ) in capsys.readouterr().out
