@@ -552,9 +552,12 @@ class CLI:
         """cfg name -> (timestamp, path) of the newest tar archive still on disk."""
         newest: dict[str, tuple[str, str]] = {}
         for path in manager.list_archives():
-            m = FILENAME_PATTERN.match(os.path.basename(path))
-            if m and (m.group(1) not in newest or m.group(2) > newest[m.group(1)][0]):
-                newest[m.group(1)] = (m.group(2), path)
+            name = os.path.basename(path)
+            m = FILENAME_PATTERN.match(name)
+            # Same fallback as the archive-mode export: an odd name stands for itself, oldest possible.
+            cfg, ts = (m.group(1), m.group(2)) if m else (os.path.splitext(name)[0], "00000000-000000")
+            if cfg not in newest or ts > newest[cfg][0]:
+                newest[cfg] = (ts, path)
         return newest
 
     def _export_encryption(
@@ -628,37 +631,52 @@ class CLI:
         """Export the newest backup of ``cfg``; return True when the file is not encrypted."""
         if tar is not None and (snap is None or tar[0] > snap.time.strftime(TIMESTAMP_FORMAT)):
             target = dest or os.path.join(dest_dir, os.path.basename(tar[1]))
+            if os.path.isdir(target):
+                target = os.path.join(target, os.path.basename(tar[1]))
             shutil.copy2(tar[1], target)
             print(Fore.GREEN + f"Exported: {target}")
+            if args.encrypt_to:
+                print(
+                    Fore.YELLOW + f"Warning: {target} is an archive already on disk and was copied, not re-encrypted."
+                )
             return crypto.detect_method(tar[1]) is None
         assert snap is not None
         encryption, warning = self._export_encryption(manager, args, cfg)
         if warning:
             print(Fore.YELLOW + f"Warning: {warning}")
-        target = dest or os.path.join(dest_dir, f"{cfg}-{snap.time.strftime(TIMESTAMP_FORMAT)}.tar.gz")
+        default_name = f"{cfg}-{snap.time.strftime(TIMESTAMP_FORMAT)}.tar.gz"
+        target = dest or os.path.join(dest_dir, default_name)
+        if os.path.isdir(target):
+            target = os.path.join(target, default_name)
         final = self._export_snapshot(store, snap, target, encryption)
         print(Fore.GREEN + f"Exported: {final}")
         return encryption is None
 
     def _export_config_restic(self, manager: BackupManager, store: ResticStore, args: argparse.Namespace) -> int:
+        try:
+            self._encryption_override(args)
+        except ValueError as e:
+            print(Fore.RED + str(e))
+            return EXIT_USAGE
         cfg = args.export_config
         snaps = [s for s in store.snapshots() if s.cfg == cfg]
         tar = self._newest_tars(manager).get(cfg)
         if not snaps and tar is None:
             print(Fore.RED + f"No saved configuration found with the name: {cfg}")
             return EXIT_NO_SUCH_CONFIG
-        try:
-            plain = self._export_one(
-                manager, store, args, cfg, snaps[-1] if snaps else None, tar, args.output, os.path.expanduser("~")
-            )
-        except ValueError as e:
-            print(Fore.RED + str(e))
-            return EXIT_USAGE
+        plain = self._export_one(
+            manager, store, args, cfg, snaps[-1] if snaps else None, tar, args.output, os.path.expanduser("~")
+        )
         if plain:
             print(Fore.YELLOW + "Note: archives are not encrypted and may contain secrets.")
         return EXIT_OK
 
     def _export_all_restic(self, manager: BackupManager, store: ResticStore, args: argparse.Namespace) -> int:
+        try:
+            self._encryption_override(args)
+        except ValueError as e:
+            print(Fore.RED + str(e))
+            return EXIT_USAGE
         newest: dict[str, Snapshot] = {}
         for snap in store.snapshots():  # oldest first, so the last one wins
             newest[snap.cfg] = snap
@@ -674,15 +692,29 @@ class CLI:
             print(Fore.RED + f"Cannot create output directory: {dest_dir}")
             return EXIT_USAGE
         plain = False
-        try:
-            for cfg in names:
+        exit_code = EXIT_OK
+        for cfg in names:
+            # Like the archive-mode export: one failing configuration does not stop the others.
+            try:
                 plain |= self._export_one(manager, store, args, cfg, newest.get(cfg), tars.get(cfg), None, dest_dir)
-        except ValueError as e:
-            print(Fore.RED + str(e))
-            return EXIT_USAGE
+            except ValidationError as e:
+                print(Fore.RED + f"[{cfg}] validation error in configuration: {e}")
+                exit_code = EXIT_VALIDATION
+            except PermissionError as e:
+                print(Fore.RED + f"[{cfg}] permission error: {e}")
+                exit_code = EXIT_PERMISSION
+            except EncryptionError as e:
+                print(Fore.RED + f"[{cfg}] encryption error: {e}")
+                exit_code = EXIT_ENCRYPTION
+            except StoreError as e:
+                print(Fore.RED + f"[{cfg}] {e}")
+                exit_code = EXIT_RUNTIME
+            except OSError as e:
+                print(Fore.RED + f"[{cfg}] I/O error: {e}")
+                exit_code = EXIT_IO
         if plain:
             print(Fore.YELLOW + "Note: archives are not encrypted and may contain secrets.")
-        return EXIT_OK
+        return exit_code
 
     def _compress(
         self,

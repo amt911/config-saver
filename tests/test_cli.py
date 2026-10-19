@@ -17,6 +17,7 @@ from config_saver.lib import paths
 from config_saver.lib.backup_manager.backup_manager import BackupManager
 from config_saver.lib.cli.cli import (
     CLI,
+    EXIT_ENCRYPTION,
     EXIT_INCOMPLETE,
     EXIT_NO_SUCH_CONFIG,
     EXIT_NOT_FOUND,
@@ -647,7 +648,11 @@ def test_list_restic_mode_groups_by_cfg_and_shows_unmigrated(
     assert "zsh" in out and "kde" in out
     assert "2026-10-01 03:00:00" in out and "first run" in out
     assert "2026-08-01 12:00:00" in out
-    assert "tar" in out and "not migrated" in out
+    assert "not migrated" in out
+    rows = [ln for ln in out.splitlines() if "│" in ln or "┃" in ln]
+    assert sum(" tar " in ln for ln in rows) == 1
+    assert sum(" restic " in ln for ln in rows) == 3
+    assert [ln for ln in rows if "2026-08-01 12:00:00" in ln and " tar " in ln]
 
 
 def test_show_configs_restic_unions_snapshots_and_tars(
@@ -741,7 +746,7 @@ def test_export_no_plaintext_left_on_encrypt_failure(
     dest = tmp_path / "out"
     dest.mkdir()
     code = run(["--export-config", "zsh", "--output", str(dest / "z.tar.gz.age")])
-    assert code != EXIT_OK
+    assert code == EXIT_ENCRYPTION
     assert list(dest.iterdir()) == []
 
 
@@ -792,3 +797,62 @@ def test_export_all_configs_restic(fake_home: Path, tmp_path: Path, monkeypatch:
         "old-20260801-120000.tar.gz",
         "zsh-20261002-030000.tar.gz",
     ]
+
+
+def test_export_config_to_existing_directory_lands_inside(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    parent = tmp_path / "parent"
+    dest = parent / "dest"
+    dest.mkdir(parents=True)
+    assert run(["--export-config", "zsh", "--output", str(dest)]) == EXIT_OK
+    assert [p.name for p in dest.iterdir()] == ["zsh-20261002-030405.tar.gz"]
+    assert [p.name for p in parent.iterdir()] == ["dest"]
+
+
+def test_export_all_continues_after_a_failing_config(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _read_mode(
+        monkeypatch,
+        _snap("aaa", datetime(2026, 10, 2, 3, 0, 0)),
+        _snap("zzz", datetime(2026, 10, 2, 4, 0, 0)),
+    )
+    _write_user_config(fake_home, "aaa", encrypt={"method": "age", "recipients": ["not-a-real-recipient"]})
+    dest = tmp_path / "exports"
+    assert run(["--export-all-configs", "--output", str(dest)]) == EXIT_ENCRYPTION
+    assert [p.name for p in dest.iterdir()] == ["zzz-20261002-040000.tar.gz"]
+    assert "not encrypted" in capsys.readouterr().out
+
+
+def test_export_invalid_config_is_a_validation_error(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    _write_user_config(fake_home, "zsh", encrypt={"method": "age", "recipients": []})
+    out = tmp_path / "o.tar.gz"
+    assert run(["--export-config", "zsh", "--output", str(out)]) == EXIT_VALIDATION
+    assert not out.exists()
+
+
+def test_export_encrypt_to_with_newer_tar_warns_not_reencrypted(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    _make_saved_archive(fake_home, "zsh", "20261101-000000")
+    assert run(["--export-config", "zsh", "--output", str(tmp_path / "c.tar.gz"), "--encrypt-to", "age1abc"]) == EXIT_OK
+    assert "not re-encrypted" in capsys.readouterr().out
+
+
+def test_export_all_restic_includes_oddly_named_archives(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 0, 0)))
+    odd = fake_home / ".config" / "config-saver" / "odd.tar.gz"
+    odd.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(odd, "w:gz"):
+        pass
+    dest = tmp_path / "exports"
+    assert run(["--export-all-configs", "--output", str(dest)]) == EXIT_OK
+    assert "odd.tar.gz" in [p.name for p in dest.iterdir()]
