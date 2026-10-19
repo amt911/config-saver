@@ -6,6 +6,7 @@ Returns structured results; the CLI renders them and picks exit codes.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -19,13 +20,17 @@ from .parser.parser import Parser
 from .restic_store import ResticStore, repo_path
 from .tar_prune import prune_config_dir
 
+# Plugin recipients (age1yubikey1…, age1tpm1…) have another human-readable part, so a '1'/'b'/'i'/'o'
+# (not in the bech32 charset) follows the separator.
+_NATIVE_RECIPIENT = re.compile(r"age1[02-9ac-hj-np-z]+")
+
 
 def check_identity_matches(identity: str, recipient: str) -> str | None:
     """None when ``identity`` is the private half of ``recipient``, else why not.
 
-    Only native age recipients (``age1…``) can be compared; others (ssh keys, plugins) pass.
+    Only native age recipients (bech32 prefix exactly ``age``) can be compared; others (ssh keys, plugins) pass.
     """
-    if not recipient.startswith("age1"):
+    if not _NATIVE_RECIPIENT.fullmatch(recipient):
         return None
     if not os.path.isfile(identity):
         return f"identity file not found: {identity} (pass --identity <key file>)"
@@ -35,10 +40,11 @@ def check_identity_matches(identity: str, recipient: str) -> str | None:
         raise StoreError(f"could not run age-keygen: {exc}") from exc
     if done.returncode != 0:
         return f"{identity} is not a readable age identity: {done.stderr.decode('utf-8', 'replace').strip()}"
-    derived = done.stdout.decode("utf-8", "replace").strip()
-    if derived != recipient:
+    derived = {line.strip() for line in done.stdout.decode("utf-8", "replace").splitlines() if line.strip()}
+    if recipient not in derived:
         return (
-            f"{identity} is the key for {derived}, not {recipient}: the store would be unreadable with it. "
+            f"{identity} is the key for {', '.join(sorted(derived)) or 'nothing'}, not {recipient}: "
+            "the store would be unreadable with it. "
             "Pass the matching --identity or the right --encrypt-to."
         )
     return None

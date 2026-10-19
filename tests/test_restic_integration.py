@@ -191,7 +191,7 @@ def test_cli_export_from_the_store_decrypts_back_to_the_source(
 
 
 def test_cli_migrate_real_age_archives_then_delete_and_roundtrip(
-    tmp_path: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Real age + restic: two tar-mode .tar.gz.age archives migrate, re-run skips, delete, export == source."""
     from config_saver.lib.backup_manager.backup_manager import BackupManager
@@ -251,6 +251,18 @@ def test_cli_migrate_real_age_archives_then_delete_and_roundtrip(
     restored = next(restore.rglob("f.txt")).parent
     assert (restored / "f.txt").read_text() == "version 1\n"
     assert (restored / "blob.bin").read_bytes() == final_blob
-    before = [s.id for s in store.snapshots()]
-    assert CLI(["--prune", "--dry-run", "--identity", key]).run() == EXIT_OK
-    assert [s.id for s in store.snapshots()] == before
+
+    # Retention that drops everything but the newest: the dry run must LIST the older snapshot, change nothing...
+    prune_cfgs = tmp_path / "prune-cfgs"
+    prune_cfgs.mkdir()
+    write_config(
+        prune_cfgs / "my-cfg.yaml", [str(data)], retention={"daily": 0, "weekly": 0, "monthly": 0, "yearly": 0}
+    )
+    before = store.snapshots("my-cfg")
+    assert CLI(["--prune", "--dry-run", "-i", str(prune_cfgs), "--identity", key]).run() == EXIT_OK
+    listed = capsys.readouterr().out
+    assert f"2026-01-01 03:00:00 ({before[0].short_id})" in listed and "would remove 1" in listed
+    assert [s.id for s in store.snapshots("my-cfg")] == [s.id for s in before]
+    # ... and the real prune removes exactly that one.
+    assert CLI(["--prune", "-i", str(prune_cfgs), "--identity", key]).run() == EXIT_OK
+    assert [s.id for s in store.snapshots("my-cfg")] == [before[1].id]
