@@ -45,3 +45,7 @@ class IncompleteBackupError(ConfigSaverError):
     def __init__(self, missing: list[str]):
         self.missing = missing
         super().__init__(f"{len(missing)} configured path(s) were missing: " + ", ".join(missing))
+
+
+class StoreError(RuntimeError, ConfigSaverError):
+    """The restic-backed snapshot store is unusable, or restic/age refused to run."""

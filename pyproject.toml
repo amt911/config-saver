@@ -64,6 +64,7 @@ testpaths = ["tests"]
 addopts = "-q --strict-markers"
 markers = [
     "slow: tests that build wheels or walk large trees",
+    "restic: integration tests that need the real restic and age binaries",
 ]
 
 [tool.coverage.run]
