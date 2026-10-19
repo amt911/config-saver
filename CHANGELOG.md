@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-10-19
+
 ### Added
 
 - **`--compress` stores into a deduplicated restic repository** when `restic` and `age` are
