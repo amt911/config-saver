@@ -25,6 +25,13 @@ All notable changes to this project are documented here. The format follows
   configuration's `encrypt:` block, with no plaintext left behind on failure; archives not yet
   migrated are listed with a `tar` marker.
 
+- **`--restic-init --encrypt-to <age key>`** creates the store; **`--migrate [--delete-migrated]`**
+  moves existing `.tar.gz`/`.tar.gz.age` archives into it (original timestamps and descriptions,
+  idempotent, one progress line per archive, a closing `restic check`). An archive is deleted only
+  after `restic dump` of its snapshot hashes identically to its decompressed content; any doubt
+  keeps it. **`--prune [--dry-run] [--include-legacy]`** applies retention to every configuration
+  on demand.
+
 ### Fixed
 
 - `--include-system-configs` was dropped by batch (`--input DIR`) and `--description` runs; it is

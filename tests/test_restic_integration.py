@@ -188,3 +188,58 @@ def test_cli_export_from_the_store_decrypts_back_to_the_source(
     restored = next(restore.rglob("f.txt")).parent
     assert filecmp.dircmp(data, restored).diff_files == []
     assert (restored / "sub" / "b.bin").read_bytes() == (data / "sub" / "b.bin").read_bytes()
+
+
+def test_cli_migrate_real_age_archives_then_delete_and_roundtrip(
+    tmp_path: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real age + restic: two tar-mode .tar.gz.age archives migrate, re-run skips, delete, export == source."""
+    from config_saver.lib.backup_manager.backup_manager import BackupManager
+    from config_saver.lib.cli.cli import CLI, EXIT_OK
+    from config_saver.lib.models.encryption_model import EncryptionModel
+    from tests.conftest import write_config
+
+    monkeypatch.setenv("RESTIC_CACHE_DIR", str(tmp_path / "cache"))
+    key, recipient = _identity(tmp_path)
+    saves = fake_home / ".config" / "config-saver"
+
+    data = fake_home / "data"
+    data.mkdir()
+    cfg = write_config(tmp_path / "my-cfg.yaml", [str(data)])
+    encryption = EncryptionModel(method="age", recipients=[recipient])
+    manager = BackupManager(str(saves))
+    stamps = ["20260101-030000", "20260102-040506"]
+    for index, stamp in enumerate(stamps):
+        (data / "f.txt").write_text(f"version {index}\n")
+        (data / "blob.bin").write_bytes(os.urandom(2048))
+        manager.compress_config_to_timestamp_dir(
+            str(cfg), str(saves / "configs" / "my-cfg"), stamp, description=f"run {index}", encryption=encryption
+        )
+    final_blob = (data / "blob.bin").read_bytes()
+    archives = sorted((saves / "configs").rglob("*.tar.gz.age"))
+    assert len(archives) == 2
+
+    assert CLI(["--restic-init", "--encrypt-to", recipient, "--identity", key]).run() == EXIT_OK
+    store = ResticStore(str(saves))
+    assert CLI(["--migrate", "--identity", key]).run() == EXIT_OK
+    snaps = store.snapshots("my-cfg")
+    assert [s.time for s in snaps] == [datetime(2026, 1, 1, 3, 0, 0), datetime(2026, 1, 2, 4, 5, 6)]
+    assert [s.description for s in snaps] == ["run 0", "run 1"]
+    assert all(a.exists() for a in archives)  # nothing deleted without the flag
+
+    assert CLI(["--migrate", "--identity", key]).run() == EXIT_OK
+    assert len(store.snapshots("my-cfg")) == 2  # idempotent
+
+    assert CLI(["--migrate", "--delete-migrated", "--identity", key]).run() == EXIT_OK  # skipped ones verified
+    assert not list((saves / "configs").rglob("*.tar.gz.age"))
+    assert not (saves / "configs" / "my-cfg" / stamps[0]).exists()
+
+    export = tmp_path / "export.tar.gz"
+    assert CLI(["--export-config", "my-cfg", "--identity", key, "--output", str(export)]).run() == EXIT_OK
+    restore = tmp_path / "restore"
+    restore.mkdir()
+    assert CLI(["--decompress", "-i", str(export), "-o", str(restore)]).run() == EXIT_OK
+    restored = next(restore.rglob("f.txt")).parent
+    assert (restored / "f.txt").read_text() == "version 1\n"
+    assert (restored / "blob.bin").read_bytes() == final_blob
+    assert CLI(["--prune", "--dry-run", "--identity", key]).run() == EXIT_OK

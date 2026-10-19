@@ -856,3 +856,179 @@ def test_export_all_restic_includes_oddly_named_archives(
     dest = tmp_path / "exports"
     assert run(["--export-all-configs", "--output", str(dest)]) == EXIT_OK
     assert "odd.tar.gz" in [p.name for p in dest.iterdir()]
+
+
+# ----------------------------------------- --restic-init, --migrate, --prune
+
+
+class _MaintStore:
+    """A store with snapshots per config; records what forget/prune/init were asked."""
+
+    seed: list[Snapshot] = []
+    instances: list[_MaintStore] = []
+
+    def __init__(self, saves_dir: str, identity: str | None = None) -> None:
+        self.identity = identity or "/key"
+        self.forgets: list[tuple[str, object, bool]] = []
+        self.prunes = 0
+        self.inits: list[str] = []
+        _MaintStore.instances.append(self)
+
+    def init(self, recipient: str) -> None:
+        self.inits.append(recipient)
+
+    def snapshots(self, cfg=None):  # type: ignore[no-untyped-def]
+        return [s for s in _MaintStore.seed if cfg in (None, s.cfg)]
+
+    def forget(self, cfg, policy, dry_run, also_keep=()):  # type: ignore[no-untyped-def]
+        self.forgets.append((cfg, policy, dry_run))
+        return list(self.snapshots(cfg))[:-1]  # everything but the newest
+
+    def prune(self) -> None:
+        self.prunes += 1
+
+
+def _maint_mode(monkeypatch: pytest.MonkeyPatch, mode: StorageMode, *snaps: Snapshot) -> None:
+    _MaintStore.seed = list(snaps)
+    _MaintStore.instances = []
+    monkeypatch.setattr("config_saver.lib.cli.cli.select_mode", lambda _saves: mode)
+    monkeypatch.setattr("config_saver.lib.cli.cli.ResticStore", _MaintStore)
+
+
+def _snaps(cfg: str, n: int = 3) -> list[Snapshot]:
+    return [_snap(cfg, datetime(2026, 1, d, 3, 0, 0)) for d in range(1, n + 1)]
+
+
+def test_cli_restic_init_requires_encrypt_to(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _maint_mode(monkeypatch, StorageMode.TAR_NOT_INITIALISED)
+    assert run(["--restic-init"]) == EXIT_USAGE
+    assert run(["--restic-init", "--encrypt-to", "gpgkey", "--encrypt-method", "gpg"]) == EXIT_USAGE
+    assert run(["--restic-init", "--encrypt-to", "a", "--encrypt-to", "b"]) == EXIT_USAGE
+    assert all(not s.inits for s in _MaintStore.instances)
+
+
+def test_cli_restic_init_creates_store_and_warns_about_the_key(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _maint_mode(monkeypatch, StorageMode.TAR_NOT_INITIALISED)
+    assert run(["--restic-init", "--encrypt-to", "age1abc", "--identity", "/k"]) == EXIT_OK
+    assert _MaintStore.instances[-1].inits == ["age1abc"]
+    assert "only thing" in capsys.readouterr().out.lower()
+
+
+def test_cli_modifier_flags_need_their_verb(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _maint_mode(monkeypatch, StorageMode.RESTIC)
+    assert run(["--list", "--delete-migrated"]) == EXIT_USAGE
+    assert run(["--list", "--dry-run"]) == EXIT_USAGE
+    assert run(["--migrate", "--dry-run"]) == EXIT_USAGE
+    assert run(["--prune", "--delete-migrated"]) == EXIT_USAGE
+
+
+@pytest.mark.parametrize("mode", [StorageMode.TAR_NO_RESTIC, StorageMode.TAR_NOT_INITIALISED])
+def test_cli_migrate_in_tar_mode_is_usage_with_the_notice(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], mode: StorageMode
+) -> None:
+    _maint_mode(monkeypatch, mode)
+    assert run(["--migrate"]) == EXIT_USAGE
+    assert NOTICES[mode] in capsys.readouterr().out
+
+
+def _migration(monkeypatch: pytest.MonkeyPatch, **fields: object) -> list[tuple[object, ...]]:
+    from config_saver.lib.migrate import MigrationReport
+
+    calls: list[tuple[object, ...]] = []
+
+    def fake(manager, store, identity, delete, progress=None):  # type: ignore[no-untyped-def]
+        calls.append((identity, delete))
+        return MigrationReport(**fields)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("config_saver.lib.cli.cli.migrate_archives", fake)
+    return calls
+
+
+def test_cli_migrate_exit_codes_and_flags(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _maint_mode(monkeypatch, StorageMode.RESTIC)
+    calls = _migration(monkeypatch, migrated=["a"])
+    assert run(["--migrate", "--identity", "/k", "--delete-migrated"]) == EXIT_OK
+    assert calls == [("/k", True)]
+    _migration(monkeypatch, migrated=["a"], failed=[("b", "boom")])
+    assert run(["--migrate"]) == EXIT_RUNTIME
+    _migration(monkeypatch, migrated=["a"], check_error="bad pack")
+    assert run(["--migrate"]) == EXIT_RUNTIME
+
+
+def test_cli_prune_dry_run_deletes_nothing(
+    tmp_path: Path, data_dir: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _maint_mode(monkeypatch, StorageMode.RESTIC, *_snaps("one"))
+    cfg_dir = _cfg_dir(tmp_path, data_dir)
+    assert run(["--prune", "--dry-run", "-i", str(cfg_dir)]) == EXIT_OK
+    store = _MaintStore.instances[-1]
+    assert store.forgets and all(dry for _, _, dry in store.forgets) and store.prunes == 0
+    out = capsys.readouterr().out
+    assert "would remove 2" in out and "Total" in out
+
+
+def test_cli_prune_skips_legacy_by_default(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _maint_mode(monkeypatch, StorageMode.RESTIC, *_snaps("legacy"), *_snaps("kept"))
+    cfg_dir = fake_home / "empty-cfgs"
+    cfg_dir.mkdir()
+    write_config(cfg_dir / "kept.yaml", [str(fake_home)])
+    assert run(["--prune", "-i", str(cfg_dir)]) == EXIT_OK
+    store = _MaintStore.instances[-1]
+    assert [c for c, _, _ in store.forgets] == ["kept"] and store.prunes == 1
+    assert run(["--prune", "--include-legacy", "-i", str(cfg_dir)]) == EXIT_OK
+    assert sorted(c for c, _, _ in _MaintStore.instances[-1].forgets) == ["kept", "legacy"]
+
+
+def test_cli_prune_restic_uses_block_for_configured_and_defaults_for_orphans(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from config_saver.lib.models.retention_model import RetentionModel
+
+    _maint_mode(monkeypatch, StorageMode.RESTIC, *_snaps("mine"), *_snaps("gone"))
+    cfg_dir = fake_home / "cfgs"
+    cfg_dir.mkdir()
+    write_config(
+        cfg_dir / "mine.yaml", [str(fake_home)], retention={"daily": 1, "weekly": 0, "monthly": 0, "yearly": 0}
+    )
+    assert run(["--prune", "-i", str(cfg_dir)]) == EXIT_OK
+    policies = {c: p for c, p, _ in _MaintStore.instances[-1].forgets}
+    assert policies["mine"] == RetentionModel(daily=1, weekly=0, monthly=0, yearly=0)
+    assert policies["gone"] == RetentionModel()
+    assert "no configuration file" in capsys.readouterr().out
+
+
+def _tar_stamps(saves: Path, name: str, days: int = 3) -> list[Path]:
+    dirs = []
+    for day in range(1, days + 1):
+        stamp = saves / "configs" / name / f"2026010{day}-000000"
+        stamp.mkdir(parents=True)
+        (stamp / f"{name}.tar.gz").write_bytes(b"x")
+        dirs.append(stamp)
+    return dirs
+
+
+def test_cli_prune_tar_mode_explicit_retention_only(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _maint_mode(monkeypatch, StorageMode.TAR_NOT_INITIALISED)
+    saves = fake_home / ".config" / "config-saver"
+    cfg_dir = fake_home / "cfgs"
+    cfg_dir.mkdir()
+    write_config(
+        cfg_dir / "with.yaml", [str(fake_home)], retention={"daily": 1, "weekly": 0, "monthly": 0, "yearly": 0}
+    )
+    write_config(cfg_dir / "without.yaml", [str(fake_home)])
+    with_dirs = _tar_stamps(saves, "with")
+    without_dirs = _tar_stamps(saves, "without")
+    _tar_stamps(saves, "orphan")
+
+    assert run(["--prune", "--dry-run", "-i", str(cfg_dir)]) == EXIT_OK
+    assert all(d.exists() for d in with_dirs)
+
+    assert run(["--prune", "-i", str(cfg_dir)]) == EXIT_OK
+    assert [d.exists() for d in with_dirs] == [False, False, True]
+    assert all(d.exists() for d in without_dirs)
+    assert len(list((saves / "configs" / "orphan").iterdir())) == 3
+    assert "Total" in capsys.readouterr().out

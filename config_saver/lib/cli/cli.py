@@ -26,14 +26,17 @@ from rich.table import Table
 
 from config_saver import __version__
 from config_saver.lib import crypto, paths
-from config_saver.lib.backup_manager.backup_manager import BackupManager, BatchResult, PruneReport
+from config_saver.lib.archive_names import FILENAME_PATTERN
+from config_saver.lib.backup_manager.backup_manager import LEGACY_NAME, BackupManager, BatchResult, PruneReport
 from config_saver.lib.errors import ArchiveError, EncryptionError, RootRequiredError, StoreError, UnsafeArchiveError
+from config_saver.lib.migrate import MigrationReport, migrate_archives
 from config_saver.lib.models.encryption_model import EncryptionModel
+from config_saver.lib.models.retention_model import RetentionModel
 from config_saver.lib.parser.parser import Parser
-from config_saver.lib.restic_store import NOTICES, ResticStore, Snapshot, StorageMode, select_mode
+from config_saver.lib.restic_store import NOTICES, ResticStore, Snapshot, StorageMode, repo_path, select_mode
 from config_saver.lib.tar_compressor.tar_compressor import CompressResult
 from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
-from config_saver.lib.tar_prune import TIMESTAMP_FORMAT
+from config_saver.lib.tar_prune import TIMESTAMP_FORMAT, prune_config_dir
 
 init(autoreset=True)
 
@@ -48,9 +51,6 @@ EXIT_NO_SUCH_CONFIG = 7
 EXIT_INCOMPLETE = 8
 EXIT_ENCRYPTION = 9
 EXIT_IO = 10
-
-# Matches <name>-YYYYMMDD-HHMMSS.tar.gz, optionally encrypted (.age / .gpg)
-FILENAME_PATTERN = re.compile(r"(.+)-(\d{8}-\d{6})\.tar\.gz(?:\.age|\.gpg)?$")
 
 
 class BackupTable:
@@ -184,6 +184,34 @@ class CLI:
             "--show-configs",
             action="store_true",
             help="Show available configuration names",
+        )
+        group.add_argument(
+            "--restic-init",
+            action="store_true",
+            help="Create the deduplicated restic store (needs --encrypt-to <age recipient>)",
+        )
+        group.add_argument(
+            "--migrate",
+            action="store_true",
+            help="Move existing tar archives into the restic store (see --delete-migrated)",
+        )
+        group.add_argument(
+            "--prune",
+            action="store_true",
+            help="Apply retention to every configuration now (see --dry-run, --include-legacy)",
+        )
+        parser.add_argument(
+            "--delete-migrated",
+            action="store_true",
+            help="With --migrate: delete each archive once its snapshot is verified byte for byte",
+        )
+        parser.add_argument(
+            "--dry-run", action="store_true", help="With --prune: show what would be removed, delete nothing"
+        )
+        parser.add_argument(
+            "--include-legacy",
+            action="store_true",
+            help="With --prune: also prune the migrated top-level archives (config 'legacy')",
         )
         parser.add_argument(
             "--input",
@@ -454,7 +482,20 @@ class CLI:
             print(Fore.RED + f"I/O error: {e}")
             return EXIT_IO
 
+    @staticmethod
+    def _misplaced_modifier(args: argparse.Namespace) -> str | None:
+        """A modifier flag given without the verb it modifies (silently ignoring it would mislead)."""
+        if args.delete_migrated and not args.migrate:
+            return "--delete-migrated only applies to --migrate."
+        if (args.dry_run or args.include_legacy) and not args.prune:
+            return "--dry-run and --include-legacy only apply to --prune."
+        return None
+
     def _dispatch(self, args: argparse.Namespace) -> int:
+        misplaced = self._misplaced_modifier(args)
+        if misplaced:
+            print(Fore.RED + misplaced)
+            return EXIT_USAGE
         manager = BackupManager()
         saves_dir = manager.ensure_saves_dir()
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -475,6 +516,12 @@ class CLI:
                 return self._export_all_configs(manager, args)
             BackupTable(saves_dir).render(store.snapshots() if store is not None else None)
             return EXIT_OK
+        if args.restic_init:
+            return self._restic_init(args, saves_dir)
+        if args.migrate:
+            return self._migrate(manager, args, saves_dir)
+        if args.prune:
+            return self._prune(manager, args, saves_dir)
         if args.compress:
             return self._compress(manager, args, saves_dir, timestamp)
         if args.decompress:
@@ -715,6 +762,138 @@ class CLI:
         if plain:
             print(Fore.YELLOW + "Note: archives are not encrypted and may contain secrets.")
         return exit_code
+
+    # ------------------------------------------- store setup, migration, manual prune
+
+    def _restic_init(self, args: argparse.Namespace, saves_dir: str) -> int:
+        if not args.encrypt_to:
+            print(Fore.RED + "--restic-init needs --encrypt-to <age recipient>: the store password is encrypted to it.")
+            return EXIT_USAGE
+        if (args.encrypt_method or "age") != "age":
+            print(Fore.RED + "The restic store is encrypted with age: --encrypt-method gpg cannot be used here.")
+            return EXIT_USAGE
+        if len(args.encrypt_to) != 1:
+            print(Fore.RED + "--restic-init takes exactly one --encrypt-to recipient.")
+            return EXIT_USAGE
+        store = ResticStore(saves_dir, args.identity)
+        store.init(args.encrypt_to[0])
+        print(Fore.GREEN + f"Created the restic store in {saves_dir}.")
+        print(
+            Fore.YELLOW + "The age private key is now the only thing needed to read this store (the repository "
+            f"password is encrypted to it). Keep a copy of {store.identity} off this machine: without it "
+            "every backup in the store is unreadable."
+        )
+        return EXIT_OK
+
+    @staticmethod
+    def _store_size(saves_dir: str) -> int:
+        total = 0
+        for root, _dirs, files in os.walk(repo_path(saves_dir)):
+            for name in files:
+                with contextlib.suppress(OSError):
+                    total += os.path.getsize(os.path.join(root, name))
+        return total
+
+    @staticmethod
+    def _print_migration(report: MigrationReport, saves_dir: str) -> None:
+        print(
+            f"Migrated {len(report.migrated)}, already in the store {len(report.skipped)}, "
+            f"failed {len(report.failed)}, deleted {len(report.deleted)} archive(s)."
+        )
+        print(
+            f"Archives before: {report.bytes_before / 1e6:.1f} MB; "
+            f"restic store now: {CLI._store_size(saves_dir) / 1e6:.1f} MB."
+        )
+        for path, reason in report.failed:
+            print(Fore.RED + f"  failed: {path}: {reason} (kept)")
+        if report.check_error:
+            print(Fore.RED + f"restic check failed: {report.check_error}")
+
+    def _migrate(self, manager: BackupManager, args: argparse.Namespace, saves_dir: str) -> int:
+        mode = select_mode(saves_dir)
+        if mode is not StorageMode.RESTIC:
+            print(Fore.RED + "--migrate needs an initialised restic store.")
+            print(Fore.YELLOW + NOTICES[mode])
+            return EXIT_USAGE
+        store = ResticStore(saves_dir, args.identity)
+
+        def progress(line: str) -> None:
+            print((Fore.RED if "FAILED" in line else Fore.CYAN) + line, flush=True)
+
+        report = migrate_archives(manager, store, args.identity, args.delete_migrated, progress=progress)
+        self._print_migration(report, saves_dir)
+        if not args.delete_migrated and report.migrated:
+            print(Fore.YELLOW + "Nothing was deleted. Re-run with --delete-migrated to remove the verified archives.")
+        return EXIT_RUNTIME if report.failed or report.check_error else EXIT_OK
+
+    @staticmethod
+    def _retention_by_config(
+        manager: BackupManager, args: argparse.Namespace
+    ) -> tuple[dict[str, RetentionModel | None], dict[str, str]]:
+        """name -> its ``retention:`` (None when absent) for every configuration found; plus unreadable ones."""
+        known: dict[str, RetentionModel | None] = {}
+        errors: dict[str, str] = {}
+        paths_by_name: dict[str, str] = {}
+        for entry in args.input or default_config_dirs():
+            found = manager.find_config_files(entry) if os.path.isdir(entry) else [entry]
+            for path in found:
+                paths_by_name[os.path.splitext(os.path.basename(path))[0]] = path  # later levels override earlier
+        for name, path in sorted(paths_by_name.items()):
+            try:
+                known[name] = Parser(path).get_model().retention
+            except (ValidationError, OSError, ValueError) as exc:
+                errors[name] = f"cannot read {path}: {exc}"
+        return known, errors
+
+    def _prune(self, manager: BackupManager, args: argparse.Namespace, saves_dir: str) -> int:
+        mode = select_mode(saves_dir)
+        store = ResticStore(saves_dir, args.identity) if mode is StorageMode.RESTIC else None
+        known, errors = self._retention_by_config(manager, args)
+        verb = "would remove" if args.dry_run else "removed"
+        total = 0
+        failed = bool(errors)
+        for name, reason in errors.items():
+            print(Fore.RED + f"[{name}] {reason}")
+
+        if store is not None:
+            names = sorted({s.cfg for s in store.snapshots()})
+        else:
+            configs_root = os.path.join(saves_dir, "configs")
+            names = sorted(os.listdir(configs_root)) if os.path.isdir(configs_root) else []
+
+        for cfg in names:
+            if cfg == LEGACY_NAME and not args.include_legacy:
+                print(Fore.YELLOW + f"[{cfg}] skipped (pass --include-legacy to prune it).")
+                continue
+            if cfg in errors:
+                continue
+            retention = known.get(cfg)
+            try:
+                if store is not None:
+                    if cfg not in known:
+                        print(Fore.YELLOW + f"[{cfg}] no configuration file found: the default retention applies.")
+                    removed = [s.short_id for s in store.forget(cfg, retention or RetentionModel(), args.dry_run)]
+                elif retention is not None:
+                    removed = prune_config_dir(os.path.join(saves_dir, "configs", cfg), retention, args.dry_run)
+                else:
+                    why = "no retention: block" if cfg in known else "no configuration file"
+                    print(Fore.YELLOW + f"[{cfg}] left alone: {why} (archive mode only prunes explicit retention).")
+                    continue
+            except (StoreError, OSError) as exc:
+                print(Fore.RED + f"[{cfg}] could not prune: {exc}")
+                failed = True
+                continue
+            if removed:
+                print(Fore.CYAN + f"[{cfg}] {verb} {len(removed)} backup(s).")
+                total += len(removed)
+        if store is not None and total and not args.dry_run:
+            try:
+                store.prune()
+            except StoreError as exc:
+                print(Fore.RED + f"could not reclaim space (restic prune): {exc}")
+                failed = True
+        print(f"Total: {total} backup(s) {verb}.")
+        return EXIT_RUNTIME if failed else EXIT_OK
 
     def _compress(
         self,

@@ -189,6 +189,7 @@ config-saver --compress
 `--export-config`/`-e NAME`: Export the latest config archive by name
 `--export-all-configs`: Export the latest archive for every saved configuration
 `--show-configs`: Show available configuration names
+`--restic-init`: Create the restic store (needs one age `--encrypt-to`); `--migrate [--delete-migrated]`: move existing archives into it; `--prune [--dry-run] [--include-legacy]`: apply retention now. See [Migrating existing backups](#migrating-existing-backups)
 `--input`/`-i PATH`: Input YAML/JSON config **or config directory** (for compress) or tar file (for decompress). **Repeatable** when every value is a directory, to combine the system configs with your own. Defaults to `/etc/config-saver/configs`, falling back to the examples shipped with a pip install (`<prefix>/share/config-saver/configs`)
 `--output`/`-o OUTPUT`: Output tar file (for compress), extraction directory (for decompress), or destination directory (for export-all-configs)
 - `--progress`/`-P`: Show progress bar during compression/decompression
@@ -270,6 +271,41 @@ data costs next to nothing.
   removed on every path, failures included. An archive newer than the newest snapshot is copied as
   before. Pass `--identity` if your age key is not the default one.
 - `--include-system-configs` and `exclude:` behave the same in both modes.
+
+### Migrating existing backups
+
+Your history of `.tar.gz` / `.tar.gz.age` archives moves into the store with its original
+timestamps and descriptions; nothing is deleted unless you ask.
+
+```sh
+config-saver --restic-init --encrypt-to <age public key>   # once; add --identity <key> if not ~/.config/age/key.txt
+config-saver --migrate                                     # copy every archive into the store, oldest first
+config-saver --migrate --delete-migrated                   # re-run: delete each archive that is verified
+```
+
+- **Back up the age private key off this machine first.** After `--restic-init` that key is the
+  only secret needed to read the whole store (the repository password is encrypted to it); lose it
+  and every backup is unreadable.
+- Encrypted archives are decrypted into a pipe, never to a temp file; the key is `--identity` if
+  given, else the store's own. An archive that cannot be decrypted is reported as failed and the
+  rest continue. Top-level `config-saver-<ts>.tar.gz*` archives become the configuration `legacy`.
+- It is **idempotent**: an archive whose configuration and time are already in the store is skipped,
+  so an interrupted run is simply re-run. One progress line is printed per archive, then a summary
+  and a `restic check`.
+- **`--delete-migrated` deletes an archive (with its `description.txt` and then its empty
+  timestamp directory) only after `restic dump` of its snapshot hashes (sha256) identically to the
+  decompressed archive.** Already-migrated archives are verified the same way before they are
+  deleted. Any mismatch, restic error or failed decrypt keeps the archive and exits `5`.
+- `--migrate` needs an initialised store (exit `6` with the setup notice otherwise).
+
+### Pruning by hand
+
+`config-saver --prune [--dry-run] [--include-legacy] [--input DIR]` applies retention to every
+configuration now. With the store, a configuration without a `retention:` block, and a snapshot
+whose configuration file no longer exists, get the defaults; `legacy` is skipped unless
+`--include-legacy`. Archive mode prunes only configurations with an explicit `retention:`. It prints
+what was (or with `--dry-run`, would be) removed per configuration and a total; `--dry-run` deletes
+nothing.
 
 ## Retention
 

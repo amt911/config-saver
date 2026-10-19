@@ -404,3 +404,7 @@ class ResticStore:
     def prune(self) -> None:
         """Reclaim the space of forgotten snapshots."""
         self._run(["prune"])
+
+    def check(self) -> None:
+        """Verify the repository structure (``restic check``); StoreError when it is not sound."""
+        self._run(["check"])

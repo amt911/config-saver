@@ -3,6 +3,15 @@
 Non-obvious things that cost time and are not deducible from the code. Add an entry when you hit
 one; keep each entry short and dated.
 
+## 2026-10-19 — migration: a failed decrypt surfaces as "Not a gzipped file"
+
+When `age -d` fails (wrong identity), its stdout is empty, so `gzip` raises `BadGzipFile`/`EOFError`
+before anyone looks at the exit status, and the real cause (age's stderr) is lost. `migrate._plain_tar`
+waits briefly for the child on any error and, if it exited non-zero by itself, raises an
+`EncryptionError` carrying age's own message. Also: the decrypt child's exit status is checked
+*inside* the restic stdin writer, so a truncated or failed decrypt aborts restic (killed before it
+commits) instead of storing a short snapshot that a later hash check would have to catch.
+
 ## 2026-08-19 — the pre-push pytest hook runs whatever `python` is on PATH
 
 The `pytest` hook in `.pre-commit-config.yaml` is `language: system` with
