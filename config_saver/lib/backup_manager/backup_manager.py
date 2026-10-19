@@ -13,25 +13,29 @@ import glob
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 
-from config_saver.lib import crypto
-from config_saver.lib.errors import RootRequiredError
+from config_saver.lib.archive_names import LEGACY_NAME
+from config_saver.lib.errors import RootRequiredError, StoreError
 from config_saver.lib.models.encryption_model import EncryptionModel
+from config_saver.lib.models.model import Model
+from config_saver.lib.models.retention_model import RetentionModel
 from config_saver.lib.parser.parser import Parser
+from config_saver.lib.restic_store import ResticStore, Snapshot
 from config_saver.lib.tar_compressor.tar_compressor import (
     ARCHIVE_MODE,
     CompressResult,
     TarCompressor,
 )
+from config_saver.lib.tar_prune import ARCHIVE_GLOBS, TIMESTAMP_FORMAT, has_archives, prune_config_dir
 
 # Backups contain secrets; their directories are private by construction.
 PRIVATE_DIR_MODE = 0o700
 
+# LEGACY_NAME (see archive_names) is reserved for migrated pre-store archives: never pruned automatically.
+
 # Config files accepted in directory (batch) mode. YAML parsing also accepts JSON.
 CONFIG_GLOBS = ("*.yaml", "*.yml", "*.json")
-
-# Archive names, plain and encrypted.
-ARCHIVE_GLOBS = ("*.tar.gz", *(f"*.tar.gz{suffix}" for suffix in crypto.SUFFIXES.values()))
 
 
 @dataclass
@@ -43,10 +47,23 @@ class ConfigOutcome:
     result: CompressResult | None = None
     skipped_root_only: bool = False
     error: str | None = None
+    # Set instead of archive_path when the backup went into the restic store.
+    snapshot: Snapshot | None = None
+    # What pruning removed for this config afterwards (paths in tar mode, snapshot ids in restic mode).
+    pruned: list[str] = field(default_factory=list)
 
     @property
     def name(self) -> str:
         return os.path.splitext(os.path.basename(self.config_path))[0]
+
+
+@dataclass
+class PruneReport:
+    """What automatic pruning did after a batch: removals per config, and errors."""
+
+    removed: dict[str, list[str]] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+    deferred: list[str] = field(default_factory=list)  # restic mode: archives still await migration
 
 
 @dataclass
@@ -115,27 +132,66 @@ def _chmod_private(path: str) -> None:
         pass
 
 
-def _compress_job(
-    job: tuple[str, str, str, str | None, bool, EncryptionModel | None, tuple[str, ...]],
-) -> ConfigOutcome:
+def _own_stamp(outcome: ConfigOutcome) -> list[datetime]:
+    """The timestamp of the directory this run just wrote, parsed from its name."""
+    if not outcome.archive_path:
+        return []
+    name = os.path.basename(os.path.dirname(outcome.archive_path))
+    try:
+        return [datetime.strptime(name, TIMESTAMP_FORMAT)]
+    except ValueError:
+        return []
+
+
+def _describe(exc: Exception) -> str:
+    """A store error already reads as a sentence; anything else needs its type."""
+    return str(exc) if isinstance(exc, StoreError) else f"{type(exc).__name__}: {exc}"
+
+
+@dataclass(frozen=True)
+class _CompressJob:
+    """One configuration to compress. Plain fields only: it is pickled to pool workers."""
+
+    config_path: str
+    dest_dir: str
+    archive_name: str
+    description: str | None
+    show_progress: bool
+    encryption: EncryptionModel | None
+    extra_directories: tuple[str, ...]
+    store: ResticStore | None = None
+    when: datetime | None = None
+
+
+def _compress_job(job: _CompressJob) -> ConfigOutcome:
     """Compress one configuration. Top-level so ProcessPoolExecutor can pickle it."""
-    config_path, dest_dir, archive_name, description, show_progress, encryption, extra_directories = job
-    outcome = ConfigOutcome(config_path=config_path)
+    outcome = ConfigOutcome(config_path=job.config_path)
     try:
         manager = BackupManager()
-        outcome.archive_path, outcome.result = manager.compress_config_to_directory(
-            config_path,
-            dest_dir,
-            archive_name,
-            description=description,
-            show_progress=show_progress,
-            encryption=encryption,
-            extra_directories=extra_directories,
-        )
+        if job.store is not None:
+            assert job.when is not None
+            outcome.snapshot, outcome.result = manager.compress_config_to_store(
+                job.config_path,
+                job.store,
+                job.when,
+                description=job.description,
+                show_progress=job.show_progress,
+                extra_directories=job.extra_directories,
+            )
+        else:
+            outcome.archive_path, outcome.result = manager.compress_config_to_directory(
+                job.config_path,
+                job.dest_dir,
+                job.archive_name,
+                description=job.description,
+                show_progress=job.show_progress,
+                encryption=job.encryption,
+                extra_directories=job.extra_directories,
+            )
     except RootRequiredError:
         outcome.skipped_root_only = True
     except Exception as exc:  # reported per config; the batch keeps going
-        outcome.error = f"{type(exc).__name__}: {exc}"
+        outcome.error = _describe(exc)
     return outcome
 
 
@@ -194,17 +250,47 @@ class BackupManager:
         what --encrypt-to does. `extra_directories` are appended to every
         configuration, which is how --include-system-configs works.
         """
+        parser, model = self._load_model(config_path, encryption, extra_directories)
+        compressor = TarCompressor(model, out_path, show_progress=show_progress)
+        result = compressor.compress()
+        # A placeholder that matched nothing never becomes a path; report it as missing.
+        result.missing_inputs.extend(parser.unresolved_paths)
+        return result
+
+    @staticmethod
+    def _load_model(
+        config_path: str,
+        encryption: EncryptionModel | None,
+        extra_directories: tuple[str, ...],
+    ) -> tuple[Parser, Model]:
         parser = Parser(config_path)
         model = parser.get_model()
         if encryption is not None:
             model = model.model_copy(update={"encrypt": encryption})
         if extra_directories:
             model = model.model_copy(update={"directories": [*model.directories, *extra_directories]})
-        compressor = TarCompressor(model, out_path, show_progress=show_progress)
-        result = compressor.compress()
-        # A placeholder that matched nothing never becomes a path; report it as missing.
+        return parser, model
+
+    def compress_config_to_store(
+        self,
+        config_path: str,
+        store: ResticStore,
+        when: datetime,
+        description: str | None = None,
+        show_progress: bool = False,
+        extra_directories: tuple[str, ...] = (),
+    ) -> tuple[Snapshot, CompressResult]:
+        """Stream a configuration's tar into the restic store, tagged with its name.
+
+        ``encrypt:`` is ignored here: the store is always encrypted (see
+        ``TarCompressor.compress_to_stream``).
+        """
+        parser, model = self._load_model(config_path, None, extra_directories)
+        compressor = TarCompressor(model, "", show_progress=show_progress)
+        name = os.path.splitext(os.path.basename(config_path))[0]
+        snapshot, result, _added = store.backup(compressor.compress_to_stream, name, when, description)
         result.missing_inputs.extend(parser.unresolved_paths)
-        return result
+        return snapshot, result
 
     # Backwards-compatible alias (the tool advertises JSON support too).
     compress_yaml_file = compress_config_file
@@ -227,7 +313,21 @@ class BackupManager:
         _ensure_private_dir(dest_dir)
 
         out_path = os.path.join(dest_dir, archive_name)
-        result = self.compress_config_file(config_path, out_path, show_progress=show_progress, encryption=encryption)
+        try:
+            result = self.compress_config_file(
+                config_path,
+                out_path,
+                show_progress=show_progress,
+                encryption=encryption,
+                extra_directories=extra_directories,
+            )
+        except BaseException:
+            # A failed run must not leave an empty timestamp directory that looks like a backup.
+            try:
+                os.rmdir(dest_dir)
+            except OSError:  # not empty (or gone): leave it
+                pass
+            raise
         # Encryption appends a suffix, so the real path comes from the result.
         out_path = result.output_path
 
@@ -260,6 +360,8 @@ class BackupManager:
             archive_name,
             description=description,
             show_progress=show_progress,
+            encryption=encryption,
+            extra_directories=extra_directories,
         )
 
     # Backwards-compatible alias.
@@ -296,6 +398,7 @@ class BackupManager:
         jobs: int = 1,
         encryption: EncryptionModel | None = None,
         extra_directories: tuple[str, ...] = (),
+        store: ResticStore | None = None,
     ) -> BatchResult:
         """Compress each configuration inside input_dir into its own archive.
 
@@ -317,6 +420,7 @@ class BackupManager:
             jobs=jobs,
             encryption=encryption,
             extra_directories=extra_directories,
+            store=store,
         )
 
     def compress_config_files(
@@ -328,12 +432,17 @@ class BackupManager:
         jobs: int = 1,
         encryption: EncryptionModel | None = None,
         extra_directories: tuple[str, ...] = (),
+        store: ResticStore | None = None,
     ) -> BatchResult:
         """Compress an explicit list of configurations, one archive each.
 
         Directory mode is one caller; another is a command line naming several
         configuration directories (a system one plus your own), which is why the
         list is passed in rather than discovered here.
+
+        With a ``store`` each configuration becomes a snapshot in the restic
+        repository (stamped with ``timestamp``, the same clock tar mode uses for
+        its directory names) instead of a .tar.gz.
         """
         # More workers than configurations buys nothing, and a process pool for a
         # single configuration is measurably slower than doing it here.
@@ -341,13 +450,24 @@ class BackupManager:
 
         self.ensure_saves_dir()
 
-        jobs_spec: list[tuple[str, str, str, str | None, bool, EncryptionModel | None, tuple[str, ...]]] = []
+        when = datetime.strptime(timestamp, TIMESTAMP_FORMAT) if store is not None else None
+        jobs_spec: list[_CompressJob] = []
         for cfg in cfg_files:
             cfg_basename = os.path.splitext(os.path.basename(cfg))[0]
             ts_dir = os.path.join(self.saves_dir, "configs", cfg_basename, timestamp)
             archive_name = f"{cfg_basename}-{timestamp}.tar.gz"
             jobs_spec.append(
-                (cfg, ts_dir, archive_name, description, show_progress and jobs == 1, encryption, extra_directories)
+                _CompressJob(
+                    cfg,
+                    ts_dir,
+                    archive_name,
+                    description,
+                    show_progress and jobs == 1,
+                    encryption,
+                    extra_directories,
+                    store=store,
+                    when=when,
+                )
             )
 
         if jobs > 1:
@@ -366,3 +486,48 @@ class BackupManager:
 
     # Backwards-compatible alias.
     compress_directory_of_yamls = compress_directory_of_configs
+
+    def prune_after_batch(self, batch: BatchResult, store: ResticStore | None) -> PruneReport:
+        """Apply retention to the configs this batch just produced.
+
+        Only configs whose job succeeded are touched, and a failure here never
+        changes the outcome of a backup: it lands in ``PruneReport.errors``.
+        Restic mode: ``forget`` per config with its ``retention:`` (or the
+        defaults), then one ``prune`` if anything was forgotten. Tar mode: only
+        configs that declare ``retention:`` explicitly; without a block nothing
+        is deleted, so an upgrade never removes history nobody asked to prune.
+        """
+        report = PruneReport()
+        for outcome in batch.outcomes:
+            if outcome.error or outcome.skipped_root_only or outcome.result is None:
+                continue
+            if outcome.name == LEGACY_NAME:
+                continue  # reserved for migrated top-level archives; only a manual prune names it
+            if store is not None and has_archives(os.path.join(self.saves_dir, "configs", outcome.name)):
+                # Migration is unfinished: pruning now would forget snapshots that
+                # `--migrate` would only copy in again.
+                report.deferred.append(outcome.name)
+                continue
+            try:
+                retention = Parser(outcome.config_path).get_model().retention
+                if store is not None:
+                    own = [outcome.snapshot.time] if outcome.snapshot else []
+                    forgotten = store.forget(outcome.name, retention or RetentionModel(), False, also_keep=own)
+                    removed = [s.short_id for s in forgotten]
+                elif retention is not None:
+                    cfg_dir = os.path.join(self.saves_dir, "configs", outcome.name)
+                    removed = prune_config_dir(cfg_dir, retention, dry_run=False, also_keep=_own_stamp(outcome))
+                else:
+                    continue
+            except Exception as exc:  # one config's failure must not stop the others
+                report.errors.append(f"[{outcome.name}] could not prune: {_describe(exc)}")
+                continue
+            if removed:
+                outcome.pruned = removed
+                report.removed[outcome.name] = removed
+        if store is not None and report.removed:
+            try:
+                store.prune()
+            except Exception as exc:
+                report.errors.append(f"could not reclaim space (restic prune): {_describe(exc)}")
+        return report

@@ -3,6 +3,7 @@
 from pydantic import BaseModel, ConfigDict, Field
 
 from .encryption_model import EncryptionModel
+from .retention_model import RetentionModel
 from .specific_files_model import SpecificFilesModel
 
 
@@ -30,4 +31,8 @@ class Model(BaseModel):
     encrypt: EncryptionModel | None = Field(
         default=None,
         description="Encrypt the resulting archive with age or gpg (a .tar.gz is not confidential)",
+    )
+    retention: RetentionModel | None = Field(
+        default=None,
+        description="How many backups to keep per day/week/month/year when pruning",
     )

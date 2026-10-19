@@ -375,6 +375,69 @@ class TarCompressor:
         info.mode = 0o600
         tar.addfile(info, io.BytesIO(payload))
 
+    def _with_progress(
+        self, items: Iterable[tuple[str, str, bool]]
+    ) -> tuple[Iterable[tuple[str, str, bool]], Callable[[str], None]]:
+        """Attach the progress bar when requested; return the items and the emitter."""
+        if not self.show_progress:
+            return items, _no_emit
+        from tqdm import tqdm  # imported lazily: only needed for the progress bar
+
+        # Materialise the list only when a total is actually needed; in headless
+        # mode the generator keeps startup latency and memory flat.
+        return tqdm(list(items), desc="Compressing files", unit="file"), tqdm.write
+
+    def _write_members(
+        self,
+        tar: tarfile.TarFile,
+        items: Iterable[tuple[str, str, bool]],
+        result: CompressResult,
+        emit: Callable[[str], None],
+    ) -> None:
+        """Add every collected entry to ``tar`` (shared by file and stream output)."""
+        for path, arcname, is_dir in items:
+            # Skip root-owned files if only_root_user is false and current user is not root
+            if not self.yaml_data.only_root_user and self.current_uid != 0 and self._is_root_owned(path):
+                emit(f"Skipping root-owned file (only_root_user=false): {path}")
+                result.skipped_root_owned.append(path)
+                continue
+
+            if is_dir:
+                tar.add(path, arcname=arcname, recursive=False)
+                result.added += 1
+                continue
+
+            normalized = None
+            if self.yaml_data.normalize_content:
+                normalized = self._normalized_stream(path)
+
+            if normalized is not None:
+                stream, size = normalized
+                emit(f"Compressing (normalized): {path} -> {arcname}")
+                tarinfo = tar.gettarinfo(path, arcname=arcname)
+                tarinfo.size = size
+                with stream:
+                    tar.addfile(tarinfo, fileobj=stream)
+            else:
+                emit(f"Compressing: {path} -> {arcname}")
+                tar.add(path, arcname=arcname)
+            result.added += 1
+
+    def compress_to_stream(self, fileobj: IO[bytes]) -> CompressResult:
+        """Write an uncompressed tar to ``fileobj``, which may be a pipe.
+
+        Same members, normalisation and skipping as ``compress()``, but nothing
+        touches the disk and ``encrypt:`` is ignored: the consumer (restic) does
+        its own compression and encryption. ``w|`` is tar's streaming mode, it
+        never seeks. ``output_path`` is left empty for the caller to fill in.
+        """
+        result = CompressResult(output_path="")
+        items, emit = self._with_progress(self._collect(result))
+        with tarfile.open(fileobj=fileobj, mode="w|") as tar:
+            self._write_metadata(tar)
+            self._write_members(tar, items, result, emit)
+        return result
+
     def compress(self) -> CompressResult:
         """Compress every configured file/directory into ``self.output_path``.
 
@@ -393,15 +456,7 @@ class TarCompressor:
 
         result = CompressResult(output_path=final_path)
 
-        emit: Callable[[str], None] = _no_emit
-        items: Iterable[tuple[str, str, bool]] = self._collect(result)
-        if self.show_progress:
-            from tqdm import tqdm  # imported lazily: only needed for the progress bar
-
-            # Materialise the list only when a total is actually needed; in headless
-            # mode the generator keeps startup latency and memory flat.
-            items = tqdm(list(items), desc="Compressing files", unit="file")
-            emit = tqdm.write
+        items, emit = self._with_progress(self._collect(result))
 
         out_dir = os.path.dirname(os.path.abspath(final_path)) or "."
         os.makedirs(out_dir, exist_ok=True)
@@ -412,33 +467,7 @@ class TarCompressor:
             fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, ARCHIVE_MODE)
             with os.fdopen(fd, "wb") as raw, tarfile.open(fileobj=raw, mode="w:gz") as tar:
                 self._write_metadata(tar)
-                for path, arcname, is_dir in items:
-                    # Skip root-owned files if only_root_user is false and current user is not root
-                    if not self.yaml_data.only_root_user and self.current_uid != 0 and self._is_root_owned(path):
-                        emit(f"Skipping root-owned file (only_root_user=false): {path}")
-                        result.skipped_root_owned.append(path)
-                        continue
-
-                    if is_dir:
-                        tar.add(path, arcname=arcname, recursive=False)
-                        result.added += 1
-                        continue
-
-                    normalized = None
-                    if self.yaml_data.normalize_content:
-                        normalized = self._normalized_stream(path)
-
-                    if normalized is not None:
-                        stream, size = normalized
-                        emit(f"Compressing (normalized): {path} -> {arcname}")
-                        tarinfo = tar.gettarinfo(path, arcname=arcname)
-                        tarinfo.size = size
-                        with stream:
-                            tar.addfile(tarinfo, fileobj=stream)
-                    else:
-                        emit(f"Compressing: {path} -> {arcname}")
-                        tar.add(path, arcname=arcname)
-                    result.added += 1
+                self._write_members(tar, items, result, emit)
             os.chmod(tmp_path, ARCHIVE_MODE)
             if encryption is None:
                 os.replace(tmp_path, final_path)

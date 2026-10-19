@@ -73,7 +73,8 @@ systemd-run --user --scope --quiet \
   mutmut run --max-children 4 \
     'config_saver.lib.utils.path_expander.*' \
     'config_saver.lib.tar_compressor.tar_compressor.xǁTarCompressorǁ_normalize_path*' \
-    'config_saver.lib.tar_compressor.tar_decompressor.xǁTarDecompressorǁ_validate*'
+    'config_saver.lib.tar_compressor.tar_decompressor.xǁTarDecompressorǁ_validate*' \
+    'config_saver.lib.retention.*'
 
 mutmut results                       # what survived
 mutmut show '<mutant name>'          # the exact diff that survived

@@ -3,6 +3,34 @@
 Non-obvious things that cost time and are not deducible from the code. Add an entry when you hit
 one; keep each entry short and dated.
 
+## 2026-10-19 — prune → re-migrate churn (fixed in 3.5.0)
+
+Measured on a copy of the real store (zsh, firefox, claude-conversations; 70 archives, 3762 MB into
+a 1076 MB repository, migrate 2:31, verified delete 2:00). Originally, a `--compress` between
+`--migrate` and `--migrate --delete-migrated` pruned old snapshots by retention (47 zsh ones); the
+next `--migrate` no longer found them in the store, re-migrated those archives, verified and
+deleted them, and the following `--compress` pruned them again. Wasteful, not lossy.
+
+Fixed in 3.5.0 by deferring the automatic prune for any configuration that still has archives on
+disk (a yellow line names it) until migration has finished; a manual `--prune` is not deferred.
+`restic check` at the end of a migration now prints `restic check: ok`.
+
+## 2026-10-19 — migration: a failed decrypt surfaces as "Not a gzipped file"
+
+When `age -d` fails (wrong identity), its stdout is empty, so `gzip` raises `BadGzipFile`/`EOFError`
+before anyone looks at the exit status, and the real cause (age's stderr) is lost. `migrate._plain_tar`
+waits briefly for the child on any error and, if it exited non-zero by itself, raises an
+`EncryptionError` carrying age's own message. Also: the decrypt child's exit status is checked
+*inside* the restic stdin writer, so a truncated or failed decrypt aborts restic (killed before it
+commits) instead of storing a short snapshot that a later hash check would have to catch.
+
+## 2026-10-19 — migration timestamps are naive local time (DST fall-back)
+
+`--time` is the archive's `YYYYMMDD-HHMMSS` read as naive local time. On the fall-back hour that
+second exists twice, so the stored instant can shift by an hour and a re-run (which compares
+cfg + second) may create a duplicate snapshot. It never loses data: the archive is only deleted
+after its own snapshot's hash matches.
+
 ## 2026-08-19 — the pre-push pytest hook runs whatever `python` is on PATH
 
 The `pytest` hook in `.pre-commit-config.yaml` is `language: system` with

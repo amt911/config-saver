@@ -24,6 +24,7 @@ SCOPE=(
   'config_saver.lib.utils.path_expander.*'
   'config_saver.lib.tar_compressor.tar_compressor.xǁTarCompressorǁ_normalize_path*'
   'config_saver.lib.tar_compressor.tar_decompressor.xǁTarDecompressorǁ_validate*'
+  'config_saver.lib.retention.*'
 )
 
 # Sin cgroup, una corrida dimensionó su pool por el número de cores y tumbó la

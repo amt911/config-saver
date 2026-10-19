@@ -6,6 +6,61 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-10-19
+
+### Added
+
+- **`--compress` stores into a deduplicated restic repository** when `restic` and `age` are
+  installed and a store exists in the saves directory. Each configuration is a snapshot tagged with
+  its name; unchanged data is stored once across runs and across configurations. The store is always
+  encrypted (random password, age-encrypted), so `--encrypt-to`/`--encrypt-method` are rejected
+  (exit `6`) while it is in use. Without a store `--compress` writes `.tar.gz` as before and prints
+  a one-line notice on stderr saying how to get deduplication. A store that exists but cannot be
+  used is an error (exit `5`), never a silent fallback.
+- **`retention:` per configuration** (`daily` 7, `weekly` 4, `monthly` 12, `yearly` 2, `0` disables a
+  bucket; the newest backup is always kept) and **automatic pruning after every directory-mode
+  `--compress`**: in restic mode always (defaults when the block is absent), in archive mode only
+  for configurations that declare `retention:`. A prune failure is reported after the batch and
+  exits `5` without touching the backups.
+- **`--list`, `--show-configs`, `--export-config` and `--export-all-configs` read the restic
+  store.** Exports are real `.tar.gz` files (named from the snapshot time), encrypted per the
+  configuration's `encrypt:` block, with no plaintext left behind on failure; archives not yet
+  migrated are listed with a `tar` marker.
+
+- **`--restic-init --encrypt-to <age key>`** creates the store; **`--migrate [--delete-migrated]`**
+  moves existing `.tar.gz`/`.tar.gz.age` archives into it (original timestamps and descriptions,
+  idempotent, one progress line per archive, a closing `restic check`). An archive is deleted only
+  after `restic dump` of its snapshot hashes identically to its decompressed content; any doubt
+  keeps it. **`--prune [--dry-run] [--include-legacy]`** applies retention to every configuration
+  on demand. While unmigrated archives of a configuration remain, the automatic prune after
+  `--compress` skips it and says so (`--migrate --delete-migrated` is the recommended one-shot
+  step); `--migrate` prints `restic check: ok` after a successful closing check.
+
+### Changed
+
+- Archives written straight into the saves directory (`config-saver-<ts>.tar.gz`, no config name)
+  are called `legacy` everywhere: `--list`, `--show-configs`, `--export-config legacy` (it finds the
+  tar and the restic copies, newest wins), `--migrate` and `--prune`. They used to show up as
+  `config-saver` in the listing; `--export-config config-saver` no longer matches them.
+- The `--list` legend now reads "archive still on disk" (the marker also covers archives that are
+  already migrated but not yet deleted); `--prune` totals read "N backup(s) would be removed." /
+  "N backup(s) removed.".
+- tar-mode `--list` shows one row per archive.
+- `--export-config NAME` matches the configuration name exactly. It used to match by prefix, so
+  `--export-config own` could export an `own-configs` archive; an archive without a timestamp in
+  its name is now found under its full stem (`foo-bar.tar.gz` → `foo-bar.tar`).
+
+### Fixed
+
+- A failed tar run removes the empty timestamp directory it created.
+- A relative `--identity` is stored (and resolved) as an absolute path, so a store set up from one
+  directory still opens from the timer's; `--compress` now honours `--identity`.
+- Malformed YAML no longer crashes with a traceback: `--prune` reports the configuration as
+  unreadable (exit `5`), `--export-config` exits `3`, `--export-all-configs` reports the
+  configuration, carries on and exits `3`; a single-file `--compress` of such a file exits `3`.
+- `--include-system-configs` was dropped by batch (`--input DIR`) and `--description` runs; it is
+  now forwarded to every archive. `--encrypt-to` was likewise dropped by `--description` runs.
+
 ## [3.4.0] - 2026-08-19
 
 ### Added

@@ -189,6 +189,7 @@ config-saver --compress
 `--export-config`/`-e NAME`: Export the latest config archive by name
 `--export-all-configs`: Export the latest archive for every saved configuration
 `--show-configs`: Show available configuration names
+`--restic-init`: Create the restic store (needs one age `--encrypt-to`); `--migrate [--delete-migrated]`: move existing archives into it; `--prune [--dry-run] [--include-legacy]`: apply retention now. See [Migrating existing backups](#migrating-existing-backups)
 `--input`/`-i PATH`: Input YAML/JSON config **or config directory** (for compress) or tar file (for decompress). **Repeatable** when every value is a directory, to combine the system configs with your own. Defaults to `/etc/config-saver/configs`, falling back to the examples shipped with a pip install (`<prefix>/share/config-saver/configs`)
 `--output`/`-o OUTPUT`: Output tar file (for compress), extraction directory (for decompress), or destination directory (for export-all-configs)
 - `--progress`/`-P`: Show progress bar during compression/decompression
@@ -200,6 +201,9 @@ config-saver --compress
 - `--encrypt-method {age,gpg}`: Backend for `--encrypt-to` (default `age`)
 - `--identity FILE`: Key file used to decrypt an encrypted archive (required for `age`)
 - `--version`/`-v`: Show program version and exit
+
+With a restic store, `--compress` snapshots into it, then prunes by each configuration's
+`retention:`; see [Deduplicated storage](#deduplicated-storage-restic) and [Retention](#retention).
 
 - `--description`/`-m DESCRIPTION`: Optional short description to save alongside a created archive. When provided, the CLI will create a per-config timestamp directory and store both the `.tar.gz` and a `description.txt` file inside:
 
@@ -219,16 +223,133 @@ itself.
 |-----:|---------|
 | `0` | Success |
 | `2` | Configuration file, config directory or archive not found |
-| `3` | Configuration failed validation (bad shape, unknown key) |
+| `3` | Configuration failed validation (malformed YAML, bad shape, unknown key) |
 | `4` | Permission denied, including `only_root_user: true` run as non-root |
-| `5` | Archive error: corrupt archive, or a member refused as unsafe |
-| `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`) |
+| `5` | Archive error: corrupt archive, or a member refused as unsafe; an unusable restic store; a failed prune (after a complete batch report); a failed migration (`--migrate`, including an archive that could not be decrypted) |
+| `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`, `--encrypt-to` with the restic store) |
 | `7` | `--export-config NAME` matched no saved configuration |
 | `8` | `--strict` and at least one configured path was missing |
 | `9` | Encryption or decryption failed (backend missing, wrong key, bad recipient) |
 | `10` | I/O error |
 
 argparse itself exits with `2` for usage errors such as a missing action flag.
+
+## Deduplicated storage (restic)
+
+Daily full archives repeat almost everything. When [restic](https://restic.net) and `age` are
+installed and a store has been set up, `--compress` writes each configuration into one shared,
+deduplicated and encrypted restic repository instead of a `.tar.gz`; a day-two backup of unchanged
+data costs next to nothing.
+
+- **The store** lives in the saves directory: `restic/` (the repository), `restic-password.age`
+  (a random password, encrypted to your age key) and `restic-store.json`. Set it up once with
+  `config-saver --restic-init --encrypt-to <age public key>`. The password is never written
+  unencrypted and never appears on a command line.
+- **Mode selection is automatic**, per run, from what exists:
+
+  | Situation | What `--compress` does |
+  |-----------|------------------------|
+  | no `restic` binary, no store | writes `.tar.gz` archives, and prints a notice on stderr |
+  | `restic` installed, no store | writes `.tar.gz` archives, and prints a notice on stderr |
+  | store exists | snapshots into the store, tagged with the configuration's name |
+  | store exists but `restic`/`age` is missing, the identity cannot decrypt it, or it is half-made | **fails** (exit `5`); it never falls back to archives behind your back |
+
+  The notice is printed once per run, only by `--compress`, and only in the two archive modes.
+- **`--encrypt-to` / `--encrypt-method` are rejected** (exit `6`) while the store is in use, even with a single-file `--output`: the store
+  is always encrypted, and recipients apply to exports. A configuration's own `encrypt:` block is
+  ignored for the store for the same reason; it still applies to `.tar.gz` output.
+- **Single files:** `--compress --input one.yaml` goes into the store under the file's name (with
+  `--description` as the snapshot description); with `--output` it still writes exactly the
+  `.tar.gz` you named. Neither is pruned.
+- **Listing and exporting:** with a store, `--list` shows its snapshots (date and description) per
+  configuration, and `--show-configs` unions them with the archives still on disk. Archives not yet
+  migrated are marked `tar` in a `Store` column. `--export-config NAME` / `--export-all-configs`
+  write the newest snapshot as `<name>-<YYYYMMDD-HHMMSS>.tar.gz` (so `--decompress` reads it
+  unchanged), encrypted with the `encrypt:` block of the configuration file of that name (or with
+  `--encrypt-to`) as `.tar.gz.age`/`.gpg`. With no such file the export is a plain `.tar.gz` and a
+  warning says so. Plaintext exists only in a private temp file beside the destination and is
+  removed on every path, failures included. An archive newer than the newest snapshot is copied as
+  before. Pass `--identity` if your age key is not the default one.
+- `--include-system-configs` and `exclude:` behave the same in both modes.
+
+### Migrating existing backups
+
+Your history of `.tar.gz` / `.tar.gz.age` archives moves into the store with its original
+timestamps and descriptions; nothing is deleted unless you ask.
+
+```sh
+config-saver --restic-init --encrypt-to <age public key>   # once; add --identity <key> if not ~/.config/age/key.txt
+config-saver --migrate --delete-migrated                   # the one-shot step: copy, verify, then delete each archive
+```
+
+`--migrate` alone (copy without deleting) is there for a cautious first look; the one-shot form is
+recommended because it verifies every archive before deleting it. Until it has finished, the
+automatic prune after `--compress` is **deferred** for every configuration that still has archives
+on disk (a yellow line names them), so retention never forgets snapshots that a later `--migrate`
+would only copy in again. A manual `--prune` is not deferred. An archive that permanently fails to
+migrate (corrupt, or encrypted to a key you no longer have) keeps that deferral in place: inspect the
+`failed:` line, then remove the archive (and its timestamp directory) yourself if it is worthless.
+
+- **Back up the age private key off this machine first.** After `--restic-init` that key is the
+  only secret needed to read the whole store (the repository password is encrypted to it); lose it
+  and every backup is unreadable.
+- Encrypted archives are decrypted into a pipe, never to a temp file; the key is `--identity` if
+  given, else the store's own. An archive that cannot be decrypted is reported as failed and the
+  rest continue. Top-level `config-saver-<ts>.tar.gz*` archives become the configuration `legacy`.
+- It is **idempotent**: an archive whose configuration and time are already in the store is skipped,
+  so an interrupted run is simply re-run. One progress line is printed per archive, then a summary
+  and a `restic check`.
+- **`--delete-migrated` deletes an archive (with its `description.txt` and then its empty
+  timestamp directory) only after `restic dump` of its snapshot hashes (sha256) identically to the
+  decompressed archive.** Already-migrated archives are verified the same way before they are
+  deleted. Any mismatch, restic error or failed decrypt keeps the archive and exits `5`.
+- A snapshot written by this run that does not hash like its archive is forgotten again, so a
+  re-run migrates that archive afresh. A *pre-existing* snapshot that differs is never touched
+  automatically (it may be a different backup from the same second): the message names it, and you
+  inspect it and run `restic forget <id>` (or remove it) to re-migrate. Two archives of the same
+  configuration and second (e.g. `x.tar.gz` next to `x.tar.gz.age`) are reported as failed, not skipped.
+- `--restic-init` refuses an `--identity` that is not the private half of the `--encrypt-to` key.
+- `--migrate` needs an initialised store (exit `6` with the setup notice otherwise).
+
+### Pruning by hand
+
+`config-saver --prune [--dry-run] [--include-legacy] [--input DIR]` applies retention to every
+configuration now. With the store, a configuration without a `retention:` block, and a snapshot
+whose configuration file no longer exists, get the defaults; `legacy` is skipped unless
+`--include-legacy`. Archive mode prunes only configurations with an explicit `retention:`. It prints
+what was (or with `--dry-run`, would be) removed per configuration and a total; `--dry-run` deletes
+nothing.
+
+## Retention
+
+Backups accumulate; `retention:` says how many to keep. It is an optional block in any
+configuration:
+
+```yaml
+retention:
+  daily: 7      # the newest backup of each of the last 7 days that have one
+  weekly: 4     # ... of each of the last 4 ISO weeks
+  monthly: 12   # ... of each of the last 12 months
+  yearly: 2     # ... of each of the last 2 years
+```
+
+The values shown are the defaults. `0` switches that bucket off; the newest backup is always kept,
+so a policy of all zeros leaves exactly one. The buckets follow restic's `--keep-daily/-weekly/
+-monthly/-yearly`, so both storage modes agree, and a backup kept by any bucket is kept.
+
+Pruning runs automatically after every directory-mode `--compress` (the systemd timer's case), only
+for the configurations that run just backed up successfully:
+
+- **Restic mode:** always. A configuration without a `retention:` block gets the defaults. Each
+  configuration's old snapshots are forgotten, then one `restic prune` reclaims the space.
+- **Archive mode:** only for configurations that declare `retention:` explicitly; the
+  `<timestamp>/` directories outside the policy are deleted. Without the block nothing is ever
+  deleted, so upgrading does not remove history you never asked to prune. Legacy top-level
+  archives and anything else in the directory are never touched.
+
+The backup a run has just made is never pruned by that run, and the configuration name `legacy` is
+reserved for migrated archives and never pruned automatically. A pruning failure is reported after the batch report, makes the run exit `5`, and never undoes or
+hides a backup that succeeded. Single-file `--compress` is not pruned.
 
 ## Round-trip semantics
 
