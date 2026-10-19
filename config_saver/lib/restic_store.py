@@ -229,6 +229,8 @@ class ResticStore:
                 detail = done.stderr.decode("utf-8", "replace").strip() or f"exit status {done.returncode}"
                 raise StoreError(f"could not encrypt the store password: {detail}")
             os.makedirs(self.repo, mode=_PRIVATE_DIR)
+            # The rule cannot resolve the constant; _PRIVATE_DIR is 0o700, which is the point (#15).
+            # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
             os.chmod(self.repo, _PRIVATE_DIR)
             self._run(["init"])
             fd = os.open(self.settings_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _PRIVATE_FILE)
