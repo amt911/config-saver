@@ -56,10 +56,18 @@ def test_select_mode_not_initialised(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert select_mode(str(tmp_path)) is StorageMode.TAR_NOT_INITIALISED
 
 
-def test_select_mode_half_store_is_not_initialised(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_select_mode_repo_without_password_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rs.shutil, "which", _which({"restic", "age"}))
-    (tmp_path / "restic").mkdir()  # no password file
-    assert select_mode(str(tmp_path)) is StorageMode.TAR_NOT_INITIALISED
+    (tmp_path / "restic").mkdir()
+    with pytest.raises(StoreError, match="incomplete: password file .*restic-password.age is missing"):
+        select_mode(str(tmp_path))
+
+
+def test_select_mode_password_without_repo_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rs.shutil, "which", _which({"restic", "age"}))
+    (tmp_path / "restic-password.age").write_bytes(b"x")
+    with pytest.raises(StoreError, match="incomplete: repository .*restic is missing"):
+        select_mode(str(tmp_path))
 
 
 def test_select_mode_restic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -119,7 +127,7 @@ class Recorder:
         self.calls.append({"argv": argv, **kwargs})
         rc = self.returncode
         if argv[0] == "age":
-            Path(argv[argv.index("-o") + 1]).write_bytes(b"age-encrypted")
+            kwargs["stdout"].write(b"age-encrypted")
         if self.fail_on and argv[0] == self.fail_on:
             rc = 1
         return subprocess.CompletedProcess(argv, rc, self.stdout, self.stderr)
@@ -160,6 +168,36 @@ def test_init_permissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert (tmp_path / "restic-password.age").stat().st_mode & 0o777 == 0o600
     assert (tmp_path / "restic-store.json").stat().st_mode & 0o777 == 0o600
     assert (tmp_path / "restic").stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("bad", ["it's", 'say"hi', "back\\slash"])
+def test_paths_restic_cannot_carry_are_refused_before_any_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    _popen(monkeypatch, out=SUMMARY)
+    for store in (_store(tmp_path, identity=f"/keys/{bad}"), ResticStore(str(tmp_path / bad), identity="/k")):
+        with pytest.raises(StoreError, match="cannot carry"):
+            store.init("age1abc")
+        with pytest.raises(StoreError, match="cannot carry"):
+            store.prune()
+        with pytest.raises(StoreError, match="cannot carry"):
+            store.backup(_writer(), "c", WHEN, None)
+    assert rec.calls == []
+
+
+def test_init_failure_after_password_file_removes_everything(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+
+    def boom(*_a: Any, **_k: Any) -> None:
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(rs.os, "makedirs", lambda p, *a, **k: boom() if str(p).endswith("restic") else None)
+    with pytest.raises(PermissionError):
+        _store(tmp_path).init("age1abc")
+    assert not (tmp_path / "restic-password.age").exists()
 
 
 def test_init_failure_leaves_nothing_behind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -476,6 +514,16 @@ def test_missing_restic_binary_is_store_error(tmp_path: Path, monkeypatch: pytes
         _store(tmp_path).backup(_writer(), "c", WHEN, None)
     with pytest.raises(StoreError, match="could not run restic"):
         _store(tmp_path).dump(SID, "c", io.BytesIO())
+
+
+def test_env_drops_inherited_restic_vars_except_cache_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESTIC_REPOSITORY_FILE", "/elsewhere")
+    monkeypatch.setenv("RESTIC_KEY_HINT", "2")
+    monkeypatch.setenv("RESTIC_CACHE_DIR", "/cache")
+    env = _store(tmp_path)._env()
+    assert "RESTIC_REPOSITORY_FILE" not in env and "RESTIC_KEY_HINT" not in env
+    assert env["RESTIC_CACHE_DIR"] == "/cache"
+    assert env["RESTIC_REPOSITORY"] == str(tmp_path / "restic")
 
 
 def test_env_removes_restic_password_vars_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

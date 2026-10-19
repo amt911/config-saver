@@ -82,7 +82,18 @@ def settings_path(saves_dir: str) -> str:
 
 def select_mode(saves_dir: str) -> StorageMode:
     """Decide how backups are stored in ``saves_dir``."""
-    if os.path.isdir(repo_path(saves_dir)) and os.path.isfile(password_path(saves_dir)):
+    repo, password = repo_path(saves_dir), password_path(saves_dir)
+    has_repo, has_password = os.path.isdir(repo), os.path.isfile(password)
+    if has_repo != has_password:
+        if has_repo:
+            raise StoreError(
+                f"restic store is incomplete: password file {password} is missing; "
+                "without it the repository cannot be read"
+            )
+        raise StoreError(
+            f"restic store is incomplete: repository {repo} is missing; the password file {password} has nothing to unlock"
+        )
+    if has_repo:
         for binary in ("restic", "age"):
             if shutil.which(binary) is None:
                 raise StoreError(
@@ -152,8 +163,18 @@ class ResticStore:
 
     # ----------------------------------------------------------------- plumbing
 
+    def _check_paths(self) -> None:
+        """restic splits the password command on quotes itself; refuse what it cannot carry."""
+        for path in (self.identity, self.password_file):
+            if any(ch in path for ch in "'\"\\"):
+                raise StoreError(
+                    f"path contains a quote/backslash character, which restic's password command cannot carry: {path}"
+                )
+
     def _env(self) -> dict[str, str]:
-        env = {k: v for k, v in os.environ.items() if not k.startswith("RESTIC_PASSWORD")}
+        self._check_paths()
+        # Inherited RESTIC_* settings (repository file, key hint, ...) would fight ours.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("RESTIC_") or k == "RESTIC_CACHE_DIR"}
         env["RESTIC_REPOSITORY"] = self.repo
         env["RESTIC_PASSWORD_COMMAND"] = f"age -d -i {shlex.quote(self.identity)} {shlex.quote(self.password_file)}"
         return env
@@ -185,37 +206,42 @@ class ResticStore:
         """Create the repository and its age-encrypted random password."""
         if os.path.exists(self.repo) or os.path.exists(self.password_file):
             raise StoreError(f"a restic store already exists in {self.saves_dir}; refusing to overwrite it")
+        self._check_paths()
         os.makedirs(self.saves_dir, exist_ok=True)
         password = secrets.token_urlsafe(32)
         try:
-            done = subprocess.run(
-                ["age", "-r", recipient, "-o", self.password_file],
-                input=password.encode("utf-8"),
-                capture_output=True,
-                check=False,
-            )
-        except OSError as exc:
-            raise StoreError(f"could not run age: {exc}") from exc
-        if done.returncode != 0:
-            detail = done.stderr.decode("utf-8", "replace").strip() or f"exit status {done.returncode}"
-            raise StoreError(f"could not encrypt the store password: {detail}")
-        os.chmod(self.password_file, _PRIVATE_FILE)
-        os.makedirs(self.repo, mode=_PRIVATE_DIR)
-        os.chmod(self.repo, _PRIVATE_DIR)
-        try:
+            # Created 0600 up front and handed to age as stdout: never world-readable.
+            fd = os.open(self.password_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _PRIVATE_FILE)
+            with os.fdopen(fd, "wb") as target:
+                try:
+                    done = subprocess.run(
+                        ["age", "-r", recipient],
+                        input=password.encode("utf-8"),
+                        stdout=target,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                except OSError as exc:
+                    raise StoreError(f"could not run age: {exc}") from exc
+            if done.returncode != 0:
+                detail = done.stderr.decode("utf-8", "replace").strip() or f"exit status {done.returncode}"
+                raise StoreError(f"could not encrypt the store password: {detail}")
+            os.makedirs(self.repo, mode=_PRIVATE_DIR)
+            os.chmod(self.repo, _PRIVATE_DIR)
             self._run(["init"])
-        except StoreError:
+            fd = os.open(self.settings_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _PRIVATE_FILE)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"identity": self.identity}, handle)
+            os.chmod(self.settings_file, _PRIVATE_FILE)
+        except BaseException:
             # Leave nothing half-made behind, or a retry would be refused.
             shutil.rmtree(self.repo, ignore_errors=True)
-            try:
-                os.remove(self.password_file)
-            except OSError:
-                pass
+            for leftover in (self.password_file, self.settings_file):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
             raise
-        fd = os.open(self.settings_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _PRIVATE_FILE)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"identity": self.identity}, handle)
-        os.chmod(self.settings_file, _PRIVATE_FILE)
 
     def backup(
         self,
@@ -264,6 +290,10 @@ class ResticStore:
             result = write(proc.stdin)
             proc.stdin.close()
         except BrokenPipeError:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
             returncode = finish()
             error = self._explain(b"".join(err_chunks), returncode)
             if returncode == 0:

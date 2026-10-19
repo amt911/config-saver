@@ -45,6 +45,8 @@ def test_real_restic_roundtrip(tmp_path: Path, sample_tree: Path, monkeypatch: p
     store = ResticStore(str(saves), identity=key)
     store.init(recipient)
     assert (saves / "restic-password.age").stat().st_mode & 0o777 == 0o600
+    assert (saves / "restic-store.json").stat().st_mode & 0o777 == 0o600
+    assert (saves / "restic").stat().st_mode & 0o777 == 0o700
 
     compressor = TarCompressor(make_model([str(sample_tree)]), "")
     first_time = datetime(2026, 10, 1, 3, 0, 0)
@@ -80,7 +82,8 @@ def test_real_restic_roundtrip(tmp_path: Path, sample_tree: Path, monkeypatch: p
     assert [s.id for s in store.snapshots("my-cfg")] == [second.id]
 
 
-def test_wrong_identity_gives_clear_error(tmp_path: Path) -> None:
+def test_wrong_identity_gives_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESTIC_CACHE_DIR", str(tmp_path / "cache"))
     key, recipient = _identity(tmp_path)
     saves = tmp_path / "saves"
     ResticStore(str(saves), identity=key).init(recipient)
@@ -88,3 +91,13 @@ def test_wrong_identity_gives_clear_error(tmp_path: Path) -> None:
     subprocess.run(["age-keygen", "-o", str(other)], check=True, capture_output=True)
     with pytest.raises(StoreError, match="cannot decrypt the store password"):
         ResticStore(str(saves), identity=str(other)).snapshots()
+
+
+def test_apostrophe_path_gives_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESTIC_CACHE_DIR", str(tmp_path / "cache"))
+    key, recipient = _identity(tmp_path)
+    weird = tmp_path / "it's"
+    weird.mkdir()
+    with pytest.raises(StoreError, match="cannot carry"):
+        ResticStore(str(weird), identity=key).init(recipient)
+    assert not (weird / "restic").exists()
