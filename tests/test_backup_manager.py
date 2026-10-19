@@ -6,7 +6,7 @@ import io
 import os
 import stat
 import tarfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import IO
@@ -212,6 +212,7 @@ class FakeStore:
         self.backups: list[tuple[str, datetime, str | None]] = []
         self.forgets: list[tuple[str, RetentionModel, bool]] = []
         self.prunes = 0
+        self.also_keep: dict[str, list[datetime]] = {}
         self.forgotten = forgotten or {}
         self.fail_forget: set[str] = set()
         self.fail_prune = False
@@ -219,13 +220,18 @@ class FakeStore:
     def backup(self, write: Callable[[IO[bytes]], CompressResult], cfg: str, when: datetime, description: str | None):
         buffer = io.BytesIO()
         result = write(buffer)
-        assert buffer.getvalue()[:1] != b"", "a tar stream was written"
+        buffer.seek(0)
+        with tarfile.open(fileobj=buffer) as tar:
+            assert tar.getmembers(), "a real tar stream was written"
         self.backups.append((cfg, when, description))
         snapshot = Snapshot(id=f"{cfg}-id", short_id=f"{cfg}-sh", time=when, cfg=cfg, description=description)
         return snapshot, result, 123
 
-    def forget(self, cfg: str, policy: RetentionModel, dry_run: bool) -> list[Snapshot]:
+    def forget(
+        self, cfg: str, policy: RetentionModel, dry_run: bool, also_keep: Iterable[datetime] = ()
+    ) -> list[Snapshot]:
         self.forgets.append((cfg, policy, dry_run))
+        self.also_keep[cfg] = list(also_keep)
         if cfg in self.fail_forget:
             raise StoreError(f"forget failed for {cfg}")
         return self.forgotten.get(cfg, [])
@@ -467,3 +473,99 @@ def test_timestamp_dir_forwards_extra_directories(tmp_path: Path, fake_home: Pat
     )
     with tarfile.open(out, "r:gz") as tar:
         assert any(m.name.endswith("extra/e.txt") for m in tar.getmembers())
+
+
+def test_failed_job_leaves_no_empty_dir_and_the_real_backup_survives_prune(tmp_path: Path, fake_home: Path) -> None:
+    """The reviewer's sequence: ok, failed, ok with daily=2 must not eat the only Jan 1 backup."""
+    data = fake_home / "data"
+    data.mkdir()
+    (data / "f.txt").write_text("x")
+    cfg_dir = tmp_path / "configs"
+    cfg_dir.mkdir()
+    cfg = cfg_dir / "one.yaml"
+    policy = {"daily": 2, "weekly": 0, "monthly": 0, "yearly": 0}
+    write_config(cfg, [str(data)], retention=policy)
+    saves = tmp_path / "saves"
+    manager = BackupManager(str(saves))
+
+    manager.compress_directory_of_configs(str(cfg_dir), "20260101-030000")
+    cfg.write_text("directoriez: [nope]\n")  # the second run fails
+    failed = manager.compress_directory_of_configs(str(cfg_dir), "20260101-150000")
+    assert [o.name for o in failed.failures] == ["one"]
+    assert not (saves / "configs" / "one" / "20260101-150000").exists()
+    write_config(cfg, [str(data)], retention=policy)
+    batch = manager.compress_directory_of_configs(str(cfg_dir), "20260102-030000")
+
+    report = manager.prune_after_batch(batch, None)
+
+    assert report.removed == {}
+    assert sorted(p.name for p in (saves / "configs" / "one").iterdir()) == ["20260101-030000", "20260102-030000"]
+
+
+def test_root_only_skip_leaves_no_empty_dir(tmp_path: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg_dir = tmp_path / "configs"
+    cfg_dir.mkdir()
+    (cfg_dir / "rooted.yaml").write_text(yaml.safe_dump({"directories": [str(fake_home)], "only_root_user": True}))
+    monkeypatch.setattr("os.getuid", lambda: 1000)
+    saves = tmp_path / "saves"
+    BackupManager(str(saves)).compress_directory_of_configs(str(cfg_dir), "20260101-000000")
+    assert not (saves / "configs" / "rooted" / "20260101-000000").exists()
+
+
+def test_legacy_config_is_never_auto_pruned(tmp_path: Path, fake_home: Path) -> None:
+    data = fake_home / "data"
+    data.mkdir()
+    (data / "f.txt").write_text("x")
+    cfg_dir = tmp_path / "configs"
+    cfg_dir.mkdir()
+    zero = {"daily": 0, "weekly": 0, "monthly": 0, "yearly": 0}
+    write_config(cfg_dir / "legacy.yaml", [str(data)], retention=zero)
+    saves = tmp_path / "saves"
+    manager = BackupManager(str(saves))
+    _timestamp_dirs(saves, "legacy", 4)
+
+    tar_batch = manager.compress_directory_of_configs(str(cfg_dir), "20270101-000000")
+    assert manager.prune_after_batch(tar_batch, None).removed == {}
+    assert len(list((saves / "configs" / "legacy").iterdir())) == 5
+
+    store = FakeStore({"legacy": [_snap("legacy", 1)]})
+    restic_batch = manager.compress_directory_of_configs(str(cfg_dir), "20270102-000000", store=store)  # type: ignore[arg-type]
+    assert manager.prune_after_batch(restic_batch, store).removed == {}  # type: ignore[arg-type]
+    assert store.forgets == [] and store.prunes == 0
+
+
+def test_tar_prune_never_removes_this_runs_backup_under_clock_skew(tmp_path: Path, fake_home: Path) -> None:
+    zero = {"daily": 0, "weekly": 0, "monthly": 0, "yearly": 0}
+    cfg_dir = _two_configs(tmp_path, fake_home, retention=zero)
+    saves = tmp_path / "saves"
+    manager = BackupManager(str(saves))
+    _timestamp_dirs(saves, "two", 1)  # 2026-01-01, then a run stamped *earlier* than a newer existing one
+    (saves / "configs" / "two" / "20990101-000000").mkdir()
+    (saves / "configs" / "two" / "20990101-000000" / "two.tar.gz").write_bytes(b"x")
+    batch = manager.compress_directory_of_configs(str(cfg_dir), "20270101-000000")
+
+    manager.prune_after_batch(batch, None)
+
+    assert (saves / "configs" / "two" / "20270101-000000").is_dir()
+
+
+def test_restic_prune_passes_this_runs_snapshot_as_also_keep(tmp_path: Path, fake_home: Path) -> None:
+    store = FakeStore()
+    manager, batch = _ok_batch(tmp_path, fake_home, store)
+    manager.prune_after_batch(batch, store)  # type: ignore[arg-type]
+    assert store.also_keep == {"one": [datetime(2027, 1, 1)], "two": [datetime(2027, 1, 1)]}
+
+
+def test_job_errors_use_the_same_wording_as_prune_errors(tmp_path: Path, fake_home: Path) -> None:
+    cfg_dir = _two_configs(tmp_path, fake_home)
+
+    class Flaky(FakeStore):
+        def backup(self, write, cfg, when, description):  # type: ignore[no-untyped-def]
+            raise StoreError("restic failed: boom")
+
+    batch = BackupManager(str(tmp_path / "saves")).compress_directory_of_configs(
+        str(cfg_dir),
+        "20260102-030405",
+        store=Flaky(),  # type: ignore[arg-type]
+    )
+    assert batch.failures[0].error == "restic failed: boom"

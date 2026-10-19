@@ -15,7 +15,6 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from config_saver.lib import crypto
 from config_saver.lib.errors import RootRequiredError, StoreError
 from config_saver.lib.models.encryption_model import EncryptionModel
 from config_saver.lib.models.model import Model
@@ -27,16 +26,16 @@ from config_saver.lib.tar_compressor.tar_compressor import (
     CompressResult,
     TarCompressor,
 )
-from config_saver.lib.tar_prune import TIMESTAMP_FORMAT, prune_config_dir
+from config_saver.lib.tar_prune import ARCHIVE_GLOBS, TIMESTAMP_FORMAT, prune_config_dir
 
 # Backups contain secrets; their directories are private by construction.
 PRIVATE_DIR_MODE = 0o700
 
+# Config stem reserved for migrated pre-store archives: never pruned automatically.
+LEGACY_NAME = "legacy"
+
 # Config files accepted in directory (batch) mode. YAML parsing also accepts JSON.
 CONFIG_GLOBS = ("*.yaml", "*.yml", "*.json")
-
-# Archive names, plain and encrypted.
-ARCHIVE_GLOBS = ("*.tar.gz", *(f"*.tar.gz{suffix}" for suffix in crypto.SUFFIXES.values()))
 
 
 @dataclass
@@ -132,6 +131,17 @@ def _chmod_private(path: str) -> None:
         pass
 
 
+def _own_stamp(outcome: ConfigOutcome) -> list[datetime]:
+    """The timestamp of the directory this run just wrote, parsed from its name."""
+    if not outcome.archive_path:
+        return []
+    name = os.path.basename(os.path.dirname(outcome.archive_path))
+    try:
+        return [datetime.strptime(name, TIMESTAMP_FORMAT)]
+    except ValueError:
+        return []
+
+
 def _describe(exc: Exception) -> str:
     """A store error already reads as a sentence; anything else needs its type."""
     return str(exc) if isinstance(exc, StoreError) else f"{type(exc).__name__}: {exc}"
@@ -180,7 +190,7 @@ def _compress_job(job: _CompressJob) -> ConfigOutcome:
     except RootRequiredError:
         outcome.skipped_root_only = True
     except Exception as exc:  # reported per config; the batch keeps going
-        outcome.error = f"{type(exc).__name__}: {exc}"
+        outcome.error = _describe(exc)
     return outcome
 
 
@@ -302,13 +312,21 @@ class BackupManager:
         _ensure_private_dir(dest_dir)
 
         out_path = os.path.join(dest_dir, archive_name)
-        result = self.compress_config_file(
-            config_path,
-            out_path,
-            show_progress=show_progress,
-            encryption=encryption,
-            extra_directories=extra_directories,
-        )
+        try:
+            result = self.compress_config_file(
+                config_path,
+                out_path,
+                show_progress=show_progress,
+                encryption=encryption,
+                extra_directories=extra_directories,
+            )
+        except BaseException:
+            # A failed run must not leave an empty timestamp directory that looks like a backup.
+            try:
+                os.rmdir(dest_dir)
+            except OSError:  # not empty (or gone): leave it
+                pass
+            raise
         # Encryption appends a suffix, so the real path comes from the result.
         out_path = result.output_path
 
@@ -482,13 +500,17 @@ class BackupManager:
         for outcome in batch.outcomes:
             if outcome.error or outcome.skipped_root_only or outcome.result is None:
                 continue
+            if outcome.name == LEGACY_NAME:
+                continue  # reserved for migrated top-level archives; only a manual prune names it
             try:
                 retention = Parser(outcome.config_path).get_model().retention
                 if store is not None:
-                    removed = [s.short_id for s in store.forget(outcome.name, retention or RetentionModel(), False)]
+                    own = [outcome.snapshot.time] if outcome.snapshot else []
+                    forgotten = store.forget(outcome.name, retention or RetentionModel(), False, also_keep=own)
+                    removed = [s.short_id for s in forgotten]
                 elif retention is not None:
                     cfg_dir = os.path.join(self.saves_dir, "configs", outcome.name)
-                    removed = prune_config_dir(cfg_dir, retention, dry_run=False)
+                    removed = prune_config_dir(cfg_dir, retention, dry_run=False, also_keep=_own_stamp(outcome))
                 else:
                     continue
             except Exception as exc:  # one config's failure must not stop the others

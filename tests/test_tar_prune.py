@@ -79,3 +79,25 @@ def test_zero_policy_still_keeps_the_newest(tmp_path: Path) -> None:
     _make_dirs(tmp_path, stamps)
     prune_config_dir(str(tmp_path), RetentionModel(daily=0, weekly=0, monthly=0, yearly=0), dry_run=False)
     assert [p.name for p in tmp_path.iterdir()] == [stamps[-1].strftime(TIMESTAMP_FORMAT)]
+
+
+def test_dirs_without_an_archive_are_not_backups(tmp_path: Path) -> None:
+    """Regression: a failed run's empty directory used to count as a backup."""
+    policy = RetentionModel(daily=2, weekly=0, monthly=0, yearly=0)
+    _make_dirs(tmp_path, [datetime(2026, 1, 1, 3), datetime(2026, 1, 2, 3)])
+    (tmp_path / "20260101-150000").mkdir()  # failed run: no archive
+
+    removed = prune_config_dir(str(tmp_path), policy, dry_run=False)
+
+    assert removed == []
+    assert (tmp_path / "20260101-150000").is_dir()  # not ours to delete either
+    assert (tmp_path / "20260101-030000").is_dir()
+
+
+def test_also_keep_protects_this_runs_own_backup(tmp_path: Path) -> None:
+    stamps = _stamps(5)
+    _make_dirs(tmp_path, stamps)
+    zero = RetentionModel(daily=0, weekly=0, monthly=0, yearly=0)
+    removed = prune_config_dir(str(tmp_path), zero, dry_run=False, also_keep=[stamps[0]])
+    assert len(removed) == 3
+    assert (tmp_path / stamps[0].strftime(TIMESTAMP_FORMAT)).is_dir()

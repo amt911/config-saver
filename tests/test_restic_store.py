@@ -533,3 +533,14 @@ def test_env_removes_restic_password_vars_only(tmp_path: Path, monkeypatch: pyte
     assert "RESTIC_PASSWORD" not in env
     assert env["RESTIC_CACHE_DIR"] == "/cache"
     assert os.environ["RESTIC_PASSWORD"] == "x"
+
+
+def test_forget_also_keep_protects_a_snapshot_the_policy_would_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = _stamped_store(tmp_path, monkeypatch, [10, 11, 12, 13])
+    zero = RetentionModel(daily=0, weekly=0, monthly=0, yearly=0)
+    protect = _store(tmp_path).snapshots("c")[1].time  # "b"
+    removed = _store(tmp_path).forget("c", zero, dry_run=False, also_keep=[protect])
+    assert [s.short_id for s in removed] == ["a" * 8, "c" * 8]
+    assert rec.calls[-1]["argv"] == ["restic", "forget", "a" * 64, "c" * 64]

@@ -20,7 +20,7 @@ import shlex
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -387,12 +387,14 @@ class ResticStore:
         if returncode != 0:
             raise self._explain(b"".join(err_chunks), returncode)
 
-    def forget(self, cfg: str, policy: RetentionModel, dry_run: bool) -> list[Snapshot]:
-        """Forget what ``policy`` does not keep (never the newest); return those."""
+    def forget(
+        self, cfg: str, policy: RetentionModel, dry_run: bool, also_keep: Iterable[datetime] = ()
+    ) -> list[Snapshot]:
+        """Forget what ``policy`` does not keep (never the newest, never ``also_keep``); return those."""
         snaps = self.snapshots(cfg)
         if not snaps:
             return []
-        keep = keep_set((s.time for s in snaps), policy)
+        keep = keep_set((s.time for s in snaps), policy) | set(also_keep)
         newest = max(snaps, key=lambda s: (s.time, s.id))
         removed = [s for s in snaps if s.time not in keep and s.id != newest.id]
         if removed and not dry_run:

@@ -254,7 +254,7 @@ data costs next to nothing.
   | store exists but `restic`/`age` is missing, the identity cannot decrypt it, or it is half-made | **fails** (exit `5`); it never falls back to archives behind your back |
 
   The notice is printed once per run, only by `--compress`, and only in the two archive modes.
-- **`--encrypt-to` / `--encrypt-method` are rejected** (exit `6`) while the store is in use: the store
+- **`--encrypt-to` / `--encrypt-method` are rejected** (exit `6`) while the store is in use, even with a single-file `--output`: the store
   is always encrypted, and recipients apply to exports. A configuration's own `encrypt:` block is
   ignored for the store for the same reason; it still applies to `.tar.gz` output.
 - **Single files:** `--compress --input one.yaml` goes into the store under the file's name (with
@@ -289,7 +289,8 @@ for the configurations that run just backed up successfully:
   deleted, so upgrading does not remove history you never asked to prune. Legacy top-level
   archives and anything else in the directory are never touched.
 
-A pruning failure is reported after the batch report, makes the run exit `5`, and never undoes or
+The backup a run has just made is never pruned by that run, and the configuration name `legacy` is
+reserved for migrated archives and never pruned automatically. A pruning failure is reported after the batch report, makes the run exit `5`, and never undoes or
 hides a backup that succeeded. Single-file `--compress` is not pruned.
 
 ## Round-trip semantics

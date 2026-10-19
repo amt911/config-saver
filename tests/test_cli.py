@@ -393,7 +393,7 @@ class _CliFakeStore:
         self.backups.append((cfg, when, description))
         return Snapshot(f"{cfg}-id", f"{cfg}-sh", when, cfg, description), result, 1
 
-    def forget(self, cfg, policy, dry_run):  # type: ignore[no-untyped-def]
+    def forget(self, cfg, policy, dry_run, also_keep=()):  # type: ignore[no-untyped-def]
         self.forgets.append(cfg)
         return self.forgotten
 
@@ -485,7 +485,7 @@ def test_encrypt_flags_are_rejected_in_restic_mode(
 
     assert run(["--compress", "-i", str(cfg_dir), *extra]) == EXIT_USAGE
     assert "always encrypted" in capsys.readouterr().out
-    assert _CliFakeStore.instances == [] or _CliFakeStore.instances[0].backups == []
+    assert [b for s in _CliFakeStore.instances for b in s.backups] == []
 
 
 def test_single_file_without_output_goes_to_the_store(
@@ -512,7 +512,7 @@ def test_single_file_output_still_writes_targz_in_restic_mode(
     assert run(["--compress", "-i", str(cfg), "-o", str(out)]) == EXIT_OK
 
     assert out.is_file()
-    assert _CliFakeStore.instances == [] or _CliFakeStore.instances[0].backups == []
+    assert [b for s in _CliFakeStore.instances for b in s.backups] == []
 
 
 def test_restic_batch_prunes_and_reports_it(
@@ -565,7 +565,9 @@ def test_tar_batch_prunes_only_configs_with_a_retention_block(
     saves = fake_home / ".config" / "config-saver" / "configs"
     for name in ("one", "two"):
         for day in (1, 2, 3):
-            (saves / name / f"2026010{day}-000000").mkdir(parents=True)
+            stamp = saves / name / f"2026010{day}-000000"
+            stamp.mkdir(parents=True)
+            (stamp / f"{name}.tar.gz").write_bytes(b"x")
 
     assert run(["--compress", "-i", str(cfg_dir), "--jobs", "1"]) == EXIT_OK
 
