@@ -433,6 +433,11 @@ class CLI:
     def _report_prune(report: PruneReport) -> None:
         for name, removed in report.removed.items():
             print(Fore.CYAN + f"[{name}] pruned {len(removed)} old backup(s).")
+        if report.deferred:
+            print(
+                Fore.YELLOW + f"automatic prune deferred for {', '.join(report.deferred)}: "
+                "unmigrated archives remain; run `config-saver --migrate --delete-migrated`"
+            )
         for error in report.errors:
             print(Fore.RED + f"Pruning failed: {error}")
 
@@ -802,6 +807,8 @@ class CLI:
             print(Fore.RED + f"  failed: {path}: {reason} (kept)")
         if report.check_error:
             print(Fore.RED + f"restic check failed: {report.check_error}")
+        elif report.checked:
+            print(Fore.GREEN + "restic check: ok")
 
     def _migrate(self, manager: BackupManager, args: argparse.Namespace, saves_dir: str) -> int:
         mode = select_mode(saves_dir)

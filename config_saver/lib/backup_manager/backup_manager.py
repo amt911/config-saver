@@ -26,7 +26,7 @@ from config_saver.lib.tar_compressor.tar_compressor import (
     CompressResult,
     TarCompressor,
 )
-from config_saver.lib.tar_prune import ARCHIVE_GLOBS, TIMESTAMP_FORMAT, prune_config_dir
+from config_saver.lib.tar_prune import ARCHIVE_GLOBS, TIMESTAMP_FORMAT, has_archives, prune_config_dir
 
 # Backups contain secrets; their directories are private by construction.
 PRIVATE_DIR_MODE = 0o700
@@ -63,6 +63,7 @@ class PruneReport:
 
     removed: dict[str, list[str]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    deferred: list[str] = field(default_factory=list)  # restic mode: archives still await migration
 
 
 @dataclass
@@ -502,6 +503,11 @@ class BackupManager:
                 continue
             if outcome.name == LEGACY_NAME:
                 continue  # reserved for migrated top-level archives; only a manual prune names it
+            if store is not None and has_archives(os.path.join(self.saves_dir, "configs", outcome.name)):
+                # Migration is unfinished: pruning now would forget snapshots that
+                # `--migrate` would only copy in again.
+                report.deferred.append(outcome.name)
+                continue
             try:
                 retention = Parser(outcome.config_path).get_model().retention
                 if store is not None:

@@ -1055,3 +1055,37 @@ def test_cli_prune_lists_what_it_removes(
     out = capsys.readouterr().out
     assert "2026-01-01 03:00:00 (mine-sh)" in out and "2026-01-02 03:00:00 (mine-sh)" in out
     assert "2026-01-03" not in out
+
+
+def test_cli_migrate_prints_check_ok_only_when_the_check_ran(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _maint_mode(monkeypatch, StorageMode.RESTIC)
+    _migration(monkeypatch, migrated=["a"], checked=True)
+    assert run(["--migrate"]) == EXIT_OK
+    assert "restic check: ok" in capsys.readouterr().out
+    _migration(monkeypatch, migrated=["a"], checked=True, check_error="bad pack")
+    run(["--migrate"])
+    out = capsys.readouterr().out
+    assert "restic check: ok" not in out and "restic check failed: bad pack" in out
+    _migration(monkeypatch)
+    run(["--migrate"])
+    assert "restic check: ok" not in capsys.readouterr().out
+
+
+def test_cli_compress_names_the_configs_whose_prune_was_deferred(
+    tmp_path: Path, data_dir: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mode(monkeypatch, StorageMode.RESTIC)
+    cfg_dir = _cfg_dir(tmp_path, data_dir)
+    stamp = fake_home / ".config" / "config-saver" / "configs" / "one" / "20260101-000000"
+    stamp.mkdir(parents=True)
+    (stamp / "one-20260101-000000.tar.gz").write_bytes(b"x")
+
+    assert run(["--compress", "-i", str(cfg_dir), "--jobs", "1"]) == EXIT_OK
+
+    store = _CliFakeStore.instances[0]
+    assert store.forgets == ["two"]
+    assert (
+        "automatic prune deferred for one: unmigrated archives remain; run `config-saver --migrate --delete-migrated`"
+    ) in capsys.readouterr().out

@@ -32,7 +32,9 @@ All notable changes to this project are documented here. The format follows
   idempotent, one progress line per archive, a closing `restic check`). An archive is deleted only
   after `restic dump` of its snapshot hashes identically to its decompressed content; any doubt
   keeps it. **`--prune [--dry-run] [--include-legacy]`** applies retention to every configuration
-  on demand.
+  on demand. While unmigrated archives of a configuration remain, the automatic prune after
+  `--compress` skips it and says so (`--migrate --delete-migrated` is the recommended one-shot
+  step); `--migrate` prints `restic check: ok` after a successful closing check.
 
 ### Fixed
 

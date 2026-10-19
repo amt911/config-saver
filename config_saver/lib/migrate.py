@@ -43,6 +43,7 @@ class MigrationReport:
     bytes_before: int = 0
     # Set when the closing ``restic check`` failed; deletes already made were individually verified.
     check_error: str | None = None
+    checked: bool = False  # the closing ``restic check`` ran
 
 
 class _HashSink:
@@ -266,6 +267,7 @@ def migrate_archives(
     if report.migrated or report.skipped:
         try:
             store.check()
+            report.checked = True
         except StoreError as exc:
             report.check_error = _describe(exc)
     return report

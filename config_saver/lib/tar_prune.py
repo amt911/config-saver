@@ -49,6 +49,11 @@ def _timestamp_dirs(cfg_dir: str) -> dict[datetime, str]:
     return found
 
 
+def has_archives(cfg_dir: str) -> bool:
+    """True while ``cfg_dir`` still holds at least one backup timestamp directory with an archive."""
+    return bool(_timestamp_dirs(cfg_dir))
+
+
 def prune_config_dir(
     cfg_dir: str, policy: RetentionModel, dry_run: bool, also_keep: Iterable[datetime] = ()
 ) -> list[str]:

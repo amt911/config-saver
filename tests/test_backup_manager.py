@@ -569,3 +569,42 @@ def test_job_errors_use_the_same_wording_as_prune_errors(tmp_path: Path, fake_ho
         store=Flaky(),  # type: ignore[arg-type]
     )
     assert batch.failures[0].error == "restic failed: boom"
+
+
+def _leave_archive(tmp_path: Path, cfg: str) -> None:
+    stamp = tmp_path / "saves" / "configs" / cfg / "20260101-000000"
+    stamp.mkdir(parents=True)
+    (stamp / f"{cfg}-20260101-000000.tar.gz.age").write_bytes(b"x")
+
+
+def test_restic_prune_is_deferred_while_unmigrated_archives_remain(tmp_path: Path, fake_home: Path) -> None:
+    store = FakeStore({"one": [_snap("one", 1)], "two": [_snap("two", 1)]})
+    manager, batch = _ok_batch(tmp_path, fake_home, store)
+    _leave_archive(tmp_path, "one")
+
+    report = manager.prune_after_batch(batch, store)  # type: ignore[arg-type]
+
+    assert [c for c, _p, _d in store.forgets] == ["two"]  # "one" is not pruned
+    assert report.deferred == ["one"]
+    assert report.removed == {"two": ["old1"]}
+
+
+def test_restic_prune_runs_normally_once_no_archive_remains(tmp_path: Path, fake_home: Path) -> None:
+    store = FakeStore({"one": [_snap("one", 1)]})
+    manager, batch = _ok_batch(tmp_path, fake_home, store)
+    (tmp_path / "saves" / "configs" / "one" / "20260101-000000").mkdir(parents=True)  # empty dir: not an archive
+
+    report = manager.prune_after_batch(batch, store)  # type: ignore[arg-type]
+
+    assert [c for c, _p, _d in store.forgets] == ["one", "two"]
+    assert report.deferred == []
+
+
+def test_tar_prune_is_not_deferred_by_archives(tmp_path: Path, fake_home: Path) -> None:
+    store = FakeStore()
+    manager, batch = _ok_batch(
+        tmp_path, fake_home, store, retention={"daily": 1, "weekly": 0, "monthly": 0, "yearly": 0}
+    )
+    _leave_archive(tmp_path, "two")
+    report = manager.prune_after_batch(batch, None)
+    assert report.deferred == []

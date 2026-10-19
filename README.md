@@ -279,9 +279,14 @@ timestamps and descriptions; nothing is deleted unless you ask.
 
 ```sh
 config-saver --restic-init --encrypt-to <age public key>   # once; add --identity <key> if not ~/.config/age/key.txt
-config-saver --migrate                                     # copy every archive into the store, oldest first
-config-saver --migrate --delete-migrated                   # re-run: delete each archive that is verified
+config-saver --migrate --delete-migrated                   # the one-shot step: copy, verify, then delete each archive
 ```
+
+`--migrate` alone (copy without deleting) is there for a cautious first look; the one-shot form is
+recommended because it verifies every archive before deleting it. Until it has finished, the
+automatic prune after `--compress` is **deferred** for every configuration that still has archives
+on disk (a yellow line names them), so retention never forgets snapshots that a later `--migrate`
+would only copy in again. A manual `--prune` is not deferred.
 
 - **Back up the age private key off this machine first.** After `--restic-init` that key is the
   only secret needed to read the whole store (the repository password is encrypted to it); lose it
