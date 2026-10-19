@@ -382,6 +382,7 @@ class _CliFakeStore:
 
     def __init__(self, saves_dir: str, identity: str | None = None) -> None:
         self.saves_dir = saves_dir
+        self.identity = identity
         self.backups: list[tuple[str, datetime, str | None]] = []
         self.forgets: list[str] = []
         self.prunes = 0
@@ -648,7 +649,7 @@ def test_list_restic_mode_groups_by_cfg_and_shows_unmigrated(
     assert "zsh" in out and "kde" in out
     assert "2026-10-01 03:00:00" in out and "first run" in out
     assert "2026-08-01 12:00:00" in out
-    assert "not migrated" in out
+    assert "archive still on disk" in out
     rows = [ln for ln in out.splitlines() if "│" in ln or "┃" in ln]
     assert sum(" tar " in ln for ln in rows) == 1
     assert sum(" restic " in ln for ln in rows) == 3
@@ -1089,3 +1090,116 @@ def test_cli_compress_names_the_configs_whose_prune_was_deferred(
     assert (
         "automatic prune deferred for one: unmigrated archives remain; run `config-saver --migrate --delete-migrated` (or remove archives that cannot be migrated)"
     ) in capsys.readouterr().out
+
+
+def test_compress_honours_identity_flag(tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mode(monkeypatch, StorageMode.RESTIC)
+    cfg_dir = _cfg_dir(tmp_path, data_dir)
+    assert run(["--compress", "-i", str(cfg_dir), "--jobs", "1", "--identity", "/my/key"]) == EXIT_OK
+    assert _CliFakeStore.instances[0].identity == "/my/key"
+
+
+# ------------------------------------------------------------ malformed YAML
+
+
+def _bad_yaml(directory: Path, name: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{name}.yaml"
+    path.write_text("directories: [\n")
+    return path
+
+
+def test_prune_with_malformed_yaml_reports_it_and_exits_runtime(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _maint_mode(monkeypatch, StorageMode.RESTIC, *_snaps("broken"), *_snaps("fine"))
+    cfgs = fake_home / "cfgs"
+    _bad_yaml(cfgs, "broken")
+    write_config(cfgs / "fine.yaml", [str(fake_home)])
+    assert run(["--prune", "--dry-run", "-i", str(cfgs)]) == EXIT_RUNTIME
+    out = capsys.readouterr().out
+    assert "[broken] cannot read" in out
+    assert [c for c, _, _ in _MaintStore.instances[-1].forgets] == ["fine"]
+
+
+def test_export_config_restic_malformed_yaml_is_validation_exit(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    _bad_yaml(fake_home / ".config" / "config-saver" / "configs.d", "zsh")
+    assert run(["--export-config", "zsh"]) == EXIT_VALIDATION
+    assert "yaml" in capsys.readouterr().out.lower()
+
+
+def test_export_all_restic_malformed_yaml_continues_and_exits_validation(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)), _snap("kde", datetime(2026, 10, 2, 4, 0, 0)))
+    _bad_yaml(fake_home / ".config" / "config-saver" / "configs.d", "zsh")
+    out_dir = tmp_path / "exports"
+    assert run(["--export-all-configs", "--output", str(out_dir)]) == EXIT_VALIDATION
+    assert "[zsh]" in capsys.readouterr().out
+    assert [p.name for p in out_dir.iterdir()] == ["kde-20261002-040000.tar.gz"]
+
+
+# ------------------------------------------------- top-level archives are 'legacy'
+
+
+def _top_level_archive(fake_home: Path, ts: str) -> Path:
+    path = fake_home / ".config" / "config-saver" / f"config-saver-{ts}.tar.gz"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(path, "w:gz"):
+        pass
+    return path
+
+
+def test_top_level_archives_are_named_legacy_in_show_configs_and_list(
+    fake_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _top_level_archive(fake_home, "20260101-000000")
+    assert run(["--show-configs"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "- legacy" in out and "config-saver" not in out.replace("Available", "")
+    assert run(["--list"]) == EXIT_OK
+    assert "legacy" in capsys.readouterr().out
+
+
+def test_export_config_legacy_finds_top_level_tar(fake_home: Path, tmp_path: Path) -> None:
+    archive = _top_level_archive(fake_home, "20260101-000000")
+    dest = tmp_path / "out.tar.gz"
+    assert run(["--export-config", "legacy", "--output", str(dest)]) == EXIT_OK
+    assert dest.read_bytes() == archive.read_bytes()
+
+
+def test_export_all_configs_names_top_level_archive_once(fake_home: Path, tmp_path: Path) -> None:
+    _top_level_archive(fake_home, "20260101-000000")
+    out_dir = tmp_path / "exports"
+    assert run(["--export-all-configs", "--output", str(out_dir)]) == EXIT_OK
+    assert [p.name for p in out_dir.iterdir()] == ["config-saver-20260101-000000.tar.gz"]
+
+
+def test_export_config_legacy_restic_newest_wins(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _read_mode(monkeypatch, _snap("legacy", datetime(2026, 10, 2, 3, 4, 5)))
+    newer = _top_level_archive(fake_home, "20261101-000000")
+    dest = tmp_path / "copy.tar.gz"
+    assert run(["--export-config", "legacy", "--output", str(dest)]) == EXIT_OK
+    assert dest.read_bytes() == newer.read_bytes()
+    newer.unlink()
+    older = _top_level_archive(fake_home, "20250101-000000")
+    assert run(["--export-config", "legacy", "--output", str(dest)]) == EXIT_OK
+    assert dest.read_bytes() != older.read_bytes()  # the snapshot is newer than the archive
+
+
+def test_prune_totals_read_as_sentences(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _maint_mode(monkeypatch, StorageMode.RESTIC, *_snaps("mine"))
+    cfgs = fake_home / "cfgs"
+    cfgs.mkdir()
+    write_config(cfgs / "mine.yaml", [str(fake_home)])
+    assert run(["--prune", "--dry-run", "-i", str(cfgs)]) == EXIT_OK
+    assert "Total: 2 backup(s) would be removed." in capsys.readouterr().out
+    assert run(["--prune", "-i", str(cfgs)]) == EXIT_OK
+    assert "Total: 2 backup(s) removed." in capsys.readouterr().out

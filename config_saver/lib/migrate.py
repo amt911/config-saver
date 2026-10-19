@@ -22,15 +22,14 @@ from datetime import datetime
 from typing import IO
 
 from . import crypto
-from .archive_names import FILENAME_PATTERN
-from .backup_manager.backup_manager import LEGACY_NAME, BackupManager
+from .archive_names import FILENAME_PATTERN, LEGACY_NAME, LEGACY_STEM, is_top_level
+from .backup_manager.backup_manager import BackupManager
 from .errors import EncryptionError, StoreError
 from .restic_store import ResticStore, Snapshot, drain
 from .tar_compressor.tar_compressor import CompressResult
 from .tar_prune import ARCHIVE_GLOBS, TIMESTAMP_FORMAT
 
 _CHUNK = 1024 * 1024
-_LEGACY_STEM = "config-saver"
 _KILL_GRACE_SECONDS = 5
 
 
@@ -80,11 +79,11 @@ def _mtime(path: str) -> datetime:
 def classify(path: str, saves_dir: str) -> tuple[str, datetime]:
     """(config name, backup time) of an archive: from its name, else the config 'legacy' / its mtime."""
     name = os.path.basename(path)
-    top_level = os.path.dirname(os.path.abspath(path)) == os.path.abspath(saves_dir)
+    top_level = is_top_level(path, saves_dir)
     match = FILENAME_PATTERN.match(name)
     if match:
         cfg = match.group(1)
-        if top_level and cfg == _LEGACY_STEM:
+        if top_level and cfg == LEGACY_STEM:
             cfg = LEGACY_NAME
         try:
             return cfg, datetime.strptime(match.group(2), TIMESTAMP_FORMAT)
@@ -94,7 +93,7 @@ def classify(path: str, saves_dir: str) -> tuple[str, datetime]:
     for suffix in (".age", ".gpg", ".gz", ".tar"):
         if stem.endswith(suffix):
             stem = stem[: -len(suffix)]
-    return (LEGACY_NAME if top_level and stem == _LEGACY_STEM else stem), _mtime(path)
+    return (LEGACY_NAME if top_level and stem == LEGACY_STEM else stem), _mtime(path)
 
 
 @contextlib.contextmanager

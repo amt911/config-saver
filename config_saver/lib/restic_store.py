@@ -151,7 +151,9 @@ class ResticStore:
         self.repo = repo_path(saves_dir)
         self.password_file = password_path(saves_dir)
         self.settings_file = settings_path(saves_dir)
-        self.identity = identity or self._recorded_identity() or os.path.expanduser(DEFAULT_IDENTITY)
+        # Absolute, so a store set up from one directory still works from the timer's.
+        chosen = identity or self._recorded_identity() or DEFAULT_IDENTITY
+        self.identity = os.path.abspath(os.path.expanduser(chosen))
 
     def _recorded_identity(self) -> str | None:
         try:

@@ -15,6 +15,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from config_saver.lib.archive_names import LEGACY_NAME
 from config_saver.lib.errors import RootRequiredError, StoreError
 from config_saver.lib.models.encryption_model import EncryptionModel
 from config_saver.lib.models.model import Model
@@ -31,8 +32,7 @@ from config_saver.lib.tar_prune import ARCHIVE_GLOBS, TIMESTAMP_FORMAT, has_arch
 # Backups contain secrets; their directories are private by construction.
 PRIVATE_DIR_MODE = 0o700
 
-# Config stem reserved for migrated pre-store archives: never pruned automatically.
-LEGACY_NAME = "legacy"
+# LEGACY_NAME (see archive_names) is reserved for migrated pre-store archives: never pruned automatically.
 
 # Config files accepted in directory (batch) mode. YAML parsing also accepts JSON.
 CONFIG_GLOBS = ("*.yaml", "*.yml", "*.json")

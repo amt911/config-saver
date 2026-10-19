@@ -170,6 +170,21 @@ def test_init_permissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert (tmp_path / "restic").stat().st_mode & 0o777 == 0o700
 
 
+def test_relative_identity_is_stored_and_used_absolute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    ResticStore(str(tmp_path), identity="key.txt").init("age1acde")
+    assert json.loads((tmp_path / "restic-store.json").read_text())["identity"] == str(work / "key.txt")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert ResticStore(str(tmp_path)).identity == str(work / "key.txt")
+    assert ResticStore(str(tmp_path), identity="other.txt").identity == str(elsewhere / "other.txt")
+
+
 @pytest.mark.parametrize("bad", ["it's", 'say"hi', "back\\slash"])
 def test_paths_restic_cannot_carry_are_refused_before_any_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: str

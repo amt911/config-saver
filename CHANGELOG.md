@@ -36,8 +36,25 @@ All notable changes to this project are documented here. The format follows
   `--compress` skips it and says so (`--migrate --delete-migrated` is the recommended one-shot
   step); `--migrate` prints `restic check: ok` after a successful closing check.
 
+### Changed
+
+- Archives written straight into the saves directory (`config-saver-<ts>.tar.gz`, no config name)
+  are called `legacy` everywhere: `--list`, `--show-configs`, `--export-config legacy` (it finds the
+  tar and the restic copies, newest wins), `--migrate` and `--prune`. They used to show up as
+  `config-saver` in the listing; `--export-config config-saver` no longer matches them.
+- The `--list` legend now reads "archive still on disk" (the marker also covers archives that are
+  already migrated but not yet deleted); `--prune` totals read "N backup(s) would be removed." /
+  "N backup(s) removed.".
+- tar-mode `--list` shows one row per archive.
+
 ### Fixed
 
+- A failed tar run removes the empty timestamp directory it created.
+- A relative `--identity` is stored (and resolved) as an absolute path, so a store set up from one
+  directory still opens from the timer's; `--compress` now honours `--identity`.
+- Malformed YAML no longer crashes with a traceback: `--prune` reports the configuration as
+  unreadable (exit `5`), `--export-config` exits `3`, `--export-all-configs` reports the
+  configuration, carries on and exits `3`.
 - `--include-system-configs` was dropped by batch (`--input DIR`) and `--description` runs; it is
   now forwarded to every archive. `--encrypt-to` was likewise dropped by `--description` runs.
 

@@ -11,9 +11,11 @@ import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+import yaml
 from pydantic import ValidationError
 
-from .backup_manager.backup_manager import LEGACY_NAME, BackupManager
+from .archive_names import LEGACY_NAME
+from .backup_manager.backup_manager import BackupManager
 from .errors import StoreError
 from .models.retention_model import RetentionModel
 from .parser.parser import Parser
@@ -75,7 +77,7 @@ def retention_by_config(
     for name, path in sorted(paths_by_name.items()):
         try:
             known[name] = Parser(path).get_model().retention
-        except (ValidationError, OSError, ValueError) as exc:
+        except (ValidationError, yaml.YAMLError, OSError, ValueError) as exc:
             errors[name] = f"cannot read {path}: {exc}"
     return known, errors
 

@@ -17,6 +17,7 @@ import sys
 from collections.abc import Iterator
 from datetime import datetime
 
+import yaml
 from colorama import Fore, init
 from pydantic import ValidationError
 from rich.align import Align
@@ -26,7 +27,7 @@ from rich.table import Table
 
 from config_saver import __version__
 from config_saver.lib import crypto, maintenance, paths
-from config_saver.lib.archive_names import FILENAME_PATTERN
+from config_saver.lib.archive_names import FILENAME_PATTERN, archive_identity
 from config_saver.lib.backup_manager.backup_manager import BackupManager, BatchResult, PruneReport
 from config_saver.lib.errors import ArchiveError, EncryptionError, RootRequiredError, StoreError, UnsafeArchiveError
 from config_saver.lib.migrate import MigrationReport, migrate_archives
@@ -91,9 +92,7 @@ class BackupTable:
         # config name -> [(when, store kind, description)]
         grouped: dict[str, list[tuple[datetime, str, str | None]]] = {}
         for f in files:
-            name = os.path.basename(f)
-            m = self.FILENAME_PATTERN.match(name)
-            cfgname = m.group(1) if m else os.path.splitext(name)[0]
+            cfgname, _stamp = archive_identity(f, self.saves_dir)
             desc = self.manager.get_description_for_archive(f)
             grouped.setdefault(cfgname, []).append((self._parse_ts(f), "tar", desc))
         for snap in snapshots or []:
@@ -128,7 +127,7 @@ class BackupTable:
         console.rule("Saved configurations")
         console.print(Columns(tables, expand=False, padding=(0, 2), equal=False))
         if mixed and any(kind == "tar" for entries in grouped.values() for _, kind, _ in entries):
-            console.print("tar = full archive on disk, not migrated to the restic store yet", style="yellow")
+            console.print("tar = full archive on disk, archive still on disk", style="yellow")
         console.rule()
 
 
@@ -467,6 +466,10 @@ class CLI:
             print(Fore.RED + "Validation error in configuration:")
             print(Fore.RED + str(e))
             return EXIT_VALIDATION
+        except yaml.YAMLError as e:
+            print(Fore.RED + "Validation error in configuration: not valid YAML:")
+            print(Fore.RED + str(e))
+            return EXIT_VALIDATION
         except PermissionError as e:
             print(Fore.RED + f"Permission error: {e}")
             return EXIT_PERMISSION
@@ -534,7 +537,9 @@ class CLI:
 
     def _show_configs(self, manager: BackupManager, store: ResticStore | None = None) -> int:
         config_names = {
-            m.group(1) for m in (FILENAME_PATTERN.match(os.path.basename(p)) for p in manager.list_archives()) if m
+            archive_identity(p, manager.saves_dir)[0]
+            for p in manager.list_archives()
+            if FILENAME_PATTERN.match(os.path.basename(p))
         }
         if store is not None:
             config_names |= {s.cfg for s in store.snapshots()}
@@ -548,7 +553,7 @@ class CLI:
 
     def _export_config(self, manager: BackupManager, args: argparse.Namespace) -> int:
         cfgname = args.export_config
-        matching = [p for p in manager.list_archives() if os.path.basename(p).startswith(cfgname + "-")]
+        matching = [p for p in manager.list_archives() if archive_identity(p, manager.saves_dir)[0] == cfgname]
         if not matching:
             print(Fore.RED + f"No saved configuration found with the name: {cfgname}")
             return EXIT_NO_SUCH_CONFIG
@@ -567,9 +572,7 @@ class CLI:
     def _export_all_configs(self, manager: BackupManager, args: argparse.Namespace) -> int:
         cfg_latest: dict[str, tuple[str, str]] = {}
         for p in manager.list_archives():
-            name = os.path.basename(p)
-            m = FILENAME_PATTERN.match(name)
-            cfg, ts = (m.group(1), m.group(2)) if m else (os.path.splitext(name)[0], "00000000-000000")
+            cfg, ts = archive_identity(p, manager.saves_dir)
             if cfg not in cfg_latest or ts > cfg_latest[cfg][0]:
                 cfg_latest[cfg] = (ts, p)
 
@@ -603,10 +606,7 @@ class CLI:
         """cfg name -> (timestamp, path) of the newest tar archive still on disk."""
         newest: dict[str, tuple[str, str]] = {}
         for path in manager.list_archives():
-            name = os.path.basename(path)
-            m = FILENAME_PATTERN.match(name)
-            # Same fallback as the archive-mode export: an odd name stands for itself, oldest possible.
-            cfg, ts = (m.group(1), m.group(2)) if m else (os.path.splitext(name)[0], "00000000-000000")
+            cfg, ts = archive_identity(path, manager.saves_dir)
             if cfg not in newest or ts > newest[cfg][0]:
                 newest[cfg] = (ts, path)
         return newest
@@ -748,7 +748,7 @@ class CLI:
             # Like the archive-mode export: one failing configuration does not stop the others.
             try:
                 plain |= self._export_one(manager, store, args, cfg, newest.get(cfg), tars.get(cfg), None, dest_dir)
-            except ValidationError as e:
+            except (ValidationError, yaml.YAMLError) as e:
                 print(Fore.RED + f"[{cfg}] validation error in configuration: {e}")
                 exit_code = EXIT_VALIDATION
             except PermissionError as e:
@@ -833,6 +833,7 @@ class CLI:
         known, unreadable = maintenance.retention_by_config(manager, args.input or default_config_dirs())
         outcome = maintenance.prune_all(saves_dir, store, known, unreadable, args.dry_run, args.include_legacy)
         verb = "would remove" if args.dry_run else "removed"
+        total_verb = "would be removed" if args.dry_run else "removed"
         for note in outcome.notes:
             print(Fore.YELLOW + note)
         for cfg, labels in outcome.removed.items():
@@ -841,7 +842,7 @@ class CLI:
                 print(f"    {label}")
         for error in outcome.errors:
             print(Fore.RED + error)
-        print(f"Total: {outcome.total} backup(s) {verb}.")
+        print(f"Total: {outcome.total} backup(s) {total_verb}.")
         return EXIT_RUNTIME if outcome.errors else EXIT_OK
 
     def _compress(
@@ -865,7 +866,7 @@ class CLI:
 
         # A store that exists but cannot be used raises StoreError here: never a silent fallback.
         mode = select_mode(saves_dir)
-        store = ResticStore(saves_dir) if mode is StorageMode.RESTIC else None
+        store = ResticStore(saves_dir, args.identity) if mode is StorageMode.RESTIC else None
         if store is not None and (args.encrypt_to or args.encrypt_method):
             print(
                 Fore.RED + "--encrypt-to/--encrypt-method cannot be used while the restic store is in use: "
