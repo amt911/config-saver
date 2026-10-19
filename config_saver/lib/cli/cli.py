@@ -11,6 +11,7 @@ import argparse
 import os
 import re
 import shutil
+import sys
 from datetime import datetime
 
 from colorama import Fore, init
@@ -22,11 +23,13 @@ from rich.table import Table
 
 from config_saver import __version__
 from config_saver.lib import crypto, paths
-from config_saver.lib.backup_manager.backup_manager import BackupManager, BatchResult
-from config_saver.lib.errors import ArchiveError, EncryptionError, RootRequiredError, UnsafeArchiveError
+from config_saver.lib.backup_manager.backup_manager import BackupManager, BatchResult, PruneReport
+from config_saver.lib.errors import ArchiveError, EncryptionError, RootRequiredError, StoreError, UnsafeArchiveError
 from config_saver.lib.models.encryption_model import EncryptionModel
+from config_saver.lib.restic_store import NOTICES, ResticStore, StorageMode, select_mode
 from config_saver.lib.tar_compressor.tar_compressor import CompressResult
 from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
+from config_saver.lib.tar_prune import TIMESTAMP_FORMAT
 
 init(autoreset=True)
 
@@ -364,8 +367,14 @@ class CLI:
     @staticmethod
     def _report_batch(batch: BatchResult) -> None:
         for outcome in batch.outcomes:
-            if outcome.archive_path:
-                print(Fore.GREEN + f"Compression completed successfully. Output: {outcome.archive_path}")
+            if outcome.archive_path or outcome.snapshot:
+                if outcome.snapshot:
+                    print(
+                        Fore.GREEN
+                        + f"Stored snapshot {outcome.snapshot.short_id} of {outcome.name} in the restic store."
+                    )
+                else:
+                    print(Fore.GREEN + f"Compression completed successfully. Output: {outcome.archive_path}")
                 if outcome.result:
                     CLI._report_result(outcome.result, label=outcome.name)
             elif outcome.error:
@@ -379,6 +388,20 @@ class CLI:
             for cfg in batch.skipped_root_only:
                 print(Fore.YELLOW + f"  - {os.path.basename(cfg)}")
             print(Fore.YELLOW + "  To process these configs, run with: sudo config-saver --compress")
+
+    @staticmethod
+    def _report_prune(report: PruneReport) -> None:
+        for name, removed in report.removed.items():
+            print(Fore.CYAN + f"[{name}] pruned {len(removed)} old backup(s).")
+        for error in report.errors:
+            print(Fore.RED + f"Pruning failed: {error}")
+
+    @staticmethod
+    def _print_notice(mode: StorageMode) -> None:
+        """Say once, on stderr, why backups are not deduplicated (tar modes only)."""
+        notice = NOTICES.get(mode)
+        if notice:
+            print(Fore.YELLOW + notice, file=sys.stderr)
 
     # ---------------------------------------------------------------- actions
 
@@ -407,6 +430,9 @@ class CLI:
             return EXIT_ENCRYPTION
         except (UnsafeArchiveError, ArchiveError) as e:
             print(Fore.RED + f"Archive error: {e}")
+            return EXIT_RUNTIME
+        except StoreError as e:
+            print(Fore.RED + str(e))
             return EXIT_RUNTIME
         except RuntimeError as e:
             print(Fore.RED + f"Runtime error: {e}")
@@ -516,6 +542,16 @@ class CLI:
         if args.progress and args.jobs == "auto":
             jobs = 1
 
+        # A store that exists but cannot be used raises StoreError here: never a silent fallback.
+        mode = select_mode(saves_dir)
+        store = ResticStore(saves_dir) if mode is StorageMode.RESTIC else None
+        if store is not None and (args.encrypt_to or args.encrypt_method):
+            print(
+                Fore.RED + "--encrypt-to/--encrypt-method cannot be used while the restic store is in use: "
+                "the store is always encrypted, and recipients apply to exports (--export-config)."
+            )
+            return EXIT_USAGE
+
         try:
             encryption = self._encryption_override(args)
         except ValueError as e:
@@ -557,6 +593,7 @@ class CLI:
             if not cfg_files:
                 return self._report_no_configurations()
 
+            self._print_notice(mode)
             batch = manager.compress_config_files(
                 cfg_files,
                 timestamp,
@@ -565,9 +602,13 @@ class CLI:
                 jobs=jobs,
                 encryption=encryption,
                 extra_directories=extra_directories,
+                store=store,
             )
             self._report_batch(batch)
-            if batch.failures:
+            # Only after the report, and never allowed to change a backup's outcome.
+            prune_report = manager.prune_after_batch(batch, store)
+            self._report_prune(prune_report)
+            if batch.failures or prune_report.errors:
                 return EXIT_RUNTIME
             if args.strict and batch.missing_inputs:
                 return EXIT_INCOMPLETE
@@ -584,6 +625,22 @@ class CLI:
                 "with an explicit --output path."
             )
             return EXIT_USAGE
+
+        self._print_notice(mode)
+        if store is not None and not args.output:
+            snapshot, result = manager.compress_config_to_store(
+                input_path,
+                store,
+                datetime.strptime(timestamp, TIMESTAMP_FORMAT),
+                description=args.description,
+                show_progress=args.progress,
+                extra_directories=extra_directories,
+            )
+            print(Fore.GREEN + f"Stored snapshot {snapshot.short_id} of {snapshot.cfg} in the restic store.")
+            self._report_result(result)
+            if args.strict and result.missing_inputs:
+                return EXIT_INCOMPLETE
+            return EXIT_OK
 
         if args.description:
             cfg_basename = os.path.splitext(os.path.basename(input_path))[0]

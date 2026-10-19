@@ -201,6 +201,9 @@ config-saver --compress
 - `--identity FILE`: Key file used to decrypt an encrypted archive (required for `age`)
 - `--version`/`-v`: Show program version and exit
 
+With a restic store, `--compress` snapshots into it, then prunes by each configuration's
+`retention:`; see [Deduplicated storage](#deduplicated-storage-restic) and [Retention](#retention).
+
 - `--description`/`-m DESCRIPTION`: Optional short description to save alongside a created archive. When provided, the CLI will create a per-config timestamp directory and store both the `.tar.gz` and a `description.txt` file inside:
 
 ```text
@@ -221,14 +224,73 @@ itself.
 | `2` | Configuration file, config directory or archive not found |
 | `3` | Configuration failed validation (bad shape, unknown key) |
 | `4` | Permission denied, including `only_root_user: true` run as non-root |
-| `5` | Archive error: corrupt archive, or a member refused as unsafe |
-| `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`) |
+| `5` | Archive error: corrupt archive, or a member refused as unsafe; an unusable restic store; a failed prune (after a complete batch report) |
+| `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`, `--encrypt-to` with the restic store) |
 | `7` | `--export-config NAME` matched no saved configuration |
 | `8` | `--strict` and at least one configured path was missing |
 | `9` | Encryption or decryption failed (backend missing, wrong key, bad recipient) |
 | `10` | I/O error |
 
 argparse itself exits with `2` for usage errors such as a missing action flag.
+
+## Deduplicated storage (restic)
+
+Daily full archives repeat almost everything. When [restic](https://restic.net) and `age` are
+installed and a store has been set up, `--compress` writes each configuration into one shared,
+deduplicated and encrypted restic repository instead of a `.tar.gz`; a day-two backup of unchanged
+data costs next to nothing.
+
+- **The store** lives in the saves directory: `restic/` (the repository), `restic-password.age`
+  (a random password, encrypted to your age key) and `restic-store.json`. Set it up once with
+  `config-saver --restic-init --encrypt-to <age public key>`. The password is never written
+  unencrypted and never appears on a command line.
+- **Mode selection is automatic**, per run, from what exists:
+
+  | Situation | What `--compress` does |
+  |-----------|------------------------|
+  | no `restic` binary, no store | writes `.tar.gz` archives, and prints a notice on stderr |
+  | `restic` installed, no store | writes `.tar.gz` archives, and prints a notice on stderr |
+  | store exists | snapshots into the store, tagged with the configuration's name |
+  | store exists but `restic`/`age` is missing, the identity cannot decrypt it, or it is half-made | **fails** (exit `5`); it never falls back to archives behind your back |
+
+  The notice is printed once per run, only by `--compress`, and only in the two archive modes.
+- **`--encrypt-to` / `--encrypt-method` are rejected** (exit `6`) while the store is in use: the store
+  is always encrypted, and recipients apply to exports. A configuration's own `encrypt:` block is
+  ignored for the store for the same reason; it still applies to `.tar.gz` output.
+- **Single files:** `--compress --input one.yaml` goes into the store under the file's name (with
+  `--description` as the snapshot description); with `--output` it still writes exactly the
+  `.tar.gz` you named. Neither is pruned.
+- `--include-system-configs` and `exclude:` behave the same in both modes.
+
+## Retention
+
+Backups accumulate; `retention:` says how many to keep. It is an optional block in any
+configuration:
+
+```yaml
+retention:
+  daily: 7      # the newest backup of each of the last 7 days that have one
+  weekly: 4     # ... of each of the last 4 ISO weeks
+  monthly: 12   # ... of each of the last 12 months
+  yearly: 2     # ... of each of the last 2 years
+```
+
+The values shown are the defaults. `0` switches that bucket off; the newest backup is always kept,
+so a policy of all zeros leaves exactly one. The buckets follow restic's `--keep-daily/-weekly/
+-monthly/-yearly`, so both storage modes agree, and a backup kept by any bucket is kept.
+
+Pruning runs automatically after every directory-mode `--compress` (the systemd timer's case), only
+for the configurations that run just backed up successfully:
+
+- **Restic mode:** always. A configuration without a `retention:` block gets the defaults. Each
+  configuration's old snapshots are forgotten, then one `restic prune` reclaims the space.
+- **Archive mode:** only for configurations that declare `retention:` explicitly; the
+  `<timestamp>/` directories outside the policy are deleted. Without the block nothing is ever
+  deleted, so upgrading does not remove history you never asked to prune. Legacy top-level
+  archives and anything else in the directory are never touched.
+
+A pruning failure is reported after the batch report, makes the run exit `5`, and never undoes or
+hides a backup that succeeded. Single-file `--compress` is not pruned.
 
 ## Round-trip semantics
 

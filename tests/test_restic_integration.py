@@ -101,3 +101,51 @@ def test_apostrophe_path_gives_clear_error(tmp_path: Path, monkeypatch: pytest.M
     with pytest.raises(StoreError, match="cannot carry"):
         ResticStore(str(weird), identity=key).init(recipient)
     assert not (weird / "restic").exists()
+
+
+def test_cli_compress_into_the_store_then_prune(
+    tmp_path: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real restic through the CLI: two configs twice, then retention on one of them."""
+    import yaml
+
+    from config_saver.lib.cli import cli as cli_module
+    from config_saver.lib.cli.cli import CLI, EXIT_OK
+
+    monkeypatch.setenv("RESTIC_CACHE_DIR", str(tmp_path / "cache"))
+    key, recipient = _identity(tmp_path)
+    saves = fake_home / ".config" / "config-saver"
+    ResticStore(str(saves), identity=key).init(recipient)
+
+    data = fake_home / "data"
+    data.mkdir()
+    (data / "f.txt").write_text("hello\n")
+    cfg_dir = tmp_path / "configs"
+    cfg_dir.mkdir()
+    (cfg_dir / "one.yaml").write_text(yaml.safe_dump({"directories": [str(data)]}))
+    two = cfg_dir / "two.yaml"
+    two.write_text(yaml.safe_dump({"directories": [str(data)]}))
+
+    day = {"n": 0}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def]
+            day["n"] += 1
+            return datetime(2026, 10, day["n"], 3, 0, 0)
+
+    monkeypatch.setattr(cli_module, "datetime", Clock)
+
+    for _ in range(2):  # the default --jobs auto: both configs back up in parallel
+        assert CLI(["--compress", "-i", str(cfg_dir)]).run() == EXIT_OK
+    store = ResticStore(str(saves))
+    assert len(store.snapshots("one")) == 2 and len(store.snapshots("two")) == 2
+    assert not list(saves.rglob("*.tar.gz"))
+
+    zero = {"daily": 0, "weekly": 0, "monthly": 0, "yearly": 0}
+    two.write_text(yaml.safe_dump({"directories": [str(data)], "retention": zero}))
+    assert CLI(["--compress", "-i", str(cfg_dir)]).run() == EXIT_OK
+
+    assert len(store.snapshots("one")) == 3  # defaults keep every distinct day
+    kept = store.snapshots("two")
+    assert len(kept) == 1 and kept[0].time == datetime(2026, 10, 3, 3, 0, 0)

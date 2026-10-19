@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`--compress` stores into a deduplicated restic repository** when `restic` and `age` are
+  installed and a store exists in the saves directory. Each configuration is a snapshot tagged with
+  its name; unchanged data is stored once across runs and across configurations. The store is always
+  encrypted (random password, age-encrypted), so `--encrypt-to`/`--encrypt-method` are rejected
+  (exit `6`) while it is in use. Without a store `--compress` writes `.tar.gz` as before and prints
+  a one-line notice on stderr saying how to get deduplication. A store that exists but cannot be
+  used is an error (exit `5`), never a silent fallback.
+- **`retention:` per configuration** (`daily` 7, `weekly` 4, `monthly` 12, `yearly` 2, `0` disables a
+  bucket; the newest backup is always kept) and **automatic pruning after every directory-mode
+  `--compress`**: in restic mode always (defaults when the block is absent), in archive mode only
+  for configurations that declare `retention:`. A prune failure is reported after the batch and
+  exits `5` without touching the backups.
+
+### Fixed
+
+- `--include-system-configs` was dropped by batch (`--input DIR`) and `--description` runs; it is
+  now forwarded to every archive. `--encrypt-to` was likewise dropped by `--description` runs.
+
 ## [3.4.0] - 2026-08-19
 
 ### Added

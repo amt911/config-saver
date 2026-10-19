@@ -27,6 +27,8 @@ from config_saver.lib.cli.cli import (
     EXIT_VALIDATION,
     BackupTable,
 )
+from config_saver.lib.errors import StoreError
+from config_saver.lib.restic_store import NOTICES, Snapshot, StorageMode
 
 from .conftest import write_config
 
@@ -367,3 +369,205 @@ def test_decompress_takes_a_single_archive(tmp_path: Path, data_dir: Path) -> No
     archive = tmp_path / "a.tar.gz"
     assert run(["--compress", "-i", str(cfg), "-o", str(archive)]) == EXIT_OK
     assert run(["--decompress", "-i", str(archive), "-i", str(archive), "-o", str(tmp_path / "out")]) == EXIT_USAGE
+
+
+# ------------------------------------------------- restic store and pruning
+
+
+class _CliFakeStore:
+    """Stands in for ResticStore; ``instances`` records every one the CLI built."""
+
+    instances: list[_CliFakeStore] = []
+
+    def __init__(self, saves_dir: str, identity: str | None = None) -> None:
+        self.saves_dir = saves_dir
+        self.backups: list[tuple[str, datetime, str | None]] = []
+        self.forgets: list[str] = []
+        self.prunes = 0
+        self.forgotten: list[Snapshot] = []
+        self.fail_prune = False
+        _CliFakeStore.instances.append(self)
+
+    def backup(self, write, cfg, when, description):  # type: ignore[no-untyped-def]
+        result = write(io.BytesIO())
+        self.backups.append((cfg, when, description))
+        return Snapshot(f"{cfg}-id", f"{cfg}-sh", when, cfg, description), result, 1
+
+    def forget(self, cfg, policy, dry_run):  # type: ignore[no-untyped-def]
+        self.forgets.append(cfg)
+        return self.forgotten
+
+    def prune(self) -> None:
+        self.prunes += 1
+        if self.fail_prune:
+            raise StoreError("prune exploded")
+
+
+def _mode(monkeypatch: pytest.MonkeyPatch, mode: StorageMode) -> None:
+    _CliFakeStore.instances = []
+    monkeypatch.setattr("config_saver.lib.cli.cli.select_mode", lambda _saves: mode)
+    monkeypatch.setattr("config_saver.lib.cli.cli.ResticStore", _CliFakeStore)
+
+
+def _cfg_dir(tmp_path: Path, data_dir: Path, **extra: object) -> Path:
+    cfg_dir = tmp_path / "configs"
+    cfg_dir.mkdir()
+    write_config(cfg_dir / "one.yaml", [str(data_dir)])
+    write_config(cfg_dir / "two.yaml", [str(data_dir)], **extra)
+    return cfg_dir
+
+
+def test_restic_mode_stores_snapshots_and_writes_no_archives(
+    tmp_path: Path, data_dir: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mode(monkeypatch, StorageMode.RESTIC)
+    cfg_dir = _cfg_dir(tmp_path, data_dir)
+
+    assert run(["--compress", "-i", str(cfg_dir), "--jobs", "1"]) == EXIT_OK
+
+    store = _CliFakeStore.instances[0]
+    assert [b[0] for b in store.backups] == ["one", "two"]
+    assert not list((fake_home / ".config" / "config-saver").rglob("*.tar.gz"))
+    out = capsys.readouterr()
+    assert "one-sh" in out.out and "two-sh" in out.out
+    assert out.err == ""  # restic mode prints no notice
+
+
+@pytest.mark.parametrize("mode", [StorageMode.TAR_NO_RESTIC, StorageMode.TAR_NOT_INITIALISED])
+def test_notice_printed_once_in_tar_modes(
+    tmp_path: Path,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: StorageMode,
+) -> None:
+    _mode(monkeypatch, mode)
+    cfg_dir = _cfg_dir(tmp_path, data_dir)
+
+    assert run(["--compress", "-i", str(cfg_dir), "--jobs", "1"]) == EXIT_OK
+
+    captured = capsys.readouterr()
+    assert captured.err.count(NOTICES[mode]) == 1
+    assert NOTICES[mode] not in captured.out
+
+
+def test_notice_is_not_printed_for_other_verbs(
+    data_dir: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mode(monkeypatch, StorageMode.TAR_NO_RESTIC)
+    assert run(["--list"]) == EXIT_OK
+    assert capsys.readouterr().err == ""
+
+
+def test_store_error_from_select_mode_is_exit_runtime_in_red(
+    tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken(_saves: str) -> StorageMode:
+        raise StoreError("restic store is incomplete: password file is missing")
+
+    monkeypatch.setattr("config_saver.lib.cli.cli.select_mode", broken)
+    cfg_dir = _cfg_dir(tmp_path, data_dir)
+
+    assert run(["--compress", "-i", str(cfg_dir)]) == EXIT_RUNTIME
+    assert "restic store is incomplete" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("extra", [["--encrypt-to", "age1abc"], ["--encrypt-method", "gpg"]])
+def test_encrypt_flags_are_rejected_in_restic_mode(
+    tmp_path: Path,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    extra: list[str],
+) -> None:
+    _mode(monkeypatch, StorageMode.RESTIC)
+    cfg_dir = _cfg_dir(tmp_path, data_dir)
+
+    assert run(["--compress", "-i", str(cfg_dir), *extra]) == EXIT_USAGE
+    assert "always encrypted" in capsys.readouterr().out
+    assert _CliFakeStore.instances == [] or _CliFakeStore.instances[0].backups == []
+
+
+def test_single_file_without_output_goes_to_the_store(
+    tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mode(monkeypatch, StorageMode.RESTIC)
+    cfg = write_config(tmp_path / "solo.yaml", [str(data_dir)])
+
+    assert run(["--compress", "-i", str(cfg), "-m", "hello"]) == EXIT_OK
+
+    store = _CliFakeStore.instances[0]
+    assert [(b[0], b[2]) for b in store.backups] == [("solo", "hello")]
+    assert store.forgets == [] and store.prunes == 0  # single-file is never pruned
+    assert "solo-sh" in capsys.readouterr().out
+
+
+def test_single_file_output_still_writes_targz_in_restic_mode(
+    tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _mode(monkeypatch, StorageMode.RESTIC)
+    cfg = write_config(tmp_path / "solo.yaml", [str(data_dir)])
+    out = tmp_path / "named.tar.gz"
+
+    assert run(["--compress", "-i", str(cfg), "-o", str(out)]) == EXIT_OK
+
+    assert out.is_file()
+    assert _CliFakeStore.instances == [] or _CliFakeStore.instances[0].backups == []
+
+
+def test_restic_batch_prunes_and_reports_it(
+    tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mode(monkeypatch, StorageMode.RESTIC)
+    cfg_dir = _cfg_dir(tmp_path, data_dir)
+    original = _CliFakeStore.__init__
+
+    def init(self: _CliFakeStore, saves_dir: str, identity: str | None = None) -> None:
+        original(self, saves_dir, identity)
+        self.forgotten = [Snapshot("old-id", "old1", datetime(2026, 1, 1), "x", None)]
+
+    monkeypatch.setattr(_CliFakeStore, "__init__", init)
+
+    assert run(["--compress", "-i", str(cfg_dir), "--jobs", "1"]) == EXIT_OK
+
+    store = _CliFakeStore.instances[0]
+    assert store.forgets == ["one", "two"] and store.prunes == 1
+    assert "pruned" in capsys.readouterr().out.lower()
+
+
+def test_prune_error_after_successful_batch_exit_runtime_report_printed(
+    tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mode(monkeypatch, StorageMode.RESTIC)
+    cfg_dir = _cfg_dir(tmp_path, data_dir)
+    original = _CliFakeStore.__init__
+
+    def init(self: _CliFakeStore, saves_dir: str, identity: str | None = None) -> None:
+        original(self, saves_dir, identity)
+        self.forgotten = [Snapshot("old-id", "old1", datetime(2026, 1, 1), "x", None)]
+        self.fail_prune = True
+
+    monkeypatch.setattr(_CliFakeStore, "__init__", init)
+
+    assert run(["--compress", "-i", str(cfg_dir), "--jobs", "1"]) == EXIT_RUNTIME
+
+    out = capsys.readouterr().out
+    # The batch report comes first and still says the backups succeeded.
+    assert out.index("one-sh") < out.index("prune exploded")
+    assert "] failed:" not in out
+
+
+def test_tar_batch_prunes_only_configs_with_a_retention_block(
+    tmp_path: Path, data_dir: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _mode(monkeypatch, StorageMode.TAR_NOT_INITIALISED)
+    cfg_dir = _cfg_dir(tmp_path, data_dir, retention={"daily": 1, "weekly": 0, "monthly": 0, "yearly": 0})
+    saves = fake_home / ".config" / "config-saver" / "configs"
+    for name in ("one", "two"):
+        for day in (1, 2, 3):
+            (saves / name / f"2026010{day}-000000").mkdir(parents=True)
+
+    assert run(["--compress", "-i", str(cfg_dir), "--jobs", "1"]) == EXIT_OK
+
+    assert len(list((saves / "one").iterdir())) == 4
+    assert len(list((saves / "two").iterdir())) == 1
