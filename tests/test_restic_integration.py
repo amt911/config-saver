@@ -219,6 +219,15 @@ def test_cli_migrate_real_age_archives_then_delete_and_roundtrip(
     archives = sorted((saves / "configs").rglob("*.tar.gz.age"))
     assert len(archives) == 2
 
+    from config_saver.lib.cli.cli import EXIT_USAGE
+
+    (tmp_path / "second").mkdir()
+    other, _ = _identity(tmp_path / "second")
+    assert CLI(["--restic-init", "--encrypt-to", recipient, "--identity", other]).run() == EXIT_USAGE
+    assert (
+        CLI(["--restic-init", "--encrypt-to", recipient, "--identity", str(tmp_path / "missing")]).run() == EXIT_USAGE
+    )
+    assert not (saves / "restic").exists()
     assert CLI(["--restic-init", "--encrypt-to", recipient, "--identity", key]).run() == EXIT_OK
     store = ResticStore(str(saves))
     assert CLI(["--migrate", "--identity", key]).run() == EXIT_OK
@@ -242,4 +251,6 @@ def test_cli_migrate_real_age_archives_then_delete_and_roundtrip(
     restored = next(restore.rglob("f.txt")).parent
     assert (restored / "f.txt").read_text() == "version 1\n"
     assert (restored / "blob.bin").read_bytes() == final_blob
+    before = [s.id for s in store.snapshots()]
     assert CLI(["--prune", "--dry-run", "--identity", key]).run() == EXIT_OK
+    assert [s.id for s in store.snapshots()] == before

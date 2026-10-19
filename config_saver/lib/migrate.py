@@ -25,7 +25,7 @@ from . import crypto
 from .archive_names import FILENAME_PATTERN
 from .backup_manager.backup_manager import LEGACY_NAME, BackupManager
 from .errors import EncryptionError, StoreError
-from .restic_store import ResticStore, Snapshot, _drain
+from .restic_store import ResticStore, Snapshot, drain
 from .tar_compressor.tar_compressor import CompressResult
 from .tar_prune import ARCHIVE_GLOBS, TIMESTAMP_FORMAT
 
@@ -116,7 +116,7 @@ def _plain_tar(path: str, identity: str | None) -> Iterator[IO[bytes]]:
     except OSError as exc:
         raise EncryptionError(f"could not run {method}: {exc}") from exc
     assert proc.stdout is not None and proc.stderr is not None
-    err_thread, err_chunks = _drain(proc.stderr)
+    err_thread, err_chunks = drain(proc.stderr)
 
     def detail() -> str:
         err_thread.join()
@@ -188,6 +188,16 @@ def _delete(path: str, saves_dir: str) -> None:
         os.rmdir(folder)
 
 
+def _forget_bad_snapshot(store: ResticStore, snapshot: Snapshot) -> str:
+    """Drop the snapshot this run just wrote and could not verify, so a re-run migrates the archive again."""
+    message = f"hash mismatch: snapshot {snapshot.short_id} does not hash like the archive; archive kept"
+    try:
+        store.forget_ids([snapshot.id])
+    except StoreError as exc:
+        return f"{message}; could not forget it either ({exc}): run `restic forget {snapshot.id}`"
+    return f"{message}; the bad snapshot was forgotten, re-run to migrate it again"
+
+
 def _describe(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
@@ -207,6 +217,7 @@ def migrate_archives(
     plan = sorted(((*classify(p, saves_dir), p) for p in manager.list_archives()), key=lambda e: (e[1], e[2]))
     existing: dict[tuple[str, datetime], Snapshot] = {(s.cfg, s.time): s for s in store.snapshots()}
     total = len(plan)
+    in_plan: dict[tuple[str, datetime], str] = {}
 
     for index, (cfg, when, path) in enumerate(plan, start=1):
         when = when.replace(microsecond=0)
@@ -214,11 +225,17 @@ def migrate_archives(
         with contextlib.suppress(OSError):
             report.bytes_before += os.path.getsize(path)
         try:
+            twin = in_plan.setdefault((cfg, when), path)
+            if twin != path:
+                raise StoreError(f"same config and timestamp as {twin}; not migrated (it would collide)")
             known = existing.get((cfg, when))
             if known is not None:
                 if delete:
                     if _hash_source(path, identity) != _hash_snapshot(store, known):
-                        raise StoreError("hash mismatch: the existing snapshot differs from this archive; kept")
+                        raise StoreError(
+                            f"snapshot {known.short_id} differs from {path}; inspect it and run "
+                            f"`restic forget {known.id}` (or remove it) to re-migrate"
+                        )
                     _delete(path, saves_dir)
                     report.deleted.append(path)
                 report.skipped.append(path)
@@ -234,12 +251,10 @@ def migrate_archives(
                 return CompressResult(output_path=path, added=members)
 
             snapshot, _result, _added = store.backup(write, cfg, when, description or None)
+            if _hash_snapshot(store, snapshot) != digest.hexdigest():
+                raise StoreError(_forget_bad_snapshot(store, snapshot))
             existing[(cfg, when)] = snapshot
             if delete:
-                if _hash_snapshot(store, snapshot) != digest.hexdigest():
-                    raise StoreError(
-                        f"hash mismatch: snapshot {snapshot.short_id} does not hash like the archive; kept"
-                    )
                 _delete(path, saves_dir)
                 report.deleted.append(path)
             report.migrated.append(path)

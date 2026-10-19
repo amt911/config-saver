@@ -426,6 +426,14 @@ def test_check_runs_restic_check_and_raises_on_failure(tmp_path: Path, monkeypat
         _store(tmp_path).check()
 
 
+def test_forget_ids_forgets_only_those_and_never_prunes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    _store(tmp_path).forget_ids(["a1", "b2"])
+    _store(tmp_path).forget_ids([])
+    assert [c["argv"] for c in rec.calls] == [["restic", "forget", "a1", "b2"]]
+
+
 def test_parse_restic_time_is_naive_local_and_handles_nanoseconds() -> None:
     parsed = parse_restic_time("2026-10-19T12:00:00.123456789+02:00")
     assert parsed.tzinfo is None

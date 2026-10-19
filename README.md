@@ -296,6 +296,12 @@ config-saver --migrate --delete-migrated                   # re-run: delete each
   timestamp directory) only after `restic dump` of its snapshot hashes (sha256) identically to the
   decompressed archive.** Already-migrated archives are verified the same way before they are
   deleted. Any mismatch, restic error or failed decrypt keeps the archive and exits `5`.
+- A snapshot written by this run that does not hash like its archive is forgotten again, so a
+  re-run migrates that archive afresh. A *pre-existing* snapshot that differs is never touched
+  automatically (it may be a different backup from the same second): the message names it, and you
+  inspect it and run `restic forget <id>` (or remove it) to re-migrate. Two archives of the same
+  configuration and second (e.g. `x.tar.gz` next to `x.tar.gz.age`) are reported as failed, not skipped.
+- `--restic-init` refuses an `--identity` that is not the private half of the `--encrypt-to` key.
 - `--migrate` needs an initialised store (exit `6` with the setup notice otherwise).
 
 ### Pruning by hand

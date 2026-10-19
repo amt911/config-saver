@@ -12,6 +12,13 @@ waits briefly for the child on any error and, if it exited non-zero by itself, r
 *inside* the restic stdin writer, so a truncated or failed decrypt aborts restic (killed before it
 commits) instead of storing a short snapshot that a later hash check would have to catch.
 
+## 2026-10-19 — migration timestamps are naive local time (DST fall-back)
+
+`--time` is the archive's `YYYYMMDD-HHMMSS` read as naive local time. On the fall-back hour that
+second exists twice, so the stored instant can shift by an hour and a re-run (which compares
+cfg + second) may create a duplicate snapshot. It never loses data: the archive is only deleted
+after its own snapshot's hash matches.
+
 ## 2026-08-19 — the pre-push pytest hook runs whatever `python` is on PATH
 
 The `pytest` hook in `.pre-commit-config.yaml` is `language: system` with

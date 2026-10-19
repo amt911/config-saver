@@ -50,6 +50,8 @@ class FakeStore:
         self.fail_backup: Exception | None = None
         self.fail_check = False
         self.checks = 0
+        self.forgotten: list[str] = []
+        self.fail_forget = False
         self.backups: list[tuple[str, datetime, str | None]] = []
 
     def backup(self, write, cfg, when, description):  # type: ignore[no-untyped-def]
@@ -68,6 +70,12 @@ class FakeStore:
 
     def dump(self, snapshot_id: str, cfg: str, out: IO[bytes]) -> None:
         out.write(self.dump_override if self.dump_override is not None else self.data[snapshot_id])
+
+    def forget_ids(self, ids: list[str]) -> None:
+        if self.fail_forget:
+            raise StoreError("forget failed")
+        self.forgotten += ids
+        self.snaps = [s for s in self.snaps if s.id not in ids]
 
     def check(self) -> None:
         self.checks += 1
@@ -217,3 +225,46 @@ def test_migrate_age_archive_with_missing_identity_fails_that_archive_only(saves
     report = _run(saves, store, delete=True)
     assert [p for p, _ in report.failed] == [str(enc)] and "identity" in report.failed[0][1].lower()
     assert report.migrated == [str(plain)]
+
+
+def test_migrate_bad_new_snapshot_is_forgotten_and_rerun_migrates_again(saves: Path) -> None:
+    archive = _archive(saves, "a", "20260101-030000")
+    store = FakeStore()
+    store.dump_override = b"corrupted"
+    report = _run(saves, store)  # even without --delete-migrated
+    assert [p for p, _ in report.failed] == [str(archive)] and not report.migrated
+    assert store.forgotten == ["id0"] and store.snapshots() == []
+    assert "forgotten" in report.failed[0][1]
+    store.dump_override = None
+    again = _run(saves, store)
+    assert again.migrated == [str(archive)] and not again.skipped and len(store.backups) == 2
+
+
+def test_migrate_bad_snapshot_that_cannot_be_forgotten_says_how(saves: Path) -> None:
+    _archive(saves, "a", "20260101-030000")
+    store = FakeStore()
+    store.dump_override = b"corrupted"
+    store.fail_forget = True
+    report = _run(saves, store)
+    assert "restic forget id0" in report.failed[0][1]
+
+
+def test_migrate_existing_mismatch_tells_how_to_re_migrate_and_never_forgets(saves: Path) -> None:
+    archive = _archive(saves, "a", "20260101-030000")
+    store = FakeStore()
+    _run(saves, store)
+    store.dump_override = b"other"
+    report = _run(saves, store, delete=True)
+    assert f"differs from {archive}" in report.failed[0][1] and "restic forget id0" in report.failed[0][1]
+    assert store.forgotten == [] and len(store.snaps) == 1
+
+
+def test_migrate_duplicate_cfg_and_second_is_failed_never_skipped(saves: Path) -> None:
+    first = _archive(saves, "a", "20260101-030000")
+    twin = first.with_name(first.name + ".gpg")  # same cfg and second, different file
+    shutil.copy(first, twin)
+    store = FakeStore()
+    report = _run(saves, store)
+    assert report.migrated == [str(first)] and not report.skipped
+    assert [p for p, _ in report.failed] == [str(twin)]
+    assert f"same config and timestamp as {first}" in report.failed[0][1]

@@ -25,18 +25,17 @@ from rich.console import Console
 from rich.table import Table
 
 from config_saver import __version__
-from config_saver.lib import crypto, paths
+from config_saver.lib import crypto, maintenance, paths
 from config_saver.lib.archive_names import FILENAME_PATTERN
-from config_saver.lib.backup_manager.backup_manager import LEGACY_NAME, BackupManager, BatchResult, PruneReport
+from config_saver.lib.backup_manager.backup_manager import BackupManager, BatchResult, PruneReport
 from config_saver.lib.errors import ArchiveError, EncryptionError, RootRequiredError, StoreError, UnsafeArchiveError
 from config_saver.lib.migrate import MigrationReport, migrate_archives
 from config_saver.lib.models.encryption_model import EncryptionModel
-from config_saver.lib.models.retention_model import RetentionModel
 from config_saver.lib.parser.parser import Parser
-from config_saver.lib.restic_store import NOTICES, ResticStore, Snapshot, StorageMode, repo_path, select_mode
+from config_saver.lib.restic_store import NOTICES, ResticStore, Snapshot, StorageMode, select_mode
 from config_saver.lib.tar_compressor.tar_compressor import CompressResult
 from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
-from config_saver.lib.tar_prune import TIMESTAMP_FORMAT, prune_config_dir
+from config_saver.lib.tar_prune import TIMESTAMP_FORMAT
 
 init(autoreset=True)
 
@@ -776,6 +775,10 @@ class CLI:
             print(Fore.RED + "--restic-init takes exactly one --encrypt-to recipient.")
             return EXIT_USAGE
         store = ResticStore(saves_dir, args.identity)
+        problem = maintenance.check_identity_matches(store.identity, args.encrypt_to[0])
+        if problem:
+            print(Fore.RED + problem)
+            return EXIT_USAGE
         store.init(args.encrypt_to[0])
         print(Fore.GREEN + f"Created the restic store in {saves_dir}.")
         print(
@@ -786,15 +789,6 @@ class CLI:
         return EXIT_OK
 
     @staticmethod
-    def _store_size(saves_dir: str) -> int:
-        total = 0
-        for root, _dirs, files in os.walk(repo_path(saves_dir)):
-            for name in files:
-                with contextlib.suppress(OSError):
-                    total += os.path.getsize(os.path.join(root, name))
-        return total
-
-    @staticmethod
     def _print_migration(report: MigrationReport, saves_dir: str) -> None:
         print(
             f"Migrated {len(report.migrated)}, already in the store {len(report.skipped)}, "
@@ -802,7 +796,7 @@ class CLI:
         )
         print(
             f"Archives before: {report.bytes_before / 1e6:.1f} MB; "
-            f"restic store now: {CLI._store_size(saves_dir) / 1e6:.1f} MB."
+            f"restic store now: {maintenance.store_size(saves_dir) / 1e6:.1f} MB."
         )
         for path, reason in report.failed:
             print(Fore.RED + f"  failed: {path}: {reason} (kept)")
@@ -826,74 +820,22 @@ class CLI:
             print(Fore.YELLOW + "Nothing was deleted. Re-run with --delete-migrated to remove the verified archives.")
         return EXIT_RUNTIME if report.failed or report.check_error else EXIT_OK
 
-    @staticmethod
-    def _retention_by_config(
-        manager: BackupManager, args: argparse.Namespace
-    ) -> tuple[dict[str, RetentionModel | None], dict[str, str]]:
-        """name -> its ``retention:`` (None when absent) for every configuration found; plus unreadable ones."""
-        known: dict[str, RetentionModel | None] = {}
-        errors: dict[str, str] = {}
-        paths_by_name: dict[str, str] = {}
-        for entry in args.input or default_config_dirs():
-            found = manager.find_config_files(entry) if os.path.isdir(entry) else [entry]
-            for path in found:
-                paths_by_name[os.path.splitext(os.path.basename(path))[0]] = path  # later levels override earlier
-        for name, path in sorted(paths_by_name.items()):
-            try:
-                known[name] = Parser(path).get_model().retention
-            except (ValidationError, OSError, ValueError) as exc:
-                errors[name] = f"cannot read {path}: {exc}"
-        return known, errors
-
     def _prune(self, manager: BackupManager, args: argparse.Namespace, saves_dir: str) -> int:
         mode = select_mode(saves_dir)
         store = ResticStore(saves_dir, args.identity) if mode is StorageMode.RESTIC else None
-        known, errors = self._retention_by_config(manager, args)
+        known, unreadable = maintenance.retention_by_config(manager, args.input or default_config_dirs())
+        outcome = maintenance.prune_all(saves_dir, store, known, unreadable, args.dry_run, args.include_legacy)
         verb = "would remove" if args.dry_run else "removed"
-        total = 0
-        failed = bool(errors)
-        for name, reason in errors.items():
-            print(Fore.RED + f"[{name}] {reason}")
-
-        if store is not None:
-            names = sorted({s.cfg for s in store.snapshots()})
-        else:
-            configs_root = os.path.join(saves_dir, "configs")
-            names = sorted(os.listdir(configs_root)) if os.path.isdir(configs_root) else []
-
-        for cfg in names:
-            if cfg == LEGACY_NAME and not args.include_legacy:
-                print(Fore.YELLOW + f"[{cfg}] skipped (pass --include-legacy to prune it).")
-                continue
-            if cfg in errors:
-                continue
-            retention = known.get(cfg)
-            try:
-                if store is not None:
-                    if cfg not in known:
-                        print(Fore.YELLOW + f"[{cfg}] no configuration file found: the default retention applies.")
-                    removed = [s.short_id for s in store.forget(cfg, retention or RetentionModel(), args.dry_run)]
-                elif retention is not None:
-                    removed = prune_config_dir(os.path.join(saves_dir, "configs", cfg), retention, args.dry_run)
-                else:
-                    why = "no retention: block" if cfg in known else "no configuration file"
-                    print(Fore.YELLOW + f"[{cfg}] left alone: {why} (archive mode only prunes explicit retention).")
-                    continue
-            except (StoreError, OSError) as exc:
-                print(Fore.RED + f"[{cfg}] could not prune: {exc}")
-                failed = True
-                continue
-            if removed:
-                print(Fore.CYAN + f"[{cfg}] {verb} {len(removed)} backup(s).")
-                total += len(removed)
-        if store is not None and total and not args.dry_run:
-            try:
-                store.prune()
-            except StoreError as exc:
-                print(Fore.RED + f"could not reclaim space (restic prune): {exc}")
-                failed = True
-        print(f"Total: {total} backup(s) {verb}.")
-        return EXIT_RUNTIME if failed else EXIT_OK
+        for note in outcome.notes:
+            print(Fore.YELLOW + note)
+        for cfg, labels in outcome.removed.items():
+            print(Fore.CYAN + f"[{cfg}] {verb} {len(labels)} backup(s):")
+            for label in labels:
+                print(f"    {label}")
+        for error in outcome.errors:
+            print(Fore.RED + error)
+        print(f"Total: {outcome.total} backup(s) {verb}.")
+        return EXIT_RUNTIME if outcome.errors else EXIT_OK
 
     def _compress(
         self,

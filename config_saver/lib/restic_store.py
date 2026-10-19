@@ -131,7 +131,7 @@ def parse_restic_time(text: str) -> datetime:
     return datetime.fromisoformat(text).astimezone().replace(tzinfo=None)
 
 
-def _drain(stream: IO[bytes]) -> tuple[threading.Thread, list[bytes]]:
+def drain(stream: IO[bytes]) -> tuple[threading.Thread, list[bytes]]:
     """Read ``stream`` to EOF in a thread so the child can never block on a full pipe."""
     chunks: list[bytes] = []
 
@@ -277,8 +277,8 @@ class ResticStore:
         except OSError as exc:
             raise StoreError(f"could not run restic: {exc}") from exc
         assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
-        out_thread, out_chunks = _drain(proc.stdout)
-        err_thread, err_chunks = _drain(proc.stderr)
+        out_thread, out_chunks = drain(proc.stdout)
+        err_thread, err_chunks = drain(proc.stderr)
 
         def finish() -> int:
             returncode = proc.wait()
@@ -375,7 +375,7 @@ class ResticStore:
         except OSError as exc:
             raise StoreError(f"could not run restic: {exc}") from exc
         assert proc.stdout is not None and proc.stderr is not None
-        err_thread, err_chunks = _drain(proc.stderr)
+        err_thread, err_chunks = drain(proc.stderr)
         try:
             shutil.copyfileobj(proc.stdout, out)
         except BaseException:
@@ -400,6 +400,11 @@ class ResticStore:
         if removed and not dry_run:
             self._run(["forget", *(s.id for s in removed)])
         return removed
+
+    def forget_ids(self, ids: list[str]) -> None:
+        """Forget exactly these snapshots (no space is reclaimed: that is ``prune``)."""
+        if ids:
+            self._run(["forget", *ids])
 
     def prune(self) -> None:
         """Reclaim the space of forgotten snapshots."""

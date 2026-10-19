@@ -911,6 +911,7 @@ def test_cli_restic_init_creates_store_and_warns_about_the_key(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _maint_mode(monkeypatch, StorageMode.TAR_NOT_INITIALISED)
+    monkeypatch.setattr("config_saver.lib.maintenance.check_identity_matches", lambda identity, recipient: None)
     assert run(["--restic-init", "--encrypt-to", "age1abc", "--identity", "/k"]) == EXIT_OK
     assert _MaintStore.instances[-1].inits == ["age1abc"]
     assert "only thing" in capsys.readouterr().out.lower()
@@ -1032,3 +1033,25 @@ def test_cli_prune_tar_mode_explicit_retention_only(
     assert all(d.exists() for d in without_dirs)
     assert len(list((saves / "configs" / "orphan").iterdir())) == 3
     assert "Total" in capsys.readouterr().out
+
+
+def test_cli_restic_init_refuses_a_mismatched_identity(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _maint_mode(monkeypatch, StorageMode.TAR_NOT_INITIALISED)
+    monkeypatch.setattr("config_saver.lib.maintenance.check_identity_matches", lambda identity, recipient: "wrong key")
+    assert run(["--restic-init", "--encrypt-to", "age1abc", "--identity", "/k"]) == EXIT_USAGE
+    assert _MaintStore.instances[-1].inits == [] and "wrong key" in capsys.readouterr().out
+
+
+def test_cli_prune_lists_what_it_removes(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _maint_mode(monkeypatch, StorageMode.RESTIC, *_snaps("mine"))
+    cfg_dir = fake_home / "cfgs"
+    cfg_dir.mkdir()
+    write_config(cfg_dir / "mine.yaml", [str(fake_home)])
+    assert run(["--prune", "--dry-run", "-i", str(cfg_dir)]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "2026-01-01 03:00:00 (mine-sh)" in out and "2026-01-02 03:00:00 (mine-sh)" in out
+    assert "2026-01-03" not in out
