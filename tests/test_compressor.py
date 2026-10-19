@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import io
 import os
 import stat
 import tarfile
+import threading
 from pathlib import Path
 
 import pytest
 
+from config_saver.lib import crypto
 from config_saver.lib.tar_compressor.tar_compressor import (
     HOME_CONTENT_PLACEHOLDER,
     METADATA_MEMBER,
@@ -278,3 +281,66 @@ def test_a_home_with_non_ascii_characters_is_replaced(tmp_path: Path, monkeypatc
     for name in ("utf8.conf", "latin1.conf"):
         stored = archive_member_bytes(out, os.path.join("home", "user", "t", name))
         assert HOME_CONTENT_PLACEHOLDER.encode() in stored
+
+
+def _members(tar: tarfile.TarFile) -> list[tuple[str, int, int]]:
+    return [(m.name, m.size, m.mode) for m in tar.getmembers()]
+
+
+def test_compress_to_stream_matches_gz_members(tmp_path: Path, sample_tree: Path) -> None:
+    gz = tmp_path / "out.tar.gz"
+    _compressor([str(sample_tree)], gz).compress()
+    stream_path = tmp_path / "out.tar"
+    with open(stream_path, "wb") as raw:
+        result = _compressor([str(sample_tree)], gz).compress_to_stream(raw)
+    with tarfile.open(gz, "r:gz") as a, tarfile.open(stream_path, "r:") as b:
+        members_a = _members(a)
+        members_b = _members(b)
+    assert members_b == members_a
+    assert members_b[0][0] == METADATA_MEMBER
+    assert result.added == len(members_b) - 1
+    assert result.output_path == ""
+
+
+def test_compress_to_stream_is_uncompressed(tmp_path: Path, sample_tree: Path) -> None:
+    out = tmp_path / "out.tar"
+    with open(out, "wb") as raw:
+        _compressor([str(sample_tree)], tmp_path / "x.tar.gz").compress_to_stream(raw)
+    assert out.read_bytes()[:2] != b"\x1f\x8b"
+    assert tarfile.is_tarfile(out)
+
+
+def test_compress_to_stream_is_pipe_safe(tmp_path: Path, sample_tree: Path) -> None:
+    """A pipe cannot seek: the writer must never need to."""
+    read_fd, write_fd = os.pipe()
+    chunks: list[bytes] = []
+
+    def drain() -> None:
+        with os.fdopen(read_fd, "rb") as reader:
+            while data := reader.read(65536):
+                chunks.append(data)
+
+    thread = threading.Thread(target=drain)
+    thread.start()
+    with os.fdopen(write_fd, "wb") as writer:
+        _compressor([str(sample_tree)], tmp_path / "x.tar.gz").compress_to_stream(writer)
+    thread.join(timeout=30)
+    with tarfile.open(fileobj=io.BytesIO(b"".join(chunks)), mode="r:") as tar:
+        names = tar.getnames()
+    assert METADATA_MEMBER in names
+    assert "home/user/tree/plain.txt" in names
+
+
+def test_stream_ignores_encrypt_block(tmp_path: Path, sample_tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_a: object, **_k: object) -> None:
+        raise AssertionError("crypto must not be called when streaming")
+
+    monkeypatch.setattr(crypto, "encrypt_file", boom)
+    monkeypatch.setattr(crypto, "require_binary", boom)
+    model = make_model([str(sample_tree)], encrypt={"method": "age", "recipients": ["age1xyz"]})
+    out = tmp_path / "out.tar"
+    with open(out, "wb") as raw:
+        result = TarCompressor(model, str(tmp_path / "x.tar.gz")).compress_to_stream(raw)
+    assert result.encryption is None
+    assert not list(tmp_path.glob("*.part*"))
+    assert tarfile.is_tarfile(out)
