@@ -127,7 +127,9 @@ class BackupTable:
         console.rule("Saved configurations")
         console.print(Columns(tables, expand=False, padding=(0, 2), equal=False))
         if mixed and any(kind == "tar" for entries in grouped.values() for _, kind, _ in entries):
-            console.print("tar = full archive on disk, archive still on disk", style="yellow")
+            console.print(
+                "tar = archive still on disk (not yet in the restic store, or migrated but not deleted)", style="yellow"
+            )
         console.rule()
 
 

@@ -223,7 +223,7 @@ itself.
 |-----:|---------|
 | `0` | Success |
 | `2` | Configuration file, config directory or archive not found |
-| `3` | Configuration failed validation (bad shape, unknown key) |
+| `3` | Configuration failed validation (malformed YAML, bad shape, unknown key) |
 | `4` | Permission denied, including `only_root_user: true` run as non-root |
 | `5` | Archive error: corrupt archive, or a member refused as unsafe; an unusable restic store; a failed prune (after a complete batch report); a failed migration (`--migrate`, including an archive that could not be decrypted) |
 | `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`, `--encrypt-to` with the restic store) |

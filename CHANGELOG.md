@@ -46,6 +46,9 @@ All notable changes to this project are documented here. The format follows
   already migrated but not yet deleted); `--prune` totals read "N backup(s) would be removed." /
   "N backup(s) removed.".
 - tar-mode `--list` shows one row per archive.
+- `--export-config NAME` matches the configuration name exactly. It used to match by prefix, so
+  `--export-config own` could export an `own-configs` archive; an archive without a timestamp in
+  its name is now found under its full stem (`foo-bar.tar.gz` → `foo-bar.tar`).
 
 ### Fixed
 
@@ -54,7 +57,7 @@ All notable changes to this project are documented here. The format follows
   directory still opens from the timer's; `--compress` now honours `--identity`.
 - Malformed YAML no longer crashes with a traceback: `--prune` reports the configuration as
   unreadable (exit `5`), `--export-config` exits `3`, `--export-all-configs` reports the
-  configuration, carries on and exits `3`.
+  configuration, carries on and exits `3`; a single-file `--compress` of such a file exits `3`.
 - `--include-system-configs` was dropped by batch (`--input DIR`) and `--description` runs; it is
   now forwarded to every archive. `--encrypt-to` was likewise dropped by `--description` runs.
 
