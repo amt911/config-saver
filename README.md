@@ -260,6 +260,15 @@ data costs next to nothing.
 - **Single files:** `--compress --input one.yaml` goes into the store under the file's name (with
   `--description` as the snapshot description); with `--output` it still writes exactly the
   `.tar.gz` you named. Neither is pruned.
+- **Listing and exporting:** with a store, `--list` shows its snapshots (date and description) per
+  configuration, and `--show-configs` unions them with the archives still on disk. Archives not yet
+  migrated are marked `tar` in a `Store` column. `--export-config NAME` / `--export-all-configs`
+  write the newest snapshot as `<name>-<YYYYMMDD-HHMMSS>.tar.gz` (so `--decompress` reads it
+  unchanged), encrypted with the `encrypt:` block of the configuration file of that name (or with
+  `--encrypt-to`) as `.tar.gz.age`/`.gpg`. With no such file the export is a plain `.tar.gz` and a
+  warning says so. Plaintext exists only in a private temp file beside the destination and is
+  removed on every path, failures included. An archive newer than the newest snapshot is copied as
+  before. Pass `--identity` if your age key is not the default one.
 - `--include-system-configs` and `exclude:` behave the same in both modes.
 
 ## Retention

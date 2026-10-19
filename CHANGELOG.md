@@ -20,6 +20,10 @@ All notable changes to this project are documented here. The format follows
   `--compress`**: in restic mode always (defaults when the block is absent), in archive mode only
   for configurations that declare `retention:`. A prune failure is reported after the batch and
   exits `5` without touching the backups.
+- **`--list`, `--show-configs`, `--export-config` and `--export-all-configs` read the restic
+  store.** Exports are real `.tar.gz` files (named from the snapshot time), encrypted per the
+  configuration's `encrypt:` block, with no plaintext left behind on failure; archives not yet
+  migrated are listed with a `tar` marker.
 
 ### Fixed
 

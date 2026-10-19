@@ -149,3 +149,42 @@ def test_cli_compress_into_the_store_then_prune(
     assert len(store.snapshots("one")) == 3  # defaults keep every distinct day
     kept = store.snapshots("two")
     assert len(kept) == 1 and kept[0].time == datetime(2026, 10, 3, 3, 0, 0)
+
+
+def test_cli_export_from_the_store_decrypts_back_to_the_source(
+    tmp_path: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Compress with an `encrypt:` block, export, then --decompress --identity the export."""
+    import yaml
+
+    from config_saver.lib.cli.cli import CLI, EXIT_OK
+
+    monkeypatch.setenv("RESTIC_CACHE_DIR", str(tmp_path / "cache"))
+    key, recipient = _identity(tmp_path)
+    saves = fake_home / ".config" / "config-saver"
+    ResticStore(str(saves), identity=key).init(recipient)
+
+    data = fake_home / "data"
+    (data / "sub").mkdir(parents=True)
+    (data / "f.txt").write_text("hello\n")
+    (data / "sub" / "b.bin").write_bytes(os.urandom(4096))
+    cfg_dir = fake_home / ".config" / "config-saver" / "configs.d"
+    cfg_dir.mkdir()
+    (cfg_dir / "mine.yaml").write_text(
+        yaml.safe_dump({"directories": [str(data)], "encrypt": {"method": "age", "recipients": [recipient]}})
+    )
+    assert CLI(["--compress"]).run() == EXIT_OK
+
+    assert CLI(["--list", "--identity", key]).run() == EXIT_OK
+    out_dir = tmp_path / "exports"
+    assert CLI(["--export-all-configs", "--identity", key, "--output", str(out_dir)]).run() == EXIT_OK
+    [export] = list(out_dir.iterdir())
+    assert export.name.startswith("mine-") and export.name.endswith(".tar.gz.age")
+    assert b"hello" not in export.read_bytes()
+
+    restore = tmp_path / "restore"
+    restore.mkdir()
+    assert CLI(["--decompress", "-i", str(export), "-o", str(restore), "--identity", key]).run() == EXIT_OK
+    restored = next(restore.rglob("f.txt")).parent
+    assert filecmp.dircmp(data, restored).diff_files == []
+    assert (restored / "sub" / "b.bin").read_bytes() == (data / "sub" / "b.bin").read_bytes()

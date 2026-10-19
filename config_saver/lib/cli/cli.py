@@ -8,10 +8,13 @@ module turns them into terminal output and stable exit codes.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import gzip
 import os
 import re
 import shutil
 import sys
+from collections.abc import Iterator
 from datetime import datetime
 
 from colorama import Fore, init
@@ -26,7 +29,8 @@ from config_saver.lib import crypto, paths
 from config_saver.lib.backup_manager.backup_manager import BackupManager, BatchResult, PruneReport
 from config_saver.lib.errors import ArchiveError, EncryptionError, RootRequiredError, StoreError, UnsafeArchiveError
 from config_saver.lib.models.encryption_model import EncryptionModel
-from config_saver.lib.restic_store import NOTICES, ResticStore, StorageMode, select_mode
+from config_saver.lib.parser.parser import Parser
+from config_saver.lib.restic_store import NOTICES, ResticStore, Snapshot, StorageMode, select_mode
 from config_saver.lib.tar_compressor.tar_compressor import CompressResult
 from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
 from config_saver.lib.tar_prune import TIMESTAMP_FORMAT
@@ -78,25 +82,29 @@ class BackupTable:
                 print(Fore.YELLOW + f"Warning: unparsable backup timestamp in '{name}', using file mtime.")
         return datetime.fromtimestamp(os.path.getmtime(path))
 
-    def render(self) -> None:
+    def render(self, snapshots: list[Snapshot] | None = None) -> None:
+        """Print every saved backup; ``snapshots`` (restic mode) join the tar archives still on disk."""
         files = self._gather_files()
-        if not files:
+        if not files and not snapshots:
             print(f"No config-saver tar.gz files found in {self.saves_dir} or {self.user_saves}.")
             return
 
-        # One pass over the archives: config name -> {timestamp: path}
-        grouped: dict[str, dict[str, str]] = {}
+        # config name -> [(when, store kind, description)]
+        grouped: dict[str, list[tuple[datetime, str, str | None]]] = {}
         for f in files:
             name = os.path.basename(f)
             m = self.FILENAME_PATTERN.match(name)
             cfgname = m.group(1) if m else os.path.splitext(name)[0]
-            ts = m.group(2) if m else self._parse_ts(f).strftime("%Y%m%d-%H%M%S")
-            grouped.setdefault(cfgname, {})[ts] = f
+            desc = self.manager.get_description_for_archive(f)
+            grouped.setdefault(cfgname, []).append((self._parse_ts(f), "tar", desc))
+        for snap in snapshots or []:
+            grouped.setdefault(snap.cfg, []).append((snap.time, "restic", snap.description))
 
         console = Console()
         tables: list[Table] = []
+        mixed = snapshots is not None
 
-        for cfgname, archives in grouped.items():
+        for cfgname, entries in grouped.items():
             table = Table(
                 show_header=True,
                 header_style="bold bright_blue",
@@ -106,17 +114,22 @@ class BackupTable:
             )
             table.add_column("No.", width=5, justify="center", no_wrap=True)
             table.add_column("Date", overflow="fold", justify="center", no_wrap=True)
+            if mixed:
+                table.add_column("Store", justify="center", no_wrap=True)
             table.add_column(Align.center("Description"), overflow="fold", justify="left")
 
-            for i, ts in enumerate(sorted(archives, reverse=True), start=1):
-                when = self._parse_ts(archives[ts])
-                desc = self.manager.get_description_for_archive(archives[ts])
+            for i, (when, kind, desc) in enumerate(sorted(entries, key=lambda e: e[0], reverse=True), start=1):
                 preview = "" if not desc else (desc if len(desc) <= 60 else desc[:57] + "...")
-                table.add_row(str(i), when.strftime("%Y-%m-%d %H:%M:%S"), preview)
+                cells = [str(i), when.strftime("%Y-%m-%d %H:%M:%S")]
+                if mixed:
+                    cells.append(kind)
+                table.add_row(*cells, preview)
             tables.append(table)
 
         console.rule("Saved configurations")
         console.print(Columns(tables, expand=False, padding=(0, 2), equal=False))
+        if mixed and any(kind == "tar" for entries in grouped.values() for _, kind, _ in entries):
+            console.print("tar = full archive on disk, not migrated to the restic store yet", style="yellow")
         console.rule()
 
 
@@ -446,14 +459,21 @@ class CLI:
         saves_dir = manager.ensure_saves_dir()
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-        if args.show_configs:
-            return self._show_configs(manager)
-        if args.export_config:
-            return self._export_config(manager, args)
-        if args.export_all_configs:
-            return self._export_all_configs(manager, args)
-        if args.list:
-            BackupTable(saves_dir).render()
+        if args.show_configs or args.export_config or args.export_all_configs or args.list:
+            # A store that exists but cannot be used raises StoreError: never a silent fallback to tars.
+            mode = select_mode(saves_dir)
+            store = ResticStore(saves_dir, args.identity) if mode is StorageMode.RESTIC else None
+            if args.show_configs:
+                return self._show_configs(manager, store)
+            if args.export_config:
+                if store is not None:
+                    return self._export_config_restic(manager, store, args)
+                return self._export_config(manager, args)
+            if args.export_all_configs:
+                if store is not None:
+                    return self._export_all_restic(manager, store, args)
+                return self._export_all_configs(manager, args)
+            BackupTable(saves_dir).render(store.snapshots() if store is not None else None)
             return EXIT_OK
         if args.compress:
             return self._compress(manager, args, saves_dir, timestamp)
@@ -461,10 +481,12 @@ class CLI:
             return self._decompress(args)
         return EXIT_OK
 
-    def _show_configs(self, manager: BackupManager) -> int:
+    def _show_configs(self, manager: BackupManager, store: ResticStore | None = None) -> int:
         config_names = {
             m.group(1) for m in (FILENAME_PATTERN.match(os.path.basename(p)) for p in manager.list_archives()) if m
         }
+        if store is not None:
+            config_names |= {s.cfg for s in store.snapshots()}
         if config_names:
             print(Fore.GREEN + "Available configurations:")
             for cfg in sorted(config_names):
@@ -522,6 +544,145 @@ class CLI:
                 exit_code = EXIT_PERMISSION
         print(Fore.YELLOW + "Note: archives are not encrypted and may contain secrets.")
         return exit_code
+
+    # ------------------------------------------------- exports from the restic store
+
+    @staticmethod
+    def _newest_tars(manager: BackupManager) -> dict[str, tuple[str, str]]:
+        """cfg name -> (timestamp, path) of the newest tar archive still on disk."""
+        newest: dict[str, tuple[str, str]] = {}
+        for path in manager.list_archives():
+            m = FILENAME_PATTERN.match(os.path.basename(path))
+            if m and (m.group(1) not in newest or m.group(2) > newest[m.group(1)][0]):
+                newest[m.group(1)] = (m.group(2), path)
+        return newest
+
+    def _export_encryption(
+        self, manager: BackupManager, args: argparse.Namespace, cfgname: str
+    ) -> tuple[EncryptionModel | None, str | None]:
+        """What to encrypt an export of ``cfgname`` with, plus a warning when nothing says.
+
+        --encrypt-to wins; otherwise the ``encrypt:`` block of the configuration
+        file of that name (the user's own level overrides the system one).
+        """
+        override = self._encryption_override(args)
+        if override is not None:
+            return override, None
+        found: str | None = None
+        for directory in default_config_dirs():
+            for path in manager.find_config_files(directory):
+                if os.path.splitext(os.path.basename(path))[0] == cfgname:
+                    found = path
+        if found is None:
+            return None, f"no configuration file named '{cfgname}' was found, so its encrypt: block is unknown."
+        return Parser(found).get_model().encrypt, None
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _temp_files(*paths: str) -> Iterator[None]:
+        """Remove every temp path on exit, whatever happened (keyboard interrupt included)."""
+        try:
+            yield
+        finally:
+            for path in paths:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
+
+    @staticmethod
+    def _export_snapshot(store: ResticStore, snap: Snapshot, dest: str, encryption: EncryptionModel | None) -> str:
+        """Write snapshot ``snap`` to ``dest`` as a .tar.gz (encrypted when asked); return the final path.
+
+        The plaintext only ever exists in a 0600 temp file next to the destination,
+        which is removed on every path; the result is moved into place atomically.
+        """
+        if encryption is not None:
+            suffix = crypto.suffix_for(encryption.method)
+            if not dest.endswith(suffix):
+                dest += suffix
+        directory, base = os.path.split(os.path.abspath(dest))
+        plain_tmp = os.path.join(directory, f".{base}.{os.getpid()}.part")
+        enc_tmp = plain_tmp + ".enc"
+        with CLI._temp_files(plain_tmp, enc_tmp):
+            fd = os.open(plain_tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb") as gz:
+                store.dump(snap.id, snap.cfg, gz)  # type: ignore[arg-type]
+            ready = plain_tmp
+            if encryption is not None:
+                crypto.encrypt_file(plain_tmp, enc_tmp, encryption)
+                os.unlink(plain_tmp)
+                ready = enc_tmp
+            os.replace(ready, dest)
+        return dest
+
+    def _export_one(
+        self,
+        manager: BackupManager,
+        store: ResticStore,
+        args: argparse.Namespace,
+        cfg: str,
+        snap: Snapshot | None,
+        tar: tuple[str, str] | None,
+        dest: str | None,
+        dest_dir: str,
+    ) -> bool:
+        """Export the newest backup of ``cfg``; return True when the file is not encrypted."""
+        if tar is not None and (snap is None or tar[0] > snap.time.strftime(TIMESTAMP_FORMAT)):
+            target = dest or os.path.join(dest_dir, os.path.basename(tar[1]))
+            shutil.copy2(tar[1], target)
+            print(Fore.GREEN + f"Exported: {target}")
+            return crypto.detect_method(tar[1]) is None
+        assert snap is not None
+        encryption, warning = self._export_encryption(manager, args, cfg)
+        if warning:
+            print(Fore.YELLOW + f"Warning: {warning}")
+        target = dest or os.path.join(dest_dir, f"{cfg}-{snap.time.strftime(TIMESTAMP_FORMAT)}.tar.gz")
+        final = self._export_snapshot(store, snap, target, encryption)
+        print(Fore.GREEN + f"Exported: {final}")
+        return encryption is None
+
+    def _export_config_restic(self, manager: BackupManager, store: ResticStore, args: argparse.Namespace) -> int:
+        cfg = args.export_config
+        snaps = [s for s in store.snapshots() if s.cfg == cfg]
+        tar = self._newest_tars(manager).get(cfg)
+        if not snaps and tar is None:
+            print(Fore.RED + f"No saved configuration found with the name: {cfg}")
+            return EXIT_NO_SUCH_CONFIG
+        try:
+            plain = self._export_one(
+                manager, store, args, cfg, snaps[-1] if snaps else None, tar, args.output, os.path.expanduser("~")
+            )
+        except ValueError as e:
+            print(Fore.RED + str(e))
+            return EXIT_USAGE
+        if plain:
+            print(Fore.YELLOW + "Note: archives are not encrypted and may contain secrets.")
+        return EXIT_OK
+
+    def _export_all_restic(self, manager: BackupManager, store: ResticStore, args: argparse.Namespace) -> int:
+        newest: dict[str, Snapshot] = {}
+        for snap in store.snapshots():  # oldest first, so the last one wins
+            newest[snap.cfg] = snap
+        tars = self._newest_tars(manager)
+        names = sorted(set(newest) | set(tars))
+        if not names:
+            print(Fore.YELLOW + "No saved configurations found.")
+            return EXIT_OK
+        dest_dir = args.output or os.path.expanduser("~")
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except PermissionError:
+            print(Fore.RED + f"Cannot create output directory: {dest_dir}")
+            return EXIT_USAGE
+        plain = False
+        try:
+            for cfg in names:
+                plain |= self._export_one(manager, store, args, cfg, newest.get(cfg), tars.get(cfg), None, dest_dir)
+        except ValueError as e:
+            print(Fore.RED + str(e))
+            return EXIT_USAGE
+        if plain:
+            print(Fore.YELLOW + "Note: archives are not encrypted and may contain secrets.")
+        return EXIT_OK
 
     def _compress(
         self,

@@ -573,3 +573,222 @@ def test_tar_batch_prunes_only_configs_with_a_retention_block(
 
     assert len(list((saves / "one").iterdir())) == 4
     assert len(list((saves / "two").iterdir())) == 1
+
+
+# ---------------------------------------- read verbs in restic mode (list/export)
+
+
+class _ReadStore:
+    """A store holding snapshots, each dumping a real tar of one file."""
+
+    def __init__(self, saves_dir: str, identity: str | None = None) -> None:
+        self.identity = identity
+        self.snaps: list[Snapshot] = list(_ReadStore.seed)
+
+    seed: list[Snapshot] = []
+    fail_dump = False
+
+    def snapshots(self, cfg=None):  # type: ignore[no-untyped-def]
+        return [s for s in self.snaps if cfg is None or s.cfg == cfg]
+
+    def dump(self, snapshot_id, cfg, out):  # type: ignore[no-untyped-def]
+        buf = io.BytesIO()
+        payload = f"payload of {snapshot_id}\n".encode()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            info = tarfile.TarInfo("home/tester/exported.txt")
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+        out.write(buf.getvalue()[:1024])
+        if _ReadStore.fail_dump:
+            raise StoreError("dump exploded")
+        out.write(buf.getvalue()[1024:])
+
+
+def _read_mode(monkeypatch: pytest.MonkeyPatch, *snaps: Snapshot) -> None:
+    _ReadStore.seed = list(snaps)
+    _ReadStore.fail_dump = False
+    monkeypatch.setattr("config_saver.lib.cli.cli.select_mode", lambda _saves: StorageMode.RESTIC)
+    monkeypatch.setattr("config_saver.lib.cli.cli.ResticStore", _ReadStore)
+
+
+def _snap(cfg: str, when: datetime, description: str | None = None) -> Snapshot:
+    return Snapshot(f"{cfg}-{when:%H%M%S}-fullid", f"{cfg}-sh", when, cfg, description)
+
+
+def _write_user_config(fake_home: Path, name: str, **extra: object) -> Path:
+    cfg_dir = fake_home / ".config" / "config-saver" / "configs.d"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    return write_config(cfg_dir / f"{name}.yaml", [str(fake_home)], **extra)
+
+
+def _age_key(tmp_path: Path) -> tuple[str, str]:
+    import shutil
+
+    if shutil.which("age") is None or shutil.which("age-keygen") is None:
+        pytest.skip("needs age and age-keygen")
+    key = tmp_path / "key.txt"
+    subprocess.run(["age-keygen", "-o", str(key)], check=True, capture_output=True)
+    public = subprocess.run(["age-keygen", "-y", str(key)], check=True, capture_output=True, text=True)
+    return str(key), public.stdout.strip()
+
+
+def test_list_restic_mode_groups_by_cfg_and_shows_unmigrated(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _read_mode(
+        monkeypatch,
+        _snap("zsh", datetime(2026, 10, 1, 3, 0, 0), "first run"),
+        _snap("zsh", datetime(2026, 10, 2, 3, 0, 0)),
+        _snap("kde", datetime(2026, 10, 2, 4, 0, 0)),
+    )
+    _make_saved_archive(fake_home, "zsh", "20260801-120000")
+    assert run(["--list"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "zsh" in out and "kde" in out
+    assert "2026-10-01 03:00:00" in out and "first run" in out
+    assert "2026-08-01 12:00:00" in out
+    assert "tar" in out and "not migrated" in out
+
+
+def test_show_configs_restic_unions_snapshots_and_tars(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _read_mode(monkeypatch, _snap("kde", datetime(2026, 10, 2, 4, 0, 0)))
+    _make_saved_archive(fake_home, "zsh", "20260801-120000")
+    assert run(["--show-configs"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "- kde" in out and "- zsh" in out
+
+
+def test_list_restic_mode_empty(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _read_mode(monkeypatch)
+    assert run(["--list"]) == EXIT_OK
+    assert "No config-saver" in capsys.readouterr().out
+
+
+def test_read_verbs_store_error_is_exit_runtime(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(_saves: str) -> StorageMode:
+        raise StoreError("restic store is incomplete")
+
+    monkeypatch.setattr("config_saver.lib.cli.cli.select_mode", boom)
+    for verb in (["--list"], ["--show-configs"], ["--export-config", "x"], ["--export-all-configs"]):
+        assert run(verb) == EXIT_RUNTIME
+
+
+def test_export_config_restic_gz_then_age(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
+
+    key, recipient = _age_key(tmp_path)
+    when = datetime(2026, 10, 2, 3, 4, 5)
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 1, 3, 0, 0)), _snap("zsh", when))
+    _write_user_config(fake_home, "zsh", encrypt={"method": "age", "recipients": [recipient]})
+    dest = tmp_path / "out"
+    dest.mkdir()
+    out_file = dest / "zsh-20261002-030405.tar.gz.age"
+
+    assert run(["--export-config", "zsh", "--output", str(out_file), "--identity", key]) == EXIT_OK
+
+    assert sorted(p.name for p in dest.iterdir()) == [out_file.name]  # no temp left
+    assert oct(out_file.stat().st_mode & 0o777) == "0o600"
+    assert b"payload" not in out_file.read_bytes()
+    assert "not encrypted" not in capsys.readouterr().out
+    extract = tmp_path / "extract"
+    extract.mkdir()
+    TarDecompressor(str(out_file), str(extract), identity=key).decompress()
+    assert "zsh-030405-fullid" in (extract / "home/tester/exported.txt").read_text()
+
+
+def test_export_config_default_name_from_snapshot_time(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    assert run(["--export-config", "zsh"]) == EXIT_OK
+    assert (fake_home / "zsh-20261002-030405.tar.gz").is_file()
+
+
+def test_export_config_missing_yaml_plain_and_warns(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import gzip
+
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    dest = tmp_path / "plain.tar.gz"
+    assert run(["--export-config", "zsh", "--output", str(dest)]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "no configuration file" in out.lower() and "not encrypted" in out
+    with tarfile.open(fileobj=io.BytesIO(gzip.decompress(dest.read_bytes()))) as tar:
+        assert tar.getnames() == ["home/tester/exported.txt"]
+
+
+def test_export_config_cli_encrypt_to_overrides(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, recipient = _age_key(tmp_path)
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    dest = tmp_path / "x"
+    dest.mkdir()
+    assert run(["--export-config", "zsh", "--output", str(dest / "z"), "--encrypt-to", recipient]) == EXIT_OK
+    assert [p.name for p in dest.iterdir()] == ["z.age"]
+
+
+def test_export_no_plaintext_left_on_encrypt_failure(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    _write_user_config(fake_home, "zsh", encrypt={"method": "age", "recipients": ["not-a-real-recipient"]})
+    dest = tmp_path / "out"
+    dest.mkdir()
+    code = run(["--export-config", "zsh", "--output", str(dest / "z.tar.gz.age")])
+    assert code != EXIT_OK
+    assert list(dest.iterdir()) == []
+
+
+def test_export_no_temp_left_when_dump_fails(fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    _ReadStore.fail_dump = True
+    dest = tmp_path / "out"
+    dest.mkdir()
+    assert run(["--export-config", "zsh", "--output", str(dest / "z.tar.gz")]) == EXIT_RUNTIME
+    assert list(dest.iterdir()) == []
+
+
+def test_export_config_unknown_name_restic(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _read_mode(monkeypatch, _snap("kde", datetime(2026, 10, 2, 3, 4, 5)))
+    assert run(["--export-config", "nope"]) == EXIT_NO_SUCH_CONFIG
+
+
+def test_export_config_newer_tar_is_copied(fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    newer = _make_saved_archive(fake_home, "zsh", "20261101-000000")
+    dest = tmp_path / "copy.tar.gz"
+    assert run(["--export-config", "zsh", "--output", str(dest)]) == EXIT_OK
+    assert dest.read_bytes() == newer.read_bytes()
+
+
+def test_export_config_older_tar_loses_to_snapshot(
+    fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _read_mode(monkeypatch, _snap("zsh", datetime(2026, 10, 2, 3, 4, 5)))
+    older = _make_saved_archive(fake_home, "zsh", "20260101-000000")
+    dest = tmp_path / "snap.tar.gz"
+    assert run(["--export-config", "zsh", "--output", str(dest)]) == EXIT_OK
+    assert dest.read_bytes() != older.read_bytes()
+
+
+def test_export_all_configs_restic(fake_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _read_mode(
+        monkeypatch,
+        _snap("zsh", datetime(2026, 10, 1, 3, 0, 0)),
+        _snap("zsh", datetime(2026, 10, 2, 3, 0, 0)),
+        _snap("kde", datetime(2026, 10, 2, 4, 0, 0)),
+    )
+    _make_saved_archive(fake_home, "old", "20260801-120000")
+    dest = tmp_path / "exports"
+    assert run(["--export-all-configs", "--output", str(dest)]) == EXIT_OK
+    assert sorted(p.name for p in dest.iterdir()) == [
+        "kde-20261002-040000.tar.gz",
+        "old-20260801-120000.tar.gz",
+        "zsh-20261002-030000.tar.gz",
+    ]
