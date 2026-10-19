@@ -95,6 +95,21 @@ committing to this; if the measured second-snapshot growth is not a small fracti
 and report — the fallback idea is to back up a staging tree instead, which is a design change to bring
 back to the author.
 
+### Measurement (2026-10-19, done before planning)
+
+Real `claude-conversations` history, restic 0.18.1, `age -d | gunzip | restic backup --stdin`
+(uncompressed tar, ~1.95 GB each), scratch repo on tmpfs:
+
+| snapshot | tar size | restic `data_added` | repo size after |
+| --- | --- | --- | --- |
+| 20261015-030001 | 1.95 GB | 1.94 GB | 622 MB |
+| 20261016-030000 | 1.97 GB | 176 MB | 669 MB (+47 MB) |
+| 20261019-120456 | 2.09 GB | 204 MB | 713 MB (+44 MB) |
+
+Today each of those snapshots costs ~790 MB as `.tar.gz.age`; in the store, ~45 MB. Extrapolated to
+the 55 existing snapshots: ~3 GB instead of 27 GB, ~1.7 GB after the default retention. The tar-stream
+representation is confirmed; the staging-tree fallback is not needed.
+
 ### Store layout
 
 - Repository: `<saves_dir>/restic/` (`saves_dir` as resolved today, normally
