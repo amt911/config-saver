@@ -12,7 +12,11 @@ the AUR `PKGBUILD` said `3.1.1`), which made `config-saver --version` lie in rel
    The AUR `PKGBUILD` downloads `/archive/refs/tags/$pkgver.tar.gz`, so a `v`
    prefix would 404 there. The `release-consistency` CI job runs on any tag,
    strips an optional leading `v`, and fails if what is left ≠ `project.version`.
-4. In the sibling **`config-saver-aur`** repo: bump `pkgver`, refresh the checksum with
+4. Publish the GitHub release page from the tag, with that version's CHANGELOG section as notes:
+   `gh release create <version> --verify-tag --title "v<version>" --notes-file <notes> --latest`.
+   A tag alone does not show up as a release: 3.2.0–3.5.0 were tagged without one, and the
+   repository kept advertising 3.1.1 as "Latest" until they were back-filled on 2026-10-20.
+5. In the sibling **`config-saver-aur`** repo: bump `pkgver`, refresh the checksum with
    `updpkgsums` (it can only be computed once the tag exists), regenerate `.SRCINFO` with
    `makepkg --printsrcinfo > .SRCINFO`, and push to the AUR.
 
