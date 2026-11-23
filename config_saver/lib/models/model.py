@@ -1,6 +1,6 @@
 """Module providing the base model for the json with the file locations"""
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .encryption_model import EncryptionModel
 from .retention_model import RetentionModel
@@ -28,6 +28,10 @@ class Model(BaseModel):
         description="Enable content normalization (replace home paths in text files)",
     )
     only_root_user: bool = Field(default=False, description="Restrict execution to root user only")
+    sync: bool = Field(
+        default=False,
+        description="Share this configuration's files with other machines through `--sync`",
+    )
     encrypt: EncryptionModel | None = Field(
         default=None,
         description="Encrypt the resulting archive with age or gpg (a .tar.gz is not confidential)",
@@ -36,3 +40,9 @@ class Model(BaseModel):
         default=None,
         description="How many backups to keep per day/week/month/year when pruning",
     )
+
+    @model_validator(mode="after")
+    def _sync_requires_a_shareable_config(self) -> "Model":
+        if self.sync and self.only_root_user:
+            raise ValueError("sync cannot be combined with only_root_user")
+        return self

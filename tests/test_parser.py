@@ -12,6 +12,8 @@ from pydantic import ValidationError
 from config_saver.lib.errors import RootRequiredError
 from config_saver.lib.parser.parser import Parser
 
+from .conftest import make_model
+
 
 def test_parses_yaml_and_expands_paths(tmp_path: Path, fake_home: Path) -> None:
     cfg = tmp_path / "c.yaml"
@@ -86,3 +88,17 @@ def test_unresolved_placeholders_are_reported(tmp_path: Path) -> None:
 def test_missing_config_file_raises_filenotfound(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         Parser(str(tmp_path / "nope.yaml"))
+
+
+def test_sync_defaults_false(fake_home: Path) -> None:
+    assert make_model([str(fake_home / "data")]).sync is False
+
+
+def test_sync_true_accepted(fake_home: Path) -> None:
+    assert make_model([str(fake_home / "data")], sync=True).sync is True
+
+
+def test_sync_with_only_root_user_rejected(fake_home: Path) -> None:
+    """A root-only config cannot be shared with the user's other machines."""
+    with pytest.raises(ValidationError, match="sync cannot be combined with only_root_user"):
+        make_model([str(fake_home / "data")], sync=True, only_root_user=True)
