@@ -20,7 +20,7 @@ import shlex
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -38,6 +38,9 @@ DEFAULT_IDENTITY = "~/.config/age/key.txt"
 BASE_TAG = "config-saver"
 CFG_TAG_PREFIX = "cfg:"
 DESC_TAG_PREFIX = "desc:"
+SYNC_TAG = "sync"
+PARENT_TAG_PREFIX = "parent:"
+HOST_TAG_PREFIX = "host:"
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 _PRIVATE_FILE = 0o600
 _PRIVATE_DIR = 0o700
@@ -52,6 +55,7 @@ class Snapshot:
     time: datetime
     cfg: str
     description: str | None
+    tags: tuple[str, ...] = ()
 
 
 class StorageMode(Enum):
@@ -202,6 +206,12 @@ class ResticStore:
         if "," in cfg:
             raise StoreError(f"config name '{cfg}' contains a comma, which restic tags cannot carry")
 
+    @staticmethod
+    def _check_tag(tag: str) -> None:
+        """An extra tag must be non-empty, comma-free and whitespace-free."""
+        if not tag or "," in tag or any(ch.isspace() for ch in tag):
+            raise StoreError(f"invalid tag {tag!r}: it must be non-empty with no comma or whitespace")
+
     # ------------------------------------------------------------------- verbs
 
     def init(self, recipient: str) -> None:
@@ -253,9 +263,12 @@ class ResticStore:
         cfg: str,
         when: datetime,
         description: str | None,
+        extra_tags: Sequence[str] = (),
     ) -> tuple[Snapshot, CompressResult, int]:
         """Stream ``write``'s tar into restic; return (snapshot, result, data_added)."""
         self._check_cfg(cfg)
+        for tag in extra_tags:
+            self._check_tag(tag)
         argv = [
             "restic",
             "backup",
@@ -269,6 +282,8 @@ class ResticStore:
         ]
         if description:
             argv += ["--tag", encode_description(description)]
+        for tag in extra_tags:
+            argv += ["--tag", tag]
         argv += ["--time", when.strftime(_TIME_FORMAT), "--json"]
         try:
             proc = subprocess.Popen(
@@ -338,12 +353,15 @@ class ResticStore:
                 return data
         raise StoreError("restic finished without reporting a snapshot id")
 
-    def snapshots(self, cfg: str | None = None) -> list[Snapshot]:
-        """Snapshots of this tool, oldest first, optionally of one config."""
+    def snapshots(self, cfg: str | None = None, tag: str | None = None) -> list[Snapshot]:
+        """Snapshots of this tool, oldest first, optionally of one config and/or carrying ``tag``."""
         tags = BASE_TAG
         if cfg is not None:
             self._check_cfg(cfg)
             tags += f",{CFG_TAG_PREFIX}{cfg}"
+        if tag is not None:
+            self._check_tag(tag)
+            tags += f",{tag}"
         raw = self._run(["snapshots", "--json", "--tag", tags])
         try:
             entries = json.loads(raw or b"[]")
@@ -363,6 +381,7 @@ class ResticStore:
                     time=parse_restic_time(entry["time"]),
                     cfg=name,
                     description=decode_description(desc_tag) if desc_tag else None,
+                    tags=tuple(tag_list),
                 )
             )
         return sorted(found, key=lambda s: (s.time, s.id))

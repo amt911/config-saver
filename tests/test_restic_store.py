@@ -18,6 +18,8 @@ from config_saver.lib.errors import StoreError
 from config_saver.lib.models.retention_model import RetentionModel
 from config_saver.lib.restic_store import (
     NOTICES,
+    PARENT_TAG_PREFIX,
+    SYNC_TAG,
     ResticStore,
     StorageMode,
     decode_description,
@@ -353,6 +355,25 @@ def test_backup_rejects_comma_in_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyP
         _store(tmp_path).backup(_writer(), "a,b", WHEN, None)
 
 
+def test_backup_extra_tags_are_appended_to_argv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cls = _popen(monkeypatch, out=SUMMARY)
+    snap, _, _ = _store(tmp_path).backup(_writer(), "c", WHEN, None, extra_tags=[SYNC_TAG, f"{PARENT_TAG_PREFIX}none"])
+    argv = cls.last.argv
+    tags = [argv[i + 1] for i, a in enumerate(argv) if a == "--tag"]
+    assert tags == ["config-saver", "cfg:c", "sync", "parent:none"]
+    assert snap.tags == ()
+
+
+@pytest.mark.parametrize("bad", ["a,b", "", "has space", "tab\tx"])
+def test_backup_rejects_bad_extra_tag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("restic must not be started for an invalid tag")
+
+    monkeypatch.setattr(rs.subprocess, "Popen", forbidden)
+    with pytest.raises(StoreError, match="tag"):
+        _store(tmp_path).backup(_writer(), "c", WHEN, None, extra_tags=[bad])
+
+
 def test_backup_writer_failure_kills_restic_and_reraises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cls = _popen(monkeypatch, out=SUMMARY)
 
@@ -578,3 +599,23 @@ def test_forget_also_keep_protects_a_snapshot_the_policy_would_drop(
     removed = _store(tmp_path).forget("c", zero, dry_run=False, also_keep=[protect])
     assert [s.short_id for s in removed] == ["a" * 8, "c" * 8]
     assert rec.calls[-1]["argv"] == ["restic", "forget", "a" * 64, "c" * 64]
+
+
+def test_snapshots_fill_tags_and_and_the_extra_tag_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    entry = _entry("a", "2026-10-18T12:00:00Z")
+    entry["tags"] += ["sync", "parent:none"]
+    rec.stdout = json.dumps([entry]).encode()
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    snaps = _store(tmp_path).snapshots("c", tag=SYNC_TAG)
+    assert snaps[0].tags == ("config-saver", "cfg:c", "sync", "parent:none")
+    argv = rec.calls[0]["argv"]
+    assert argv[argv.index("--tag") + 1] == "config-saver,cfg:c,sync"
+    _store(tmp_path).snapshots(tag=SYNC_TAG)
+    argv = rec.calls[1]["argv"]
+    assert argv[argv.index("--tag") + 1] == "config-saver,sync"
+
+
+def test_snapshots_rejects_bad_tag_filter(tmp_path: Path) -> None:
+    with pytest.raises(StoreError, match="tag"):
+        _store(tmp_path).snapshots(tag="a,b")
