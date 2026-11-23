@@ -133,9 +133,21 @@ def test_missing_git_is_not_set_up(tmp_path, monkeypatch):
         GitRepo(str(tmp_path / "a")).pull()
 
 
+def _installed_locale():
+    out = subprocess.run(["locale", "-a"], capture_output=True, text=True).stdout.split()
+    norm = {name.lower().replace("utf8", "utf-8"): name for name in out}
+    for want in ("es_es.utf-8", "de_de.utf-8"):
+        if want in norm:
+            return norm[want]
+    return None
+
+
 def test_push_rejection_detected_in_foreign_locale(tmp_path, remote, monkeypatch):
-    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
-    monkeypatch.setenv("LANGUAGE", "de")
+    loc = _installed_locale()
+    if loc is None:
+        pytest.skip("no es_ES/de_DE locale generated")
+    monkeypatch.setenv("LC_ALL", loc)
+    monkeypatch.setenv("LANGUAGE", loc.split("_")[0])
     a = seeded(tmp_path, remote)
     b = GitRepo(str(tmp_path / "b"))
     b.clone(remote)
@@ -179,3 +191,20 @@ def test_timeout_is_transport_error(tmp_path, monkeypatch):
     monkeypatch.setattr("config_saver.lib.sync.git_repo.TIMEOUT_SECONDS", 0.001)
     with pytest.raises(SyncTransportError):
         GitRepo(str(tmp_path / "a")).clone(str(tmp_path / "x.git"))
+
+
+def test_git_runs_with_untranslated_locale(tmp_path, remote, monkeypatch):
+    # Git's "! [rejected] ... (fetch first)" status words are not translated today, but
+    # its error lines are (es_ES); the port pins LC_ALL=C so nothing we parse can change.
+    real = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "locale.log"
+    shim = bindir / "git"
+    shim.write_text(f'#!/bin/sh\necho "$LC_ALL $LANGUAGE" >> {log}\nexec {real} "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.setenv("LC_ALL", "es_ES.UTF-8")
+    monkeypatch.setenv("LANGUAGE", "es")
+    GitRepo(str(tmp_path / "a")).init(remote)
+    assert set(log.read_text().split("\n")) == {"C C", ""}
