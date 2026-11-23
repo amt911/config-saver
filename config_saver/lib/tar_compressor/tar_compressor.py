@@ -64,6 +64,9 @@ class CompressResult:
     skipped_root_owned: list[str] = field(default_factory=list)
     # Directories the walk could not list (permissions, I/O): their content is not seen at all.
     unreadable_dirs: list[str] = field(default_factory=list)
+    # Declared paths whose existence could not be established (lstat failed with something
+    # other than "no such file"), e.g. behind a parent directory without search permission.
+    unreadable_entries: list[str] = field(default_factory=list)
     missing_inputs: list[str] = field(default_factory=list)
     encryption: crypto.EncryptionInfo | None = None
 
@@ -302,6 +305,17 @@ class TarCompressor:
         that fails.
         """
 
+        def lexists(path: str) -> bool:
+            """Like os.path.lexists, but an lstat failure that is not "absent" is recorded."""
+            try:
+                os.lstat(path)
+            except (FileNotFoundError, NotADirectoryError):
+                return False
+            except OSError as exc:
+                result.unreadable_entries.append(f"{path} ({exc.strerror or exc})")
+                return False
+            return True
+
         def walk(root: str) -> Iterator[tuple[str, bool]]:
             # The directory itself is archived so empty directories survive a round-trip.
             yield root, True
@@ -333,7 +347,7 @@ class TarCompressor:
                 if self._is_excluded(entry):
                     result.excluded += 1
                     continue
-                if "${" in entry or not os.path.lexists(entry):
+                if "${" in entry or not lexists(entry):
                     result.missing_inputs.append(entry)
                     continue
                 if os.path.isdir(entry) and not os.path.islink(entry):
@@ -346,7 +360,7 @@ class TarCompressor:
             if self._is_excluded(source):
                 result.excluded += 1
                 continue
-            if "${" in source or not os.path.isdir(source):
+            if "${" in source or not lexists(source) or not os.path.isdir(source):
                 result.missing_inputs.append(source)
                 continue
             for file in entry.files:
@@ -354,7 +368,7 @@ class TarCompressor:
                 if self._is_excluded(file_path):
                     result.excluded += 1
                     continue
-                if not os.path.lexists(file_path):
+                if not lexists(file_path):
                     result.missing_inputs.append(file_path)
                     continue
                 if os.path.isdir(file_path) and not os.path.islink(file_path):
@@ -423,6 +437,7 @@ class TarCompressor:
                 yield path, arcname
         if problems is not None:
             problems.extend(f"{d} (directory cannot be listed)" for d in result.unreadable_dirs)
+            problems.extend(result.unreadable_entries)
 
     def content_stream(self, path: str) -> IO[bytes]:
         """The bytes that would be archived for a regular file; the caller closes it."""

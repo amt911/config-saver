@@ -580,3 +580,25 @@ def test_root_owned_file_never_publishes_a_deletion(pair, monkeypatch):
         a.engine.run({"c": a.model("cfg")})
     assert Path(a.state_file).read_bytes() == state_before
     assert a.head() == head_before
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches a 0o000 directory")
+def test_unreachable_parent_never_publishes_a_deletion(pair):
+    from config_saver.lib.errors import SyncUnreadableError
+
+    a, _b = pair
+    a.write("d/f", "v1\n")
+    model = make_model([str(a.home / "d" / "f")], sync=True)
+    a.engine.run({"c": model})
+    state_before = Path(a.state_file).read_bytes()
+    head_before = a.head()
+    (a.home / "d").chmod(0)
+    try:
+        with pytest.raises(SyncUnreadableError, match="d/f"):
+            a.engine.run({"c": model})
+    finally:
+        (a.home / "d").chmod(0o700)
+    assert Path(a.state_file).read_bytes() == state_before
+    assert a.head() == head_before
+    git(a.sync_dir, "fetch", "origin")
+    assert git(a.sync_dir, "rev-list", "HEAD..@{u}") == ""

@@ -153,7 +153,7 @@ host name; the "remote" state of a configuration is its newest `sync` snapshot.
 ### systemd
 
 - `contrib/systemd/user/config-saver-sync.service` (oneshot, `UMask=0077`, `--sync`) and
-  `config-saver-sync.timer` (e.g. `OnBootSec=2min`, `OnUnitActiveSec=15min`, `Persistent=true`).
+  `config-saver-sync.timer` (e.g. `OnBootSec=2min`, `OnUnitActiveSec=15min`; no `Persistent=`, it only affects `OnCalendar=`).
 - `config-saver-notify@.service`: `ExecStart=notify-send -u critical -a config-saver "…" "…%i…"`,
   referenced from the sync service via `OnFailure=config-saver-notify@%n.service`.
   The message points at `config-saver --sync-status`.

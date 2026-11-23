@@ -235,3 +235,25 @@ def test_system_config_dir_is_refused(fake_home: Path) -> None:
         with pytest.raises(SyncSystemConfigError, match="/etc/config-saver/configs"):
             scan(make_model(declared))
     scan(make_model(["/etc/config-saver/configs-other"]))  # a sibling name is fine
+
+
+def _behind_locked_parent(fake_home: Path) -> Path:
+    d = fake_home / "d"
+    d.mkdir()
+    (d / "f").write_text("x", encoding="utf-8")
+    d.chmod(0)
+    return d
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches a 0o000 directory")
+@pytest.mark.parametrize("form", ["string", "source_files"])
+def test_path_behind_an_unreachable_parent_is_not_an_absence(fake_home: Path, form: str) -> None:
+    from config_saver.lib.errors import SyncUnreadableError
+
+    d = _behind_locked_parent(fake_home)
+    try:
+        directories = [str(d / "f")] if form == "string" else [{"source": str(d), "files": ["f"]}]
+        with pytest.raises(SyncUnreadableError, match="d/f"):
+            scan(make_model(directories))
+    finally:
+        d.chmod(0o700)
