@@ -11,7 +11,10 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Fingerprint:
-    """Identity of one synced entry. `link` is the symlink target, if any."""
+    """Identity of one synced entry.
+
+    For symlinks `sha256` is the hash of the target text and `link` is the target.
+    """
 
     sha256: str
     mode: int
@@ -45,13 +48,13 @@ def classify(
     candidates = (set(base) | set(local) | set(remote)) & local_scope
     for path in sorted(candidates):
         b = base.get(path)
-        l = local.get(path)  # noqa: E741
+        loc = local.get(path)
         r = remote.get(path)
         if r is None and path not in remote_scope:
             r = b
-        if l == r:
+        if loc == r:
             continue
-        if l == b:
+        if loc == b:
             (plan.delete_local if r is None else plan.take_remote).append(path)
         elif r == b:
             plan.publish.append(path)

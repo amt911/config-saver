@@ -132,3 +132,18 @@ def test_unchanged_local_never_conflicts_or_publishes(b, r):
     s = set(paths)
     plan = classify(b, dict(b), r, s, s)
     assert plan.conflicts == [] and plan.publish == []
+
+
+@given(sides, sides, sides, st.sets(st.sampled_from(paths)))
+def test_plan_paths_stay_in_local_scope(b, lo, r, local_scope):
+    plan = classify(b, lo, r, local_scope, set(paths))
+    for lst in (plan.take_remote, plan.delete_local, plan.publish, plan.conflicts):
+        assert set(lst) <= local_scope
+
+
+@given(sides, sides, sides, st.sets(st.sampled_from(paths)))
+def test_plan_lists_pairwise_disjoint(b, lo, r, remote_scope):
+    plan = classify(b, lo, r, set(paths), remote_scope)
+    lists = [plan.take_remote, plan.delete_local, plan.publish, plan.conflicts]
+    flat = [p for lst in lists for p in lst]
+    assert len(flat) == len(set(flat))
