@@ -200,6 +200,7 @@ config-saver --compress
 - `--encrypt-to RECIPIENT`: Encrypt the archive for this age public key or gpg key id (repeatable)
 - `--encrypt-method {age,gpg}`: Backend for `--encrypt-to` (default `age`)
 - `--identity FILE`: Key file used to decrypt an encrypted archive (required for `age`)
+- `--sync`: Sync the configurations marked `sync: true` with your other machines; `--sync-init URL [--encrypt-to RECIPIENT]`: set sync up; `--sync-status`: show what `--sync` would do (exit `11` on conflicts); `--sync-resolve local|remote [--path P]`: settle conflicts (`--path` is repeatable). See [Sync between machines](#sync-between-machines)
 - `--version`/`-v`: Show program version and exit
 
 With a restic store, `--compress` snapshots into it, then prunes by each configuration's
@@ -230,9 +231,12 @@ itself.
 | `7` | `--export-config NAME` matched no saved configuration |
 | `8` | `--strict` and at least one configured path was missing |
 | `9` | Encryption or decryption failed (backend missing, wrong key, bad recipient) |
-| `10` | I/O error |
+| `10` | I/O error, including an unreachable sync remote or a sync already set up |
+| `11` | `--sync` or `--sync-status` found paths changed on both machines since the last sync (nothing was written); see [Sync between machines](#sync-between-machines) |
 
-argparse itself exits with `2` for usage errors such as a missing action flag.
+argparse itself exits with `2` for usage errors such as a missing action flag. Sync needing a tool
+or a set-up that is absent exits `2`; a too-large sync config (over 50 MiB) or an unreadable sync
+state file exits `3`; an unknown `--path` for `--sync-resolve` exits `6`.
 
 ## Deduplicated storage (restic)
 
@@ -708,6 +712,14 @@ reported, because a backup must not skip anything in silence:
 3 path(s) excluded by pattern.
 ```
 
+### Sync between machines (`sync: true`)
+
+```yaml
+sync: true   # default false; cannot be combined with only_root_user
+```
+
+Marks the configuration as shared by `--sync`; see [Sync between machines](#sync-between-machines).
+
 ### Root-only configurations (optional)
 
 Some configurations may require root privileges to read system files (e.g., `/etc`, `/var/log`, system service configurations). You can restrict a YAML configuration to only run as root by adding the `only_root_user: true` option:
@@ -828,6 +840,46 @@ And when user `maria` decompresses it, it becomes:
 - Binary files (images, fonts, executables) are never modified
 - Only UTF-8 and Latin-1 encoded text files are processed
 - This option is **disabled by default** for safety
+
+## Sync between machines
+
+`--sync` keeps the files of configurations marked `sync: true` identical across your machines
+through a private git remote. The store is the same encrypted restic repository used for backups
+(see [Deduplicated storage](#deduplicated-storage-restic)), kept in
+`~/.local/share/config-saver/sync`; git only ever sees ciphertext. Needs `git`, `restic` and `age`.
+
+**First machine.** Create an empty **private** repository, then:
+
+```bash
+config-saver --sync-init git@github.com:you/my-configs.git --encrypt-to <age recipient>
+```
+
+Mark what to share in your configuration with `sync: true`, then run `config-saver --sync`.
+
+**Next machines.** Copy the same age private key to the machine (it decrypts the store) and run
+the same `--sync-init <url>`: when the remote already holds a store, it is cloned and no
+`--encrypt-to` is needed. Then mark the same configurations `sync: true` and run `--sync`.
+
+**What a run does.** Each `--sync` takes remote changes that this machine did not touch, publishes
+local changes that nobody else touched, and propagates deletions. Output is one line per
+configuration (`applied / deleted / published`), plus `skipped (no local config): ...` for remote
+configurations this machine does not define. `--sync-status` shows the same per path and changes
+nothing.
+
+**Conflicts.** If the same path changed on two machines since the last sync, `--sync` exits `11`,
+writes nothing, and prints one `config: path` line per conflict followed by
+`Resolve with: config-saver --sync-resolve local|remote [--path P]`. Choose `local` (keep this
+machine's version) or `remote` (take the other's); without `--path` every conflict is settled the
+same way, and `--path ~/.zshrc` (repeatable) settles only those.
+
+**Limits.**
+
+- Definitions stay per machine: a file added to one machine's YAML is not picked up by the others
+  until it is added there too.
+- Empty directories are not synced.
+- At most 50 MiB per configuration (exit `3` beyond that).
+- The git history only grows: old versions stay in it.
+- GitHub sees only ciphertext plus fixed commit metadata (`sync` / `config-saver`).
 
 ## Systemd units and timers
 

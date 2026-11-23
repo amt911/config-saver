@@ -29,16 +29,21 @@ from config_saver import __version__
 from config_saver.lib import crypto, maintenance, paths
 from config_saver.lib.archive_names import FILENAME_PATTERN, archive_identity
 from config_saver.lib.backup_manager.backup_manager import BackupManager, BatchResult, PruneReport
+from config_saver.lib.cli import sync_commands
 from config_saver.lib.errors import (
     ArchiveError,
     EncryptionError,
     RootRequiredError,
     StoreError,
+    SyncConflictError,
+    SyncNotSetUpError,
+    SyncStateError,
     SyncTooLargeError,
     UnsafeArchiveError,
 )
 from config_saver.lib.migrate import MigrationReport, migrate_archives
 from config_saver.lib.models.encryption_model import EncryptionModel
+from config_saver.lib.models.model import Model
 from config_saver.lib.parser.parser import Parser
 from config_saver.lib.restic_store import NOTICES, ResticStore, Snapshot, StorageMode, select_mode
 from config_saver.lib.tar_compressor.tar_compressor import CompressResult
@@ -58,6 +63,21 @@ EXIT_NO_SUCH_CONFIG = 7
 EXIT_INCOMPLETE = 8
 EXIT_ENCRYPTION = 9
 EXIT_IO = 10
+EXIT_SYNC_CONFLICT = sync_commands.EXIT_SYNC_CONFLICT
+
+
+# Argparse dests of the non-sync actions (the mutually exclusive group).
+_ACTIONS = (
+    "compress",
+    "decompress",
+    "list",
+    "export_config",
+    "export_all_configs",
+    "show_configs",
+    "restic_init",
+    "migrate",
+    "prune",
+)
 
 
 class BackupTable:
@@ -161,7 +181,7 @@ class CLI:
 
     def parse_args(self) -> argparse.Namespace:
         parser = argparse.ArgumentParser(description="Tar compressor/decompressor utility", prog="config-saver")
-        group = parser.add_mutually_exclusive_group(required=True)
+        group = parser.add_mutually_exclusive_group()
         group.add_argument(
             "--compress",
             "-c",
@@ -206,6 +226,33 @@ class CLI:
             "--prune",
             action="store_true",
             help="Apply retention to every configuration now (see --dry-run, --include-legacy)",
+        )
+        parser.add_argument(
+            "--sync",
+            action="store_true",
+            help="Sync the configurations marked 'sync: true' with the other machines (git remote)",
+        )
+        parser.add_argument(
+            "--sync-init",
+            metavar="URL",
+            default=None,
+            help="Set up sync against this git remote (clones it, or creates the store with --encrypt-to)",
+        )
+        parser.add_argument(
+            "--sync-status", action="store_true", help="Show what --sync would do (exit 11 on conflicts)"
+        )
+        parser.add_argument(
+            "--sync-resolve",
+            choices=("local", "remote"),
+            default=None,
+            help="Settle sync conflicts by keeping the local or the remote side (see --path)",
+        )
+        parser.add_argument(
+            "--path",
+            action="append",
+            default=None,
+            metavar="P",
+            help="With --sync-resolve: settle only this path (repeatable); default every conflict",
         )
         parser.add_argument(
             "--delete-migrated",
@@ -305,7 +352,10 @@ class CLI:
             version=f"%(prog)s {__version__}",
             help="Show program version and exit",
         )
-        return parser.parse_args(self.argv)
+        args = parser.parse_args(self.argv)
+        if not any(getattr(args, a) for a in _ACTIONS) and not sync_commands.sync_verbs(args):
+            parser.error("one of the arguments --compress/-c --decompress/-d --list/-l ... --sync is required")
+        return args
 
     # ------------------------------------------------------------- rendering
 
@@ -467,11 +517,17 @@ class CLI:
         except RootRequiredError as e:
             print(Fore.RED + str(e))
             return EXIT_PERMISSION
+        except SyncConflictError as e:
+            sync_commands.print_conflicts(e.conflicts)
+            return EXIT_SYNC_CONFLICT
+        except SyncNotSetUpError as e:
+            print(Fore.RED + str(e))
+            return EXIT_NOT_FOUND
         except FileNotFoundError as e:
             target = getattr(e, "filename", None) or str(e)
             print(Fore.RED + f"Not found: {target}")
             return EXIT_NOT_FOUND
-        except SyncTooLargeError as e:
+        except (SyncTooLargeError, SyncStateError) as e:
             print(Fore.RED + str(e))
             return EXIT_VALIDATION
         except ValidationError as e:
@@ -510,11 +566,36 @@ class CLI:
             return "--dry-run and --include-legacy only apply to --prune."
         return None
 
+    def _sync(self, args: argparse.Namespace, sync_verbs: list[str]) -> int:
+        if not sync_verbs:
+            print(Fore.RED + "--path only applies to --sync-resolve.")
+            return EXIT_USAGE
+        if any(getattr(args, a) for a in _ACTIONS):
+            print(Fore.RED + "Sync flags cannot be combined with other actions.")
+            return EXIT_USAGE
+        if args.path and not args.sync_resolve:
+            print(Fore.RED + "--path only applies to --sync-resolve.")
+            return EXIT_USAGE
+
+        def load() -> dict[str, Model]:
+            # The same discovery as --compress: layered defaults, or exactly what --input names.
+            inputs = list(args.input or [])
+            layered = not inputs
+            directories = default_config_dirs() if layered else [p for p in inputs if os.path.isdir(p)]
+            files = [p for p in inputs if not os.path.isdir(p)]
+            found = self._collect_configs(BackupManager(), directories, allow_override=layered) + files
+            return {os.path.splitext(os.path.basename(f))[0]: Parser(f).get_model() for f in found}
+
+        return sync_commands.handle(args, load)
+
     def _dispatch(self, args: argparse.Namespace) -> int:
         misplaced = self._misplaced_modifier(args)
         if misplaced:
             print(Fore.RED + misplaced)
             return EXIT_USAGE
+        sync_verbs = sync_commands.sync_verbs(args)
+        if sync_verbs or args.path:
+            return self._sync(args, sync_verbs)
         manager = BackupManager()
         saves_dir = manager.ensure_saves_dir()
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")

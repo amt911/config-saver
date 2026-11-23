@@ -1203,3 +1203,154 @@ def test_prune_totals_read_as_sentences(
     assert "Total: 2 backup(s) would be removed." in capsys.readouterr().out
     assert run(["--prune", "-i", str(cfgs)]) == EXIT_OK
     assert "Total: 2 backup(s) removed." in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------- sync
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--sync", "--sync-status"],
+        ["--sync", "--compress"],
+        ["--sync-status", "--list"],
+        ["--sync-init", "url", "--sync"],
+        ["--sync-resolve", "local", "--sync"],
+        ["--compress", "--path", "~/x"],
+        ["--sync", "--path", "~/x"],
+    ],
+)
+def test_sync_flag_combinations_exit_usage(argv: list[str], fake_home: Path) -> None:
+    assert run(argv) == EXIT_USAGE
+
+
+def test_sync_without_setup_exits_not_found(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(fake_home / "share"))
+    monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
+    for flag in (["--sync"], ["--sync-status"], ["--sync-resolve", "local"]):
+        assert run(flag) == EXIT_NOT_FOUND
+        assert "sync is not set up" in capsys.readouterr().out
+
+
+def test_sync_with_a_missing_tool_names_it(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda tool: None if tool == "age" else "/usr/bin/fake")
+    assert run(["--sync"]) == EXIT_NOT_FOUND
+    assert "age" in capsys.readouterr().out
+
+
+def test_no_action_at_all_is_still_an_argparse_error(fake_home: Path) -> None:
+    with pytest.raises(SystemExit) as raised:
+        run([])
+    assert raised.value.code == 2
+
+
+def _sync_stub(
+    monkeypatch: pytest.MonkeyPatch, fake_home: Path, error: Exception | None = None, **report: object
+) -> None:
+    from config_saver.lib.sync.engine import SyncEngine, SyncReport
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(fake_home / "share"))
+    (fake_home / "share" / "config-saver" / "sync" / ".git").mkdir(parents=True)
+    monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
+
+    def act(self: SyncEngine, *_a: object, **_k: object) -> SyncReport:
+        if error is not None:
+            raise error
+        return SyncReport(**report)  # type: ignore[arg-type]
+
+    for verb in ("run", "status", "resolve"):
+        monkeypatch.setattr(SyncEngine, verb, act)
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        ("conflict", 11),
+        ("toolarge", 3),
+        ("state", 3),
+        ("transport", 10),
+        ("exists", 10),
+    ],
+)
+def test_sync_error_to_exit_code(
+    error: str,
+    code: int,
+    tmp_path: Path,
+    fake_home: Path,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from config_saver.lib import errors
+
+    errs: dict[str, Exception] = {
+        "conflict": errors.SyncConflictError({"zsh": ["home/user/.zshrc"]}),
+        "toolarge": errors.SyncTooLargeError("too big"),
+        "state": errors.SyncStateError("bad state"),
+        "transport": errors.SyncTransportError("no remote"),
+        "exists": FileExistsError("already"),
+    }
+    _sync_stub(monkeypatch, fake_home, errs[error])
+    cfg = write_config(tmp_path / "zsh.yaml", [str(data_dir)], sync=True)
+    assert run(["--sync", "--input", str(cfg)]) == code
+    if error == "conflict":
+        out = capsys.readouterr().out
+        assert "zsh: ~/.zshrc" in out
+        assert "Resolve with: config-saver --sync-resolve local|remote [--path P]" in out
+
+
+def test_sync_resolve_unknown_path_exits_usage(
+    tmp_path: Path, fake_home: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _sync_stub(monkeypatch, fake_home, ValueError("not a current conflict: x"))
+    cfg = write_config(tmp_path / "zsh.yaml", [str(data_dir)], sync=True)
+    assert run(["--sync-resolve", "local", "--path", "~/x", "--input", str(cfg)]) == EXIT_USAGE
+
+
+def test_sync_resolve_passes_the_path_as_an_archive_name(
+    tmp_path: Path, fake_home: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from config_saver.lib.sync.engine import SyncEngine, SyncReport
+
+    _sync_stub(monkeypatch, fake_home)
+    seen: list[object] = []
+
+    def resolve(self: SyncEngine, configs: object, side: str, paths: list[str] | None) -> SyncReport:
+        seen.append((sorted(configs), side, paths))  # type: ignore[call-overload]
+        return SyncReport()
+
+    monkeypatch.setattr(SyncEngine, "resolve", resolve)
+    cfg = write_config(tmp_path / "zsh.yaml", [str(data_dir)], sync=True)
+    assert run(["--sync-resolve", "remote", "--path", "~/.zshrc", "--path", "/etc/hosts", "--input", str(cfg)]) == 0
+    assert seen == [(["zsh"], "remote", ["home/user/.zshrc", "etc/hosts"])]
+
+
+def test_sync_success_summary_and_skipped(
+    tmp_path: Path, fake_home: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _sync_stub(
+        monkeypatch,
+        fake_home,
+        applied={"zsh": ["home/user/a", "home/user/b"]},
+        published={"zsh": ["home/user/c"]},
+        skipped_remote=["other"],
+    )
+    cfg = write_config(tmp_path / "zsh.yaml", [str(data_dir)], sync=True)
+    assert run(["--sync", "--input", str(cfg)]) == 0
+    out = capsys.readouterr().out
+    assert "zsh: applied 2, deleted 0, published 1" in out
+    assert "skipped (no local config): other" in out
+
+
+def test_sync_status_lists_paths_and_exits_11_on_conflict(
+    tmp_path: Path, fake_home: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _sync_stub(monkeypatch, fake_home, applied={"zsh": ["home/user/a"]}, conflicts={"zsh": ["home/user/b"]})
+    cfg = write_config(tmp_path / "zsh.yaml", [str(data_dir)], sync=True)
+    assert run(["--sync-status", "--input", str(cfg)]) == 11
+    out = capsys.readouterr().out
+    assert "zsh: ~/a (take remote)" in out and "zsh: ~/b" in out
