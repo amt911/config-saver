@@ -6,6 +6,34 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.6.0] - 2026-11-23
+
+### Added
+
+- **Multi-machine sync** (`--sync`): the files of every configuration marked `sync: true` are kept
+  identical across machines through a dedicated restic repository (encrypted, password wrapped with
+  age) stored in a git working tree pushed to a private remote. The remote only ever sees
+  ciphertext and fixed commit metadata (`sync` / `config-saver`).
+  - Per-file three-way comparison against the last sync: remote-only changes are applied, local-only
+    changes are published, deletions propagate. A file changed on two machines is a **conflict**:
+    the run writes nothing and exits `11`.
+  - `--sync-init <git-url> --encrypt-to <age recipient>` sets up the first machine; the same command
+    clones on the next ones. `--sync-status` shows what a run would do; `--sync-resolve local|remote
+    [--path P]` settles conflicts.
+  - Definitions stay per machine: each machine syncs only what its own YAML declares, and never
+    deletes or overwrites paths it does not declare.
+  - Restored bytes go through the same extraction guard as `--decompress`; every snapshot is
+    validated before the first write. Unreadable or root-owned files in scope stop the run (exit
+    `10`) instead of being read as deletions.
+- **systemd user units** `config-saver-sync.timer` (every 15 min, 2 min after boot) and
+  `config-saver-notify@.service`: a failed sync raises a desktop notification through `notify-send`
+  (libnotify, any freedesktop desktop).
+
+### Changed
+
+- `--decompress` now auto-detects the archive compression (`r:*`), so uncompressed tars are accepted
+  too.
+
 ## [3.5.0] - 2026-10-19
 
 ### Added
