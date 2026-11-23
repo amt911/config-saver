@@ -377,15 +377,16 @@ class TarCompressor:
 
         Plain string entries, and ``source/file`` for each file of a
         ``{source, files}`` entry. Entries with an unexpanded ``${`` placeholder
-        are not real paths and are left out.
+        are not real paths, and entries whose ``source`` is excluded are dropped whole;
+        both are left out.
         """
         for entry in self.yaml_data.directories:
             if isinstance(entry, str):
                 paths = [entry]
             else:
-                paths = [os.path.join(entry.source, file) for file in entry.files]
-                if "${" in entry.source:
-                    paths = []
+                # Like _iter_entries: an excluded source drops the whole entry.
+                skipped = "${" in entry.source or self._is_excluded(entry.source)
+                paths = [] if skipped else [os.path.join(entry.source, file) for file in entry.files]
             for path in paths:
                 if "${" not in path:
                     yield path, self._normalize_path(path)

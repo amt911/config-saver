@@ -11,6 +11,7 @@ import os
 import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from typing import NoReturn
 
 from config_saver.lib.errors import SyncTooLargeError
 from config_saver.lib.models.model import Model
@@ -81,6 +82,12 @@ def _fingerprint(compressor: TarCompressor, path: str) -> tuple[Fingerprint, int
         return None
 
 
+def _too_large(total: int, scope: LocalScope) -> NoReturn:
+    raise SyncTooLargeError(
+        f"sync configuration too large: {total} bytes over the 50 MiB limit (roots: {sorted(scope.roots)})"
+    )
+
+
 def scan(model: Model) -> tuple[LocalScope, Side, int]:
     """Return ``(scope, fingerprints, total_bytes)`` for a sync-enabled model.
 
@@ -94,14 +101,19 @@ def scan(model: Model) -> tuple[LocalScope, Side, int]:
     fingerprints: Side = {}
     total = 0
     for path, arcname in compressor.iter_files():
+        # Refuse on the size alone, before reading a huge file.
+        try:
+            declared = os.lstat(path)
+        except OSError:
+            continue
+        if stat.S_ISREG(declared.st_mode) and total + declared.st_size > MAX_SYNC_BYTES:
+            _too_large(total + declared.st_size, scope)
         found = _fingerprint(compressor, path)
         if found is None:
             continue
         fingerprint, size = found
         total += size
         if total > MAX_SYNC_BYTES:
-            raise SyncTooLargeError(
-                f"sync configuration too large: {total} bytes over the 50 MiB limit (roots: {sorted(scope.roots)})"
-            )
+            _too_large(total, scope)
         fingerprints[arcname] = fingerprint
     return scope, fingerprints, total

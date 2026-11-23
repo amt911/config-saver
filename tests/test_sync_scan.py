@@ -155,3 +155,23 @@ def test_content_stream_normalizes_only_when_asked(fake_home: Path) -> None:
         assert s.read() == b"p=<<<HOME_PLACEHOLDER>>>\n"
     with TarCompressor(make_model([str(f)], normalize_content=False)).content_stream(str(f)) as s:
         assert s.read() == f.read_bytes()
+
+
+def test_scope_excluded_source_drops_whole_entry(fake_home: Path) -> None:
+    src = fake_home / "srcdir"
+    src.mkdir()
+    (src / "f").write_text("x", encoding="utf-8")
+    scope, side, _ = scan(make_model([{"source": str(src), "files": ["f"]}], exclude=["srcdir"]))
+    assert side == {}
+    assert not scope.contains("home/user/srcdir/f")
+
+
+def test_too_large_is_refused_before_reading(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import config_saver.lib.sync.scan as mod
+
+    monkeypatch.setattr(mod, "MAX_SYNC_BYTES", 10)
+    monkeypatch.setattr(mod, "_fingerprint", lambda *_a: pytest.fail("file was read"))
+    f = fake_home / "big"
+    f.write_bytes(b"x" * 11)
+    with pytest.raises(SyncTooLargeError):
+        scan(make_model([str(f)]))
