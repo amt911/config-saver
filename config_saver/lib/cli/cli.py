@@ -41,6 +41,39 @@ from config_saver.lib.errors import (
     SyncTooLargeError,
     UnsafeArchiveError,
 )
+from config_saver.lib.exit_codes import (  # re-exported: tests and callers import the codes from here
+    EXIT_ENCRYPTION as EXIT_ENCRYPTION,
+)
+from config_saver.lib.exit_codes import (
+    EXIT_INCOMPLETE as EXIT_INCOMPLETE,
+)
+from config_saver.lib.exit_codes import (
+    EXIT_IO as EXIT_IO,
+)
+from config_saver.lib.exit_codes import (
+    EXIT_NO_SUCH_CONFIG as EXIT_NO_SUCH_CONFIG,
+)
+from config_saver.lib.exit_codes import (
+    EXIT_NOT_FOUND as EXIT_NOT_FOUND,
+)
+from config_saver.lib.exit_codes import (
+    EXIT_OK as EXIT_OK,
+)
+from config_saver.lib.exit_codes import (
+    EXIT_PERMISSION as EXIT_PERMISSION,
+)
+from config_saver.lib.exit_codes import (
+    EXIT_RUNTIME as EXIT_RUNTIME,
+)
+from config_saver.lib.exit_codes import (
+    EXIT_SYNC_CONFLICT as EXIT_SYNC_CONFLICT,
+)
+from config_saver.lib.exit_codes import (
+    EXIT_USAGE as EXIT_USAGE,
+)
+from config_saver.lib.exit_codes import (
+    EXIT_VALIDATION as EXIT_VALIDATION,
+)
 from config_saver.lib.migrate import MigrationReport, migrate_archives
 from config_saver.lib.models.encryption_model import EncryptionModel
 from config_saver.lib.models.model import Model
@@ -51,20 +84,6 @@ from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
 from config_saver.lib.tar_prune import TIMESTAMP_FORMAT
 
 init(autoreset=True)
-
-# Stable exit codes (documented in README.md).
-EXIT_OK = 0
-EXIT_NOT_FOUND = 2
-EXIT_VALIDATION = 3
-EXIT_PERMISSION = 4
-EXIT_RUNTIME = 5
-EXIT_USAGE = 6
-EXIT_NO_SUCH_CONFIG = 7
-EXIT_INCOMPLETE = 8
-EXIT_ENCRYPTION = 9
-EXIT_IO = 10
-EXIT_SYNC_CONFLICT = sync_commands.EXIT_SYNC_CONFLICT
-
 
 # Argparse dests of the non-sync actions (the mutually exclusive group).
 _ACTIONS = (

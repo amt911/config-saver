@@ -1354,3 +1354,21 @@ def test_sync_status_lists_paths_and_exits_11_on_conflict(
     assert run(["--sync-status", "--input", str(cfg)]) == 11
     out = capsys.readouterr().out
     assert "zsh: ~/a (take remote)" in out and "zsh: ~/b" in out
+
+
+def test_sync_resolve_with_invalid_config_exits_validation(
+    tmp_path: Path, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pydantic's ValidationError is a ValueError: it must not be taken for an unknown --path (6)."""
+    _sync_stub(monkeypatch, fake_home)
+    cfg = write_config(tmp_path / "zsh.yaml", [str(fake_home)], sync=True, only_root_user=True)
+    assert run(["--sync-resolve", "local", "--input", str(cfg)]) == EXIT_VALIDATION
+
+
+def test_sync_status_with_nothing_to_do_says_so(
+    tmp_path: Path, fake_home: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _sync_stub(monkeypatch, fake_home)
+    cfg = write_config(tmp_path / "zsh.yaml", [str(data_dir)], sync=True)
+    assert run(["--sync-status", "--input", str(cfg)]) == 0
+    assert "Nothing to sync." in capsys.readouterr().out

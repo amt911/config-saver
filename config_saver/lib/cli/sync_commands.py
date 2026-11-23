@@ -11,13 +11,10 @@ from collections.abc import Callable, Mapping
 from colorama import Fore
 
 from config_saver.lib.errors import SyncNotSetUpError, SyncStateError, SyncTooLargeError
+from config_saver.lib.exit_codes import EXIT_OK, EXIT_SYNC_CONFLICT, EXIT_USAGE
 from config_saver.lib.models.model import Model
 from config_saver.lib.sync import paths as sync_paths
 from config_saver.lib.sync.engine import SyncEngine, SyncReport
-
-EXIT_OK = 0
-EXIT_USAGE = 6
-EXIT_SYNC_CONFLICT = 11
 
 REQUIRED_TOOLS = ("git", "restic", "age")
 _HOME_PREFIX = "home/user"
@@ -67,6 +64,8 @@ def print_conflicts(conflicts: Mapping[str, list[str]]) -> None:
 
 def _print_report(report: SyncReport, *, dry: bool) -> None:
     if dry:
+        if not (report.applied or report.deleted or report.published or report.conflicts):
+            print("Nothing to sync.")
         verbs = (
             (report.applied, "take remote"),
             (report.deleted, "delete locally"),
@@ -126,8 +125,9 @@ def handle(args: argparse.Namespace, load_configs: ConfigLoader) -> int:
         return EXIT_OK
     if args.sync_resolve:
         chosen = [to_arcname(p) for p in args.path] if args.path else None
+        configs = load_configs()  # outside the try: a ValidationError is a ValueError too
         try:
-            report = engine.resolve(load_configs(), args.sync_resolve, chosen)
+            report = engine.resolve(configs, args.sync_resolve, chosen)
         except (SyncTooLargeError, SyncStateError):
             raise
         except ValueError as exc:  # an unknown --path

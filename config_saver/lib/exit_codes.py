@@ -1,0 +1,13 @@
+"""Stable exit codes (documented in README.md), shared by the CLI and its handlers."""
+
+EXIT_OK = 0
+EXIT_NOT_FOUND = 2
+EXIT_VALIDATION = 3
+EXIT_PERMISSION = 4
+EXIT_RUNTIME = 5
+EXIT_USAGE = 6
+EXIT_NO_SUCH_CONFIG = 7
+EXIT_INCOMPLETE = 8
+EXIT_ENCRYPTION = 9
+EXIT_IO = 10
+EXIT_SYNC_CONFLICT = 11
