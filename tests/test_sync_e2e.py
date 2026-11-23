@@ -52,7 +52,7 @@ class Machine:
             env=self.env,
             capture_output=True,
             text=True,
-            cwd=str(self.home),
+            cwd=REPO_ROOT,  # mutmut reads pyproject.toml from the cwd when the package is imported
             timeout=300,
         )
 

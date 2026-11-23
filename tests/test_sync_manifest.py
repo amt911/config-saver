@@ -127,3 +127,38 @@ def test_find_head_fork():
 def test_find_head_cycle():
     with pytest.raises(StoreError, match="sync history of c forked"):
         find_head([("a", "b"), ("b", "a")], "c")
+
+
+# Each rejection names the field that failed: the message is how an operator tells which
+# check fired, so it is pinned per case (not only the exception type).
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        (_raw(scope=[""]), "path must be a non-empty string"),
+        (_raw(scope=[5]), "path must be a non-empty string"),
+        (_raw(scope=["a/../b"]), "unsafe path 'a/../b'"),
+        (_raw(scope=["/abs"]), "unsafe path '/abs'"),
+        (_raw(entries={"a\\b": {}}), "unsafe path 'a\\\\b'"),
+        (b'{"cfg":"c","cfg":"d","scope":[],"entries":{}}', "duplicate key 'cfg'"),
+        (_raw(entries=[]), "entries must be an object"),
+        (_raw(entries={"a/f": 3}), "entry must be an object with exactly keys"),
+        (_entry(sha256="XYZ"), "sha256 must be 64 lowercase hex characters"),
+        (_entry(mode=-1), "mode must be an integer in 0..0o7777"),
+        (_entry(mode=0o10000), "mode must be an integer in 0..0o7777"),
+        (_entry(link=3), "link must be a string or null"),
+        (_entry(snapshot="nope"), "snapshot must be 64 lowercase hex characters or the self marker"),
+        (b"not json", "not valid JSON"),
+    ],
+)
+def test_from_json_rejection_messages(data, message):
+    with pytest.raises(ArchiveError) as info:
+        Manifest.from_json(data)
+    text = str(info.value)
+    assert text.startswith("invalid sync manifest: ")
+    assert message in text
+
+
+@pytest.mark.parametrize("mode", [0, 0o7777])
+def test_mode_bounds_are_inclusive(mode):
+    parsed = Manifest.from_json(_entry(mode=mode))
+    assert parsed.entries["a/f"][0].mode == mode
