@@ -131,3 +131,51 @@ def test_missing_git_is_not_set_up(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
     with pytest.raises(SyncNotSetUpError):
         GitRepo(str(tmp_path / "a")).pull()
+
+
+def test_push_rejection_detected_in_foreign_locale(tmp_path, remote, monkeypatch):
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    monkeypatch.setenv("LANGUAGE", "de")
+    a = seeded(tmp_path, remote)
+    b = GitRepo(str(tmp_path / "b"))
+    b.clone(remote)
+    (tmp_path / "a" / "x").write_text("x")
+    a.commit_all("x")
+    a.push()
+    (tmp_path / "b" / "y").write_text("y")
+    b.commit_all("y")
+    assert b.push() is False
+
+
+def test_remote_rejection_is_transport_error(tmp_path, remote):
+    a = seeded(tmp_path, remote)
+    hook = tmp_path / "remote.git" / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho no >&2\nexit 1\n")
+    hook.chmod(0o755)
+    (tmp_path / "a" / "z").write_text("z")
+    a.commit_all("z")
+    with pytest.raises(SyncTransportError):
+        a.push()
+
+
+def test_commit_ignores_hooks_and_gpgsign(tmp_path, remote):
+    a = seeded(tmp_path, remote)
+    git(tmp_path / "a", "config", "commit.gpgsign", "true")
+    hook = tmp_path / "a" / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    (tmp_path / "a" / "h").write_text("h")
+    assert a.commit_all("h") is True
+
+
+def test_clone_target_is_private(tmp_path, remote):
+    seeded(tmp_path, remote)
+    b = GitRepo(str(tmp_path / "b"))
+    b.clone(remote)
+    assert (tmp_path / "b").stat().st_mode & 0o777 == 0o700
+
+
+def test_timeout_is_transport_error(tmp_path, monkeypatch):
+    monkeypatch.setattr("config_saver.lib.sync.git_repo.TIMEOUT_SECONDS", 0.001)
+    with pytest.raises(SyncTransportError):
+        GitRepo(str(tmp_path / "a")).clone(str(tmp_path / "x.git"))

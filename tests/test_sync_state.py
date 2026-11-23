@@ -41,11 +41,11 @@ def test_empty_file_is_empty_state(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "content", ["{not json", "[]", '{"heads": 1, "base": {}}', '{"heads": {}, "base": {"c": {"p": {}}}}']
+    "content", [b"\xff\xfe", "{not json", "[]", '{"heads": 1, "base": {}}', '{"heads": {}, "base": {"c": {"p": {}}}}']
 )
 def test_corrupt_state_raises(tmp_path, content):
     p = tmp_path / "s.json"
-    p.write_text(content)
+    p.write_bytes(content if isinstance(content, bytes) else content.encode())
     with pytest.raises(SyncStateError) as exc:
         load(str(p))
     assert str(p) in str(exc.value) and "Delete it" in str(exc.value)

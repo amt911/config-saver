@@ -30,6 +30,8 @@ def load(path: str) -> SyncState:
             text = fh.read()
     except FileNotFoundError:
         return SyncState()
+    except UnicodeDecodeError as exc:
+        raise _corrupt(path, f"not valid UTF-8: {exc}") from exc
     if not text.strip():
         return SyncState()
     try:

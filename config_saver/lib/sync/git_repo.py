@@ -10,7 +10,8 @@ from config_saver.lib.errors import SyncNotSetUpError, SyncTransportError
 BRANCH = "main"
 GITIGNORE = ("restic/locks/", "restic-store.json", ".staging/")  # .staging/ holds plaintext
 _FALLBACK_IDENTITY = ["-c", "user.name=config-saver", "-c", "user.email=config-saver@localhost"]
-_REJECTED = ("non-fast-forward", "fetch first", "[rejected]", "[remote rejected]")
+_STALE_MARKERS = ("non-fast-forward", "fetch first")
+TIMEOUT_SECONDS = 300
 
 
 class GitRepo:
@@ -19,16 +20,21 @@ class GitRepo:
 
     def _run(self, *args: str, cwd: bool = True, pre: list[str] | None = None, check: bool = True):
         cmd = ["git", *(["-C", self.path] if cwd else []), *(pre or []), *args]
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        # LC_ALL=C: we match git's output, which must not be translated.
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANGUAGE": "C"}
+        env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=TIMEOUT_SECONDS)
         except FileNotFoundError as exc:
             raise SyncNotSetUpError("git is not installed; multi-machine sync needs it") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise SyncTransportError(f"git {args[0]} timed out after {TIMEOUT_SECONDS}s") from exc
         if check and proc.returncode != 0:
             raise SyncTransportError(f"git {args[0]} failed: {(proc.stderr or proc.stdout).strip()}")
         return proc
 
     def clone(self, url: str) -> None:
+        os.makedirs(self.path, mode=0o700, exist_ok=True)
         self._run("clone", url, self.path, cwd=False)
 
     def init(self, url: str) -> None:
@@ -55,15 +61,16 @@ class GitRepo:
         self._run("add", "-A")
         if not self._run("status", "--porcelain").stdout.strip():
             return False
-        self._run("commit", "-m", message, pre=self._identity())
+        self._run("commit", "--no-verify", "-m", message, pre=[*self._identity(), "-c", "commit.gpgsign=false"])
         return True
 
     def push(self) -> bool:
         proc = self._run("push", "-u", "origin", BRANCH, check=False)
         if proc.returncode == 0:
             return True
-        if any(marker in proc.stderr for marker in _REJECTED):
-            return False
+        for line in proc.stderr.splitlines():
+            if "[rejected]" in line and any(m in line for m in _STALE_MARKERS):
+                return False
         raise SyncTransportError(f"git push failed: {proc.stderr.strip()}")
 
     def reset_to_upstream(self) -> None:
