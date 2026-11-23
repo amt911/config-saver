@@ -844,9 +844,9 @@ And when user `maria` decompresses it, it becomes:
 ## Sync between machines
 
 `--sync` keeps the files of configurations marked `sync: true` identical across your machines
-through a private git remote. The store is the same encrypted restic repository used for backups
-(see [Deduplicated storage](#deduplicated-storage-restic)), kept in
-`~/.local/share/config-saver/sync`; git only ever sees ciphertext. Needs `git`, `restic` and `age`.
+through a private git remote. The store is a separate encrypted restic repository, built the same way
+as the backup store (see [Deduplicated storage](#deduplicated-storage-restic)) but kept apart in
+`~/.local/share/config-saver/sync`; the backup store is not touched. Git only ever sees ciphertext. Needs `git`, `restic` and `age`.
 
 **First machine.** Create an empty **private** repository, then:
 
@@ -858,7 +858,9 @@ Mark what to share in your configuration with `sync: true`, then run `config-sav
 
 **Next machines.** Copy the same age private key to the machine (it decrypts the store) and run
 the same `--sync-init <url>`: when the remote already holds a store, it is cloned and no
-`--encrypt-to` is needed. Then mark the same configurations `sync: true` and run `--sync`.
+`--encrypt-to` is needed. Then mark the same configurations `sync: true` and run `--sync-status` and
+`--sync-resolve local|remote` **before** enabling the timer: files that already exist here and
+differ from the remote are conflicts on the first sync. Only then run `--sync` (or enable the timer).
 
 **What a run does.** Each `--sync` takes remote changes that this machine did not touch, publishes
 local changes that nobody else touched, and propagates deletions. Output is one line per
@@ -877,6 +879,13 @@ same way, and `--path ~/.zshrc` (repeatable) settles only those.
 - Definitions stay per machine: a file added to one machine's YAML is not picked up by the others
   until it is added there too.
 - Empty directories are not synced.
+- Symlink targets are synced verbatim: an absolute link into another user's home will dangle on a
+  machine with a different home.
+- Set `normalize_content` the same way on every machine for a synced configuration; otherwise the
+  same file hashes differently and shows up as a change on every run.
+- A path that exists but cannot be read (permissions) or is root-owned and skipped makes the run
+  fail (exit `10`) before anything is written: it is never published as a deletion.
+- A `sync: true` configuration cannot declare anything under `/etc/config-saver/configs` (exit `3`).
 - At most 50 MiB per configuration (exit `3` beyond that).
 - The git history only grows: old versions stay in it.
 - GitHub sees only ciphertext plus fixed commit metadata (`sync` / `config-saver`).
@@ -954,7 +963,7 @@ not need this — it runs from the system manager as `User=%i`.
 ### Multi-machine sync timer
 
 `contrib/systemd/user/` also ships `config-saver-sync.timer` / `.service`, which run
-`config-saver --sync` 2 minutes after boot and every 15 minutes after that (`Persistent=true`):
+`config-saver --sync` 2 minutes after boot and every 15 minutes after that:
 
 ```bash
 systemctl --user enable --now config-saver-sync.timer
@@ -967,6 +976,12 @@ is missing nothing else fails, you just get no banner (see `journalctl --user -u
 and `config-saver --sync-status`). The notification needs `DBUS_SESSION_BUS_ADDRESS` in the user manager,
 which a graphical login provides; on a session without one run
 `systemctl --user import-environment DBUS_SESSION_BUS_ADDRESS`.
+
+The timer has no SSH or credential environment: the sync service runs non-interactively
+(`BatchMode`, no prompts). Use a passphrase-less deploy key for the sync remote, or an https remote
+with a non-interactive credential helper, or run `systemctl --user import-environment SSH_AUTH_SOCK`
+from your session; otherwise every run fails with exit 10. An ssh command you configure yourself
+(`core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SSH`) is used as is.
 `scripts/check-sync-notify.sh` verifies the `OnFailure=` wiring against real systemd.
 
 ### Install (system-wide)

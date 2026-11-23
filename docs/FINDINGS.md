@@ -123,3 +123,9 @@ had `DBUS_SESSION_BUS_ADDRESS` (`systemctl --user show-environment`), the notify
 session (e.g. linger-only, no login) will not have it: `notify-send` then fails and, because of the
 leading `-` in `ExecStart=`, silently. The check script proves the `OnFailure=` wiring, not that a
 banner was seen; look at the screen once.
+
+## `--decompress` accepts any tar compression since sync
+
+`TarDecompressor` opens archives with `r:*` (the sync engine reads the manifest of restic dumps that
+way), so `--decompress` now also accepts uncompressed and other-compression tars, not only `.tar.gz`.
+It is a side effect of sync, not a feature to rely on; the extraction guard applies to all of them.

@@ -67,6 +67,8 @@ uncapped run once sized its worker pool from the core count and took the whole
 machine down; worse, the starved run scored 139 of 142 mutants as "killed"
 because they timed out, which reads as a great result and means nothing.
 
+The gate (`scripts/mutation-gate.sh`) needs `.venv/bin` on `PATH` (`PATH=.venv/bin:$PATH`) so it finds `mutmut`.
+
 ```sh
 systemd-run --user --scope --quiet \
   -p MemoryHigh=5G -p MemoryMax=6G -p MemorySwapMax=0 -- \

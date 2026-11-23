@@ -252,7 +252,7 @@ which cost milliseconds and touch no real filesystem outside `tmp_path`.
 | `tar_compressor/tar_decompressor.py` | round-trip, **and one regression per malicious-archive vector**: `../` member, absolute member name, symlink escaping the root, hardlink, device node |
 | `backup_manager/backup_manager.py` | archive listing, per-config timestamp dirs, description round-trip, XDG fallback on `PermissionError` |
 | `sync/` | `classify`/`manifest` pure (one test per classification branch, manifest round-trip and rejection of hostile entries); `scan`/`state`/`engine` against real trees and a real local git remote in `tmp_path`; lock, vet-all-before-write, symlink swaps; one subprocess e2e (`tests/test_sync_e2e.py`); mutation gate covers `classify` and `manifest` |
-| `cli/cli.py` | every flag, `--version`, and the documented exit codes (2, 3, 4, 5, 6, 7, 10) |
+| `cli/cli.py` | every flag, `--version`, and the documented exit codes (2, 3, 4, 5, 6, 7, 10, 11) |
 
 ### TDD — required for new logic
 
