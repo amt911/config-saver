@@ -29,9 +29,20 @@ def _bad(msg: str) -> ArchiveError:
 def _check_path(path: object) -> str:
     if not isinstance(path, str) or not path:
         raise _bad("path must be a non-empty string")
-    if path.startswith("/") or ".." in path.split("/"):
+    if "\0" in path or "\\" in path:
+        raise _bad(f"unsafe path {path!r}")
+    if path.startswith("/") or any(part in ("", ".", "..") for part in path.split("/")):
         raise _bad(f"unsafe path {path!r}")
     return path
+
+
+def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise _bad(f"duplicate key {key!r}")
+        out[key] = value
+    return out
 
 
 def _check_keys(obj: object, keys: set[str], what: str) -> dict[str, Any]:
@@ -74,7 +85,7 @@ class Manifest:
     @classmethod
     def from_json(cls, data: bytes) -> Manifest:
         try:
-            doc = json.loads(data)
+            doc = json.loads(data, object_pairs_hook=_no_duplicates)
         except (ValueError, RecursionError) as exc:  # includes UnicodeDecodeError
             raise _bad("not valid JSON") from exc
         top = _check_keys(doc, _TOP_KEYS, "manifest")

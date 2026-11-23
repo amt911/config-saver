@@ -64,6 +64,20 @@ def test_resolve_and_side():
         _raw(scope=["../x"]),
         _raw(scope=["/etc"]),
         _raw(scope=[""]),
+        _raw(scope=["a/../b"]),
+        _raw(scope=["a//b"]),
+        _raw(scope=["."]),
+        _raw(scope=["a/"]),
+        _raw(entries={"a/./b": {"sha256": H, "mode": 1, "link": None, "snapshot": SELF}}),
+        _raw(entries={"a//b": {"sha256": H, "mode": 1, "link": None, "snapshot": SELF}}),
+        _raw(entries={"a/": {"sha256": H, "mode": 1, "link": None, "snapshot": SELF}}),
+        _raw(entries={"a\0b": {"sha256": H, "mode": 1, "link": None, "snapshot": SELF}}),
+        _raw(entries={"a\\b": {"sha256": H, "mode": 1, "link": None, "snapshot": SELF}}),
+        b'{"cfg":"c","cfg":"d","scope":[],"entries":{}}',
+        b'{"cfg":"c","scope":[],"entries":{"a":{"sha256":"%s","mode":1,"link":null,'
+        b'"snapshot":"@"},"a":{"sha256":"%s","mode":1,"link":null,"snapshot":"@"}}}' % (H.encode(), H.encode()),
+        b'{"cfg":"c","scope":[],"entries":{"a":{"sha256":"%s","sha256":"%s","mode":1,'
+        b'"link":null,"snapshot":"@"}}}' % (H.encode(), H.encode()),
         _raw(entries=[]),
         _raw(entries={"../x": {"sha256": H, "mode": 1, "link": None, "snapshot": SELF}}),
         _raw(entries={"/etc/x": {"sha256": H, "mode": 1, "link": None, "snapshot": SELF}}),
@@ -108,3 +122,8 @@ def test_find_head():
 def test_find_head_fork():
     with pytest.raises(StoreError, match="sync history of cfg1 forked"):
         find_head([("a", None), ("b", "a"), ("c", "a")], "cfg1")
+
+
+def test_find_head_cycle():
+    with pytest.raises(StoreError, match="sync history of c forked"):
+        find_head([("a", "b"), ("b", "a")], "c")
