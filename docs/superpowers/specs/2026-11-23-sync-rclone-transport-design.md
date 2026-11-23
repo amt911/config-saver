@@ -29,7 +29,17 @@ per-file sync is enough; no line-merging of `.jsonl` histories is needed.
 
 ## Changes to the design (Claude's calls, correctable)
 
-1. **Remote = any restic repository URL.** `config-saver --sync-init <restic-repo>` records the URL
+1. **Remote = any restic repository URL, configurable (author asked for Proton, Google Drive, or
+   anything generic).** restic is already the provider abstraction (`rclone:<any rclone remote>:path`,
+   `sftp:`, `s3:`, `b2:`, `rest:`, local path), so there are **no per-provider classes**: they would be
+   one implementation under several names. One small port, `SyncRemote(repository, options)`, builds
+   restic's environment/arguments and is the test seam (tests use a local-path repository).
+   `~/.config/config-saver/sync.json` = `{"repository": "<url>", "options": ["key=value", …]}` where
+   `options` are restic `-o` settings for provider tuning (e.g. `rclone.args` for Proton).
+   `--sync-move <new-url>` switches provider: `restic copy` of every sync snapshot into the new
+   repository (same derived password), verify the head manifests match, then rewrite `sync.json`.
+   Documented examples: Google Drive, Proton Drive, generic.
+   Original point: `config-saver --sync-init <restic-repo>` records the URL
    in `~/.config/config-saver/sync.json` (0600). If a restic repository already answers at that URL
    the machine joins it; otherwise it is created. Google Drive via rclone is the documented setup;
    `sftp:`, `s3:`, a local path… work the same because restic does the transport.
