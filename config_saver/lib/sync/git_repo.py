@@ -33,6 +33,10 @@ class GitRepo:
             raise SyncTransportError(f"git {args[0]} failed: {(proc.stderr or proc.stdout).strip()}")
         return proc
 
+    def remote_has_branch(self, url: str) -> bool:
+        """True when ``url`` already has the sync branch (someone ran init there)."""
+        return bool(self._run("ls-remote", "--heads", url, BRANCH, cwd=False).stdout.strip())
+
     def clone(self, url: str) -> None:
         os.makedirs(self.path, mode=0o700, exist_ok=True)
         self._run("clone", url, self.path, cwd=False)
