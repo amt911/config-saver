@@ -1,0 +1,71 @@
+"""Thin port over the git CLI for the sync working tree."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+
+from config_saver.lib.errors import SyncNotSetUpError, SyncTransportError
+
+BRANCH = "main"
+GITIGNORE = ("restic/locks/", "restic-store.json", ".staging/")  # .staging/ holds plaintext
+_FALLBACK_IDENTITY = ["-c", "user.name=config-saver", "-c", "user.email=config-saver@localhost"]
+_REJECTED = ("non-fast-forward", "fetch first", "[rejected]", "[remote rejected]")
+
+
+class GitRepo:
+    def __init__(self, path: str):
+        self.path = path
+
+    def _run(self, *args: str, cwd: bool = True, pre: list[str] | None = None, check: bool = True):
+        cmd = ["git", *(["-C", self.path] if cwd else []), *(pre or []), *args]
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        except FileNotFoundError as exc:
+            raise SyncNotSetUpError("git is not installed; multi-machine sync needs it") from exc
+        if check and proc.returncode != 0:
+            raise SyncTransportError(f"git {args[0]} failed: {(proc.stderr or proc.stdout).strip()}")
+        return proc
+
+    def clone(self, url: str) -> None:
+        self._run("clone", url, self.path, cwd=False)
+
+    def init(self, url: str) -> None:
+        os.makedirs(self.path, mode=0o700, exist_ok=True)
+        self._run("init", "-b", BRANCH)
+        with open(os.path.join(self.path, ".gitignore"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(GITIGNORE) + "\n")
+        self._run("remote", "add", "origin", url)
+
+    def pull(self) -> None:
+        heads = self._run("ls-remote", "--heads", "origin", BRANCH)
+        if not heads.stdout.strip():
+            return  # remote branch does not exist yet
+        proc = self._run("pull", "--no-rebase", "--no-edit", "origin", BRANCH, check=False, pre=self._identity())
+        if proc.returncode != 0:
+            self._run("merge", "--abort", check=False)
+            raise SyncTransportError(f"git pull failed: {(proc.stderr or proc.stdout).strip()}")
+
+    def _identity(self) -> list[str]:
+        email = self._run("config", "user.email", check=False).stdout.strip()
+        return [] if email else list(_FALLBACK_IDENTITY)
+
+    def commit_all(self, message: str) -> bool:
+        self._run("add", "-A")
+        if not self._run("status", "--porcelain").stdout.strip():
+            return False
+        self._run("commit", "-m", message, pre=self._identity())
+        return True
+
+    def push(self) -> bool:
+        proc = self._run("push", "-u", "origin", BRANCH, check=False)
+        if proc.returncode == 0:
+            return True
+        if any(marker in proc.stderr for marker in _REJECTED):
+            return False
+        raise SyncTransportError(f"git push failed: {proc.stderr.strip()}")
+
+    def reset_to_upstream(self) -> None:
+        self._run("reset", "--hard", "@{u}")
+        self._run("clean", "-fd", "restic/")

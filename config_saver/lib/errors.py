@@ -53,3 +53,24 @@ class StoreError(RuntimeError, ConfigSaverError):
 
 class SyncTooLargeError(ValueError, ConfigSaverError):
     """A sync-enabled configuration covers more data than a snapshot should carry."""
+
+
+class SyncTransportError(OSError, ConfigSaverError):
+    """git could not reach, update or publish to the sync remote."""
+
+
+class SyncNotSetUpError(FileNotFoundError, ConfigSaverError):
+    """Sync was not initialised on this machine, or git itself is missing."""
+
+
+class SyncConflictError(ConfigSaverError):
+    """Local and remote changed the same paths since the last sync."""
+
+    def __init__(self, conflicts: dict[str, list[str]]):
+        self.conflicts = conflicts
+        total = sum(len(paths) for paths in conflicts.values())
+        super().__init__(f"{total} path(s) changed on both sides since the last sync")
+
+
+class SyncStateError(ValueError, ConfigSaverError):
+    """The per-machine sync state file is unreadable."""
