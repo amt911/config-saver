@@ -49,3 +49,7 @@ class IncompleteBackupError(ConfigSaverError):
 
 class StoreError(RuntimeError, ConfigSaverError):
     """The restic-backed snapshot store is unusable, or restic/age refused to run."""
+
+
+class SyncTooLargeError(ValueError, ConfigSaverError):
+    """A sync-enabled configuration covers more data than a snapshot should carry."""

@@ -29,7 +29,14 @@ from config_saver import __version__
 from config_saver.lib import crypto, maintenance, paths
 from config_saver.lib.archive_names import FILENAME_PATTERN, archive_identity
 from config_saver.lib.backup_manager.backup_manager import BackupManager, BatchResult, PruneReport
-from config_saver.lib.errors import ArchiveError, EncryptionError, RootRequiredError, StoreError, UnsafeArchiveError
+from config_saver.lib.errors import (
+    ArchiveError,
+    EncryptionError,
+    RootRequiredError,
+    StoreError,
+    SyncTooLargeError,
+    UnsafeArchiveError,
+)
 from config_saver.lib.migrate import MigrationReport, migrate_archives
 from config_saver.lib.models.encryption_model import EncryptionModel
 from config_saver.lib.parser.parser import Parser
@@ -464,6 +471,9 @@ class CLI:
             target = getattr(e, "filename", None) or str(e)
             print(Fore.RED + f"Not found: {target}")
             return EXIT_NOT_FOUND
+        except SyncTooLargeError as e:
+            print(Fore.RED + str(e))
+            return EXIT_VALIDATION
         except ValidationError as e:
             print(Fore.RED + "Validation error in configuration:")
             print(Fore.RED + str(e))

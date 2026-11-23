@@ -6,7 +6,7 @@ import json
 import os
 import tarfile
 import tempfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 
 from config_saver.lib import crypto, paths
@@ -52,6 +52,7 @@ class TarDecompressor:
         show_progress: bool = False,
         identity: str | None = None,
         restore_system_configs: bool = False,
+        members: Collection[str] | None = None,
     ):
         self.tar_path = tar_path
         self.output_dir = output_dir
@@ -62,6 +63,9 @@ class TarDecompressor:
         # declarative installer: restoring over it would make the machine
         # diverge from what that installer declares, so it is opt-in.
         self.restore_system_configs = restore_system_configs
+        # When set, only these member names are written. Every member is still
+        # validated first: a hostile member must raise even if it would be skipped.
+        self.members = members
         # Get current user's home directory for path denormalization
         self.user_home = os.path.expanduser("~")
 
@@ -313,6 +317,8 @@ class TarDecompressor:
 
                 for member in iterator:
                     destination = self._validate_member(member)
+                    if self.members is not None and member.name not in self.members:
+                        continue
                     if self._is_system_config(destination):
                         result.skipped_system_configs += 1
                         continue

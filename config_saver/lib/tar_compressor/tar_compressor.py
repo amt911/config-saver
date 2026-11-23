@@ -6,9 +6,10 @@ import fnmatch
 import io
 import json
 import os
+import stat
 import tarfile
 import tempfile
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import IO
 
@@ -38,6 +39,13 @@ _SPOOL_MAX_SIZE = 8 * 1024 * 1024
 
 def _no_emit(_message: str) -> None:
     """Discard progress messages when no progress bar is attached."""
+
+
+def _ancestors(arcname: str) -> Iterator[str]:
+    """Every parent directory name of an archive member, outermost first."""
+    parts = arcname.split("/")
+    for i in range(1, len(parts)):
+        yield "/".join(parts[:i])
 
 
 @dataclass
@@ -360,6 +368,55 @@ class TarCompressor:
             seen.add(arcname)
             yield path, arcname, is_dir
 
+    def is_excluded(self, path: str) -> bool:
+        """Public form of the ``exclude`` matching, for callers that scope by it."""
+        return self._is_excluded(path)
+
+    def declared_paths(self) -> Iterator[tuple[str, str]]:
+        """Yield ``(path, arcname)`` for every declared entry, existing or not.
+
+        Plain string entries, and ``source/file`` for each file of a
+        ``{source, files}`` entry. Entries with an unexpanded ``${`` placeholder
+        are not real paths and are left out.
+        """
+        for entry in self.yaml_data.directories:
+            if isinstance(entry, str):
+                paths = [entry]
+            else:
+                paths = [os.path.join(entry.source, file) for file in entry.files]
+                if "${" in entry.source:
+                    paths = []
+            for path in paths:
+                if "${" not in path:
+                    yield path, self._normalize_path(path)
+
+    def iter_files(self) -> Iterator[tuple[str, str]]:
+        """Yield ``(path, arcname)`` of regular files and symlinks, as ``_collect`` orders them.
+
+        Root-owned skips are left out, exactly like in the archive.
+        """
+        for path, arcname, is_dir in self._collect(CompressResult(output_path="")):
+            if is_dir or self._skips_root_owned(path):
+                continue
+            try:
+                mode = os.lstat(path).st_mode
+            except OSError:
+                continue
+            if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                yield path, arcname
+
+    def content_stream(self, path: str) -> IO[bytes]:
+        """The bytes that would be archived for a regular file; the caller closes it."""
+        if self.yaml_data.normalize_content:
+            normalized = self._normalized_stream(path)
+            if normalized is not None:
+                return normalized[0]
+        return open(path, "rb")  # noqa: SIM115 - the caller owns and closes it
+
+    def _skips_root_owned(self, path: str) -> bool:
+        """True when ``path`` is dropped because it is root-owned (``only_root_user: false``)."""
+        return not self.yaml_data.only_root_user and self.current_uid != 0 and self._is_root_owned(path)
+
     def _write_metadata(self, tar: tarfile.TarFile) -> None:
         """Store how the archive was produced, so restore does not have to guess."""
         payload = json.dumps(
@@ -397,7 +454,7 @@ class TarCompressor:
         """Add every collected entry to ``tar`` (shared by file and stream output)."""
         for path, arcname, is_dir in items:
             # Skip root-owned files if only_root_user is false and current user is not root
-            if not self.yaml_data.only_root_user and self.current_uid != 0 and self._is_root_owned(path):
+            if self._skips_root_owned(path):
                 emit(f"Skipping root-owned file (only_root_user=false): {path}")
                 result.skipped_root_owned.append(path)
                 continue
@@ -423,18 +480,49 @@ class TarCompressor:
                 tar.add(path, arcname=arcname)
             result.added += 1
 
-    def compress_to_stream(self, fileobj: IO[bytes]) -> CompressResult:
+    @staticmethod
+    def _filter_only(items: Iterable[tuple[str, str, bool]], only: Collection[str]) -> list[tuple[str, str, bool]]:
+        """Keep the files named in ``only`` and the directories that hold them."""
+        listed = list(items)
+        kept_files = {arcname for _p, arcname, is_dir in listed if not is_dir and arcname in only}
+        parents = {parent for name in kept_files for parent in _ancestors(name)}
+        return [
+            item for item in listed if (item[1] in kept_files if not item[2] else item[1] in only or item[1] in parents)
+        ]
+
+    def _write_extra_members(self, tar: tarfile.TarFile, extra_members: Mapping[str, bytes]) -> None:
+        """Add in-memory members (the sync manifest) as plain ``0600`` files."""
+        for name, payload in extra_members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            info.mode = ARCHIVE_MODE
+            tar.addfile(info, io.BytesIO(payload))
+
+    def compress_to_stream(
+        self,
+        fileobj: IO[bytes],
+        only: Collection[str] | None = None,
+        extra_members: Mapping[str, bytes] | None = None,
+    ) -> CompressResult:
         """Write an uncompressed tar to ``fileobj``, which may be a pipe.
 
         Same members, normalisation and skipping as ``compress()``, but nothing
         touches the disk and ``encrypt:`` is ignored: the consumer (restic) does
         its own compression and encryption. ``w|`` is tar's streaming mode, it
         never seeks. ``output_path`` is left empty for the caller to fill in.
+
+        ``only`` keeps just those arcnames (plus the directories above them);
+        ``extra_members`` are written as ``0600`` files after the metadata.
         """
         result = CompressResult(output_path="")
-        items, emit = self._with_progress(self._collect(result))
+        collected: Iterable[tuple[str, str, bool]] = self._collect(result)
+        if only is not None:
+            collected = self._filter_only(collected, only)
+        items, emit = self._with_progress(collected)
         with tarfile.open(fileobj=fileobj, mode="w|") as tar:
             self._write_metadata(tar)
+            if extra_members:
+                self._write_extra_members(tar, extra_members)
             self._write_members(tar, items, result, emit)
         return result
 
