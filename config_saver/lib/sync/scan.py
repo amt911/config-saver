@@ -13,7 +13,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import NoReturn
 
-from config_saver.lib.errors import SyncTooLargeError
+from config_saver.lib import paths
+from config_saver.lib.errors import SyncSystemConfigError, SyncTooLargeError, SyncUnreadableError
 from config_saver.lib.models.model import Model
 from config_saver.lib.sync.classify import Fingerprint, Side
 from config_saver.lib.tar_compressor.tar_compressor import TarCompressor
@@ -64,8 +65,12 @@ class LocalScope:
         return False
 
 
-def _fingerprint(compressor: TarCompressor, path: str) -> tuple[Fingerprint, int] | None:
-    """Fingerprint of one file or symlink, and its raw size; None if it vanished."""
+def _fingerprint(compressor: TarCompressor, path: str, problems: list[str]) -> tuple[Fingerprint, int] | None:
+    """Fingerprint of one file or symlink, and its raw size.
+
+    None when it vanished (that is a deletion). Any other failure is recorded in
+    ``problems``: a file we cannot read is not a file that is gone.
+    """
     try:
         info = os.lstat(path)
         mode = info.st_mode & 0o777
@@ -78,7 +83,10 @@ def _fingerprint(compressor: TarCompressor, path: str) -> tuple[Fingerprint, int
             while chunk := stream.read(_CHUNK):
                 sha.update(chunk)
         return Fingerprint(sha.hexdigest(), mode), info.st_size
-    except OSError:
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        problems.append(f"{path} ({exc.strerror or exc})")
         return None
 
 
@@ -98,17 +106,29 @@ def scan(model: Model) -> tuple[LocalScope, Side, int]:
     root_paths = {arcname: path for path, arcname in compressor.declared_paths()}
     scope = LocalScope(frozenset(root_paths), root_paths, compressor.is_excluded)
 
+    for declared_path, _arc in compressor.declared_paths():
+        norm = os.path.normpath(declared_path)
+        if norm == paths.SYSTEM_CONFIG_DIR or norm.startswith(paths.SYSTEM_CONFIG_DIR + "/"):
+            raise SyncSystemConfigError(
+                f"a sync configuration cannot declare '{declared_path}': {paths.SYSTEM_CONFIG_DIR} is "
+                "system policy and is never restored, so it would read as a deletion on the next run"
+            )
+
+    problems: list[str] = []
     fingerprints: Side = {}
     total = 0
-    for path, arcname in compressor.iter_files():
+    for path, arcname in compressor.iter_files(problems):
         # Refuse on the size alone, before reading a huge file.
         try:
             declared = os.lstat(path)
-        except OSError:
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            problems.append(f"{path} ({exc.strerror or exc})")
             continue
         if stat.S_ISREG(declared.st_mode) and total + declared.st_size > MAX_SYNC_BYTES:
             _too_large(total + declared.st_size, scope)
-        found = _fingerprint(compressor, path)
+        found = _fingerprint(compressor, path, problems)
         if found is None:
             continue
         fingerprint, size = found
@@ -116,4 +136,10 @@ def scan(model: Model) -> tuple[LocalScope, Side, int]:
         if total > MAX_SYNC_BYTES:
             _too_large(total, scope)
         fingerprints[arcname] = fingerprint
+    if problems:
+        raise SyncUnreadableError(
+            "cannot sync: these paths exist but cannot be read, and publishing them as missing "
+            "would delete them on every other machine. Fix their permissions or ownership: "
+            + "; ".join(sorted(problems))
+        )
     return scope, fingerprints, total

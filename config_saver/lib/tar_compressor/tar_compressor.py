@@ -62,6 +62,8 @@ class CompressResult:
     # for, so they stay out of ``missing_inputs`` and out of ``complete``.
     excluded: int = 0
     skipped_root_owned: list[str] = field(default_factory=list)
+    # Directories the walk could not list (permissions, I/O): their content is not seen at all.
+    unreadable_dirs: list[str] = field(default_factory=list)
     missing_inputs: list[str] = field(default_factory=list)
     encryption: crypto.EncryptionInfo | None = None
 
@@ -303,7 +305,9 @@ class TarCompressor:
         def walk(root: str) -> Iterator[tuple[str, bool]]:
             # The directory itself is archived so empty directories survive a round-trip.
             yield root, True
-            for dirpath, dirnames, filenames in os.walk(root):
+            for dirpath, dirnames, filenames in os.walk(
+                root, onerror=lambda exc: result.unreadable_dirs.append(str(exc.filename or root))
+            ):
                 dirnames.sort()
                 filenames.sort()
                 kept: list[str] = []
@@ -391,20 +395,34 @@ class TarCompressor:
                 if "${" not in path:
                     yield path, self._normalize_path(path)
 
-    def iter_files(self) -> Iterator[tuple[str, str]]:
+    def iter_files(self, problems: list[str] | None = None) -> Iterator[tuple[str, str]]:
         """Yield ``(path, arcname)`` of regular files and symlinks, as ``_collect`` orders them.
 
-        Root-owned skips are left out, exactly like in the archive.
+        Root-owned skips are left out, exactly like in the archive. When ``problems`` is
+        given, every path that is left out for any reason other than "it does not exist"
+        (root-owned skip, unreadable directory, failed lstat) is appended to it, so a caller
+        that must not mistake "cannot see" for "gone" can tell the two apart.
         """
-        for path, arcname, is_dir in self._collect(CompressResult(output_path="")):
-            if is_dir or self._skips_root_owned(path):
+        result = CompressResult(output_path="")
+        for path, arcname, is_dir in self._collect(result):
+            if is_dir:
+                continue
+            if self._skips_root_owned(path):
+                if problems is not None:
+                    problems.append(f"{path} (owned by root)")
                 continue
             try:
                 mode = os.lstat(path).st_mode
-            except OSError:
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                if problems is not None:
+                    problems.append(f"{path} ({exc.strerror or exc})")
                 continue
             if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
                 yield path, arcname
+        if problems is not None:
+            problems.extend(f"{d} (directory cannot be listed)" for d in result.unreadable_dirs)
 
     def content_stream(self, path: str) -> IO[bytes]:
         """The bytes that would be archived for a regular file; the caller closes it."""

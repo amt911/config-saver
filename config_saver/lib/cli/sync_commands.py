@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 
 from colorama import Fore
 
-from config_saver.lib.errors import SyncNotSetUpError, SyncStateError, SyncTooLargeError
+from config_saver.lib.errors import SyncNotSetUpError, SyncStateError, SyncSystemConfigError, SyncTooLargeError
 from config_saver.lib.exit_codes import EXIT_OK, EXIT_SYNC_CONFLICT, EXIT_USAGE
 from config_saver.lib.models.model import Model
 from config_saver.lib.sync import paths as sync_paths
@@ -128,7 +128,7 @@ def handle(args: argparse.Namespace, load_configs: ConfigLoader) -> int:
         configs = load_configs()  # outside the try: a ValidationError is a ValueError too
         try:
             report = engine.resolve(configs, args.sync_resolve, chosen)
-        except (SyncTooLargeError, SyncStateError):
+        except (SyncTooLargeError, SyncSystemConfigError, SyncStateError):
             raise
         except ValueError as exc:  # an unknown --path
             print(Fore.RED + str(exc))

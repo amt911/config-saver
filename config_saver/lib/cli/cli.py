@@ -38,6 +38,7 @@ from config_saver.lib.errors import (
     SyncConflictError,
     SyncNotSetUpError,
     SyncStateError,
+    SyncSystemConfigError,
     SyncTooLargeError,
     UnsafeArchiveError,
 )
@@ -546,7 +547,7 @@ class CLI:
             target = getattr(e, "filename", None) or str(e)
             print(Fore.RED + f"Not found: {target}")
             return EXIT_NOT_FOUND
-        except (SyncTooLargeError, SyncStateError) as e:
+        except (SyncTooLargeError, SyncSystemConfigError, SyncStateError) as e:
             print(Fore.RED + str(e))
             return EXIT_VALIDATION
         except ValidationError as e:

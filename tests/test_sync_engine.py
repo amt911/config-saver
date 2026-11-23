@@ -540,3 +540,43 @@ def test_push_race_lost_every_time_gives_up(env, monkeypatch):
     with pytest.raises(SyncTransportError, match="kept pushing"):
         b.engine.run({"c": b.model("cfg")})
     assert not os.path.exists(b.state_file)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 0o000 file")
+def test_unreadable_file_never_publishes_a_deletion(pair, monkeypatch):
+    from config_saver.lib.errors import SyncUnreadableError
+
+    a, b = pair
+    f = a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    state_before = Path(a.state_file).read_bytes()
+    head_before = a.head()
+    f.chmod(0)
+    try:
+        with pytest.raises(SyncUnreadableError, match="app.conf"):
+            a.engine.run({"c": a.model("cfg")})
+    finally:
+        f.chmod(0o600)
+    assert Path(a.state_file).read_bytes() == state_before
+    assert a.head() == head_before
+    git(a.sync_dir, "fetch", "origin")
+    assert git(a.sync_dir, "rev-list", "HEAD..@{u}") == ""  # nothing new on the remote
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    assert (b.home / "cfg" / "app.conf").read_text() == "v1\n"  # B still has its copy
+
+
+def test_root_owned_file_never_publishes_a_deletion(pair, monkeypatch):
+    from config_saver.lib.errors import SyncUnreadableError
+    from config_saver.lib.tar_compressor.tar_compressor import TarCompressor
+
+    a, _b = pair
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    state_before = Path(a.state_file).read_bytes()
+    head_before = a.head()
+    monkeypatch.setattr(TarCompressor, "_skips_root_owned", lambda self, path: path.endswith("app.conf"))
+    with pytest.raises(SyncUnreadableError, match="owned by root"):
+        a.engine.run({"c": a.model("cfg")})
+    assert Path(a.state_file).read_bytes() == state_before
+    assert a.head() == head_before

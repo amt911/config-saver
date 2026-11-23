@@ -25,7 +25,8 @@ class GitRepo:
         cmd = ["git", *(["-C", self.path] if cwd else []), *(pre or []), *args]
         # LC_ALL=C: we match git's output, which must not be translated.
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANGUAGE": "C"}
-        env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+        if not self._ssh_chosen_by_user(env):
+            env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"  # never prompt: a timer has no TTY
         for role in ("AUTHOR", "COMMITTER"):
             for key, value in _IDENTITY.items():
                 env[f"GIT_{role}_{key}"] = value
@@ -38,6 +39,22 @@ class GitRepo:
         if check and proc.returncode != 0:
             raise SyncTransportError(f"git {args[0]} failed: {(proc.stderr or proc.stdout).strip()}")
         return proc
+
+    def _ssh_choice_in_config(self, env: dict[str, str]) -> bool:
+        """True when git config (repo, global or system) sets core.sshCommand."""
+        cwd = self.path if os.path.isdir(self.path) else None
+        try:
+            proc = subprocess.run(
+                ["git", "config", "--get", "core.sshCommand"],
+                capture_output=True, text=True, env=env, cwd=cwd, timeout=TIMEOUT_SECONDS,
+            )  # fmt: skip
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False  # the real command reports it
+        return proc.returncode == 0 and bool(proc.stdout.strip())
+
+    def _ssh_chosen_by_user(self, env: dict[str, str]) -> bool:
+        """The BatchMode default is only a default: GIT_SSH_COMMAND, GIT_SSH and core.sshCommand win."""
+        return bool(env.get("GIT_SSH_COMMAND") or env.get("GIT_SSH")) or self._ssh_choice_in_config(env)
 
     def remote_has_branch(self, url: str) -> bool:
         """True when ``url`` already has the sync branch (someone ran init there)."""

@@ -175,3 +175,63 @@ def test_too_large_is_refused_before_reading(fake_home: Path, monkeypatch: pytes
     f.write_bytes(b"x" * 11)
     with pytest.raises(SyncTooLargeError):
         scan(make_model([str(f)]))
+
+
+# ------------------------------------- unreadable is not deleted (final review)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 0o000 file")
+def test_unreadable_file_in_scope_fails_the_scan(fake_home: Path) -> None:
+    from config_saver.lib.errors import SyncUnreadableError
+
+    f = fake_home / "secret.conf"
+    f.write_text("x", encoding="utf-8")
+    f.chmod(0)
+    try:
+        with pytest.raises(SyncUnreadableError, match="secret.conf"):
+            scan(make_model([str(f)]))
+    finally:
+        f.chmod(0o600)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root lists a 0o000 directory")
+def test_unlistable_directory_in_scope_fails_the_scan(fake_home: Path) -> None:
+    from config_saver.lib.errors import SyncUnreadableError
+
+    d = fake_home / "tree"
+    (d / "locked").mkdir(parents=True)
+    (d / "locked" / "inner").write_text("x", encoding="utf-8")
+    (d / "locked").chmod(0)
+    try:
+        with pytest.raises(SyncUnreadableError, match="locked"):
+            scan(make_model([str(d)]))
+    finally:
+        (d / "locked").chmod(0o700)
+
+
+def test_root_owned_file_in_scope_fails_the_scan(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from config_saver.lib.errors import SyncUnreadableError
+
+    f = fake_home / "owned.conf"
+    f.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(TarCompressor, "_skips_root_owned", lambda self, path: path == str(f))
+    with pytest.raises(SyncUnreadableError, match="owned by root"):
+        scan(make_model([str(f)]))
+
+
+def test_vanished_file_is_still_just_absent(fake_home: Path) -> None:
+    scope, side, _ = scan(make_model([str(fake_home / "never")]))
+    assert side == {} and scope.contains("home/user/never")
+
+
+def test_system_config_dir_is_refused(fake_home: Path) -> None:
+    from config_saver.lib.errors import SyncSystemConfigError
+
+    for declared in (
+        [{"source": "/etc/config-saver/configs", "files": ["a.yaml"]}],
+        ["/etc/config-saver/configs"],
+        ["/etc/config-saver/configs/sub/../x.yaml"],
+    ):
+        with pytest.raises(SyncSystemConfigError, match="/etc/config-saver/configs"):
+            scan(make_model(declared))
+    scan(make_model(["/etc/config-saver/configs-other"]))  # a sibling name is fine

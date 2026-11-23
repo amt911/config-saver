@@ -218,3 +218,52 @@ def test_git_runs_with_untranslated_locale(tmp_path, remote, monkeypatch):
     monkeypatch.setenv("LANGUAGE", "es")
     GitRepo(str(tmp_path / "a")).init(remote)
     assert set(log.read_text().split("\n")) == {"C C", ""}
+
+
+def _env_spy(tmp_path, monkeypatch):
+    real = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "ssh.log"
+    shim = bindir / "git"
+    shim.write_text(f'#!/bin/sh\necho "[${{GIT_SSH_COMMAND-unset}}]" >> {log}\nexec {real} "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    return log
+
+
+def _ssh_values(log):
+    return {line for line in log.read_text().splitlines() if line}
+
+
+def test_ssh_batchmode_is_the_default(tmp_path, remote, monkeypatch):
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.delenv("GIT_SSH", raising=False)
+    log = _env_spy(tmp_path, monkeypatch)
+    GitRepo(str(tmp_path / "a")).init(remote)
+    # `git config --get` sees the same env, so the shim logs it too: every call has the default
+    assert _ssh_values(log) == {"[unset]", "[ssh -o BatchMode=yes]"}
+
+
+def test_core_ssh_command_is_not_overridden(tmp_path, remote, monkeypatch):
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.delenv("GIT_SSH", raising=False)
+    (tmp_path / "home" / ".gitconfig").write_text("[core]\n\tsshCommand = ssh -i /my/key\n")
+    log = _env_spy(tmp_path, monkeypatch)
+    GitRepo(str(tmp_path / "a")).init(remote)
+    assert "[ssh -o BatchMode=yes]" not in _ssh_values(log)
+
+
+def test_git_ssh_command_env_is_untouched(tmp_path, remote, monkeypatch):
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /env/key")
+    log = _env_spy(tmp_path, monkeypatch)
+    GitRepo(str(tmp_path / "a")).init(remote)
+    assert _ssh_values(log) == {"[ssh -i /env/key]"}
+
+
+def test_git_ssh_env_is_not_overridden(tmp_path, remote, monkeypatch):
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.setenv("GIT_SSH", "/usr/bin/true")
+    log = _env_spy(tmp_path, monkeypatch)
+    GitRepo(str(tmp_path / "a")).init(remote)
+    assert "[ssh -o BatchMode=yes]" not in _ssh_values(log)

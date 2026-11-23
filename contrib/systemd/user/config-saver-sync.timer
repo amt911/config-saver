@@ -5,8 +5,6 @@ Description=Run config-saver multi-machine sync periodically
 Unit=config-saver-sync.service
 OnBootSec=2min
 OnUnitActiveSec=15min
-# Run a sync the machine slept through as soon as the timer starts again.
-Persistent=true
 
 [Install]
 WantedBy=timers.target

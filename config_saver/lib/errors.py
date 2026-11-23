@@ -55,6 +55,14 @@ class SyncTooLargeError(ValueError, ConfigSaverError):
     """A sync-enabled configuration covers more data than a snapshot should carry."""
 
 
+class SyncUnreadableError(OSError, ConfigSaverError):
+    """A path in a sync scope cannot be read: syncing would publish it as deleted."""
+
+
+class SyncSystemConfigError(ValueError, ConfigSaverError):
+    """A sync configuration declares a path under the system policy directory."""
+
+
 class SyncTransportError(OSError, ConfigSaverError):
     """git could not reach, update or publish to the sync remote."""
 

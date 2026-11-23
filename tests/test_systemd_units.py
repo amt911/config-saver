@@ -103,7 +103,8 @@ def test_sync_timer_values() -> None:
     unit = _unit(USER / "config-saver-sync.timer")
     assert unit.get("Timer", "OnBootSec") == "2min"
     assert unit.get("Timer", "OnUnitActiveSec") == "15min"
-    assert unit.get("Timer", "Persistent") == "true"
+    # Persistent= only affects OnCalendar= timers; this one is monotonic.
+    assert not unit.has_option("Timer", "Persistent")
     assert unit.get("Timer", "Unit") == "config-saver-sync.service"
     assert unit.get("Install", "WantedBy") == "timers.target"
 

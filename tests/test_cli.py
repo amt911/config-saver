@@ -1274,6 +1274,8 @@ def _sync_stub(
         ("state", 3),
         ("transport", 10),
         ("exists", 10),
+        ("unreadable", 10),
+        ("systemconfig", 3),
     ],
 )
 def test_sync_error_to_exit_code(
@@ -1293,6 +1295,8 @@ def test_sync_error_to_exit_code(
         "state": errors.SyncStateError("bad state"),
         "transport": errors.SyncTransportError("no remote"),
         "exists": FileExistsError("already"),
+        "unreadable": errors.SyncUnreadableError("cannot read /x"),
+        "systemconfig": errors.SyncSystemConfigError("system policy"),
     }
     _sync_stub(monkeypatch, fake_home, errs[error])
     cfg = write_config(tmp_path / "zsh.yaml", [str(data_dir)], sync=True)

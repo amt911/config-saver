@@ -51,6 +51,20 @@ def load(path: str) -> SyncState:
         raise _corrupt(path, f"{type(exc).__name__}: {exc}") from exc
 
 
+def _fsync_dir(directory: str) -> None:
+    """Make the rename durable; best effort, some filesystems refuse to open a directory."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def save(path: str, state: SyncState) -> None:
     parent = os.path.dirname(path) or "."
     os.makedirs(parent, mode=0o700, exist_ok=True)
@@ -65,8 +79,11 @@ def save(path: str, state: SyncState) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())  # the rename must not outlive the data it points at
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        _fsync_dir(parent)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)

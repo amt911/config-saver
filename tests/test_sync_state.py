@@ -64,3 +64,13 @@ def test_paths_default_to_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     assert sync_dir() == str(tmp_path / ".local/share/config-saver/sync")
     assert state_path() == str(tmp_path / ".local/state/config-saver/sync-state.json")
+
+
+def test_save_fsyncs_data_before_the_rename(tmp_path, monkeypatch):
+    calls = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace", lambda a, b: (calls.append("replace"), real_replace(a, b))[1])
+    save(str(tmp_path / "s.json"), SyncState())
+    assert calls[:2] == ["fsync", "replace"]
+    assert calls.count("fsync") == 2  # the file, then the directory
