@@ -10,6 +10,7 @@ members it may restore); state is saved only after the push succeeded.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 import re
 import shutil
@@ -41,6 +42,7 @@ MAX_ATTEMPTS = 3
 _NO_PARENT = "none"
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _STAGING = ".staging"
+LOCK_FILE = ".lock"
 
 
 @dataclass
@@ -114,7 +116,7 @@ class SyncEngine:
             os.makedirs(self.sync_dir, mode=0o700, exist_ok=True)
             self.store.init(recipient)
             self.git.init(remote_url)
-            self.git.commit_all("config-saver sync: init")
+            self.git.commit_all()
             if not self.git.push():
                 raise SyncTransportError("the remote changed while initialising; run the init again")
         except BaseException:
@@ -125,14 +127,21 @@ class SyncEngine:
     # ------------------------------------------------------------ public verbs
 
     def status(self, configs: Mapping[str, Model]) -> SyncReport:
-        with self._workspace():
+        with self._locked(), self._workspace():
             cfgs, skipped = self._analyse(configs, state_file_io.load(self.state_file))
             return self._report(cfgs, skipped)
 
     def run(self, configs: Mapping[str, Model]) -> SyncReport:
-        return self._run(configs, state_file_io.load(self.state_file))
+        with self._locked():
+            return self._run(configs, state_file_io.load(self.state_file))
 
     def resolve(
+        self, configs: Mapping[str, Model], side: Literal["local", "remote"], paths: list[str] | None
+    ) -> SyncReport:
+        with self._locked():
+            return self._resolve(configs, side, paths)
+
+    def _resolve(
         self, configs: Mapping[str, Model], side: Literal["local", "remote"], paths: list[str] | None
     ) -> SyncReport:
         state = state_file_io.load(self.state_file)
@@ -166,8 +175,9 @@ class SyncEngine:
                 if conflicts:
                     raise SyncConflictError(conflicts)
                 total.skipped_remote = skipped
-                for c in cfgs.values():
-                    self._apply(c)
+                staged = [(c, self._stage(c)) for c in cfgs.values()]  # dump + vet everything first
+                for c, groups in staged:
+                    self._apply(c, groups)
                     _extend(total.applied, c.name, c.take_remote)
                     _extend(total.deleted, c.name, c.delete_local)
                 merged = {c.name: self._merge(c) for c in cfgs.values()}
@@ -203,7 +213,7 @@ class SyncEngine:
             created[c.name] = snapshot.id
         if not created:
             return created
-        self.git.commit_all(f"sync from {self.host}")
+        self.git.commit_all()
         if self.git.push():
             return created
         self.store.forget_ids(list(created.values()))
@@ -220,8 +230,6 @@ class SyncEngine:
     # ------------------------------------------------------------- analysis
 
     def _analyse(self, configs: Mapping[str, Model], state: SyncState) -> tuple[dict[str, _Cfg], list[str]]:
-        if not os.path.isdir(os.path.join(self.sync_dir, ".git")):
-            raise SyncNotSetUpError("sync is not set up on this machine: run the sync init first")
         # Anything unpushed in the working tree is leftover of a run that died before
         # saving its state: it is disposable, and an orphan snapshot would fork the history.
         self.git.reset_to_upstream()
@@ -274,20 +282,31 @@ class SyncEngine:
 
     # ---------------------------------------------------------------- writes
 
-    def _apply(self, c: _Cfg) -> None:
-        """Restore what the remote changed. Only members chosen here are written."""
+    def _stage(self, c: _Cfg) -> list[tuple[str, list[str]]]:
+        """Dump every snapshot this config restores from and vet all of it; writes nothing.
+
+        Each group is ``(tar path, member names)``. A hostile member anywhere, a missing
+        or duplicated wanted member: all stop the run here, before any user file changes.
+        """
         if c.remote is None:
-            return
+            return []
         by_snapshot: dict[str, list[str]] = {}
         for path in c.take_remote:
             by_snapshot.setdefault(c.remote.entries[path][1], []).append(path)
+        groups = []
         for snapshot_id, names in by_snapshot.items():
-            with self._dump(snapshot_id, c.name) as tar_path:
-                result = TarDecompressor(tar_path, members=names, staging_dir=self.staging).decompress()
-            if result.extracted != len(names):
-                raise ArchiveError(
-                    f"snapshot {snapshot_id} of {c.name} does not hold all of {len(names)} expected paths"
-                )
+            tar_path = self._dump_file(snapshot_id, c.name)
+            counts = TarDecompressor(tar_path, members=names, staging_dir=self.staging).check_members()
+            bad = sorted(n for n, k in counts.items() if k != 1)
+            if bad:
+                raise ArchiveError(f"snapshot {snapshot_id} of {c.name} must hold each of these exactly once: {bad}")
+            groups.append((tar_path, names))
+        return groups
+
+    def _apply(self, c: _Cfg, groups: list[tuple[str, list[str]]]) -> None:
+        """Restore what the remote changed. Only members chosen here are written."""
+        for tar_path, names in groups:
+            TarDecompressor(tar_path, members=names, staging_dir=self.staging).decompress()
         locate = TarDecompressor("")
         for path in c.delete_local:
             with contextlib.suppress(FileNotFoundError):
@@ -330,11 +349,31 @@ class SyncEngine:
             shutil.rmtree(self.staging, ignore_errors=True)
 
     @contextlib.contextmanager
-    def _dump(self, snapshot_id: str, cfg: str) -> Iterator[str]:
-        fd, path = tempfile.mkstemp(dir=self.staging, prefix="dump.", suffix=".tar")  # 0600
+    def _locked(self) -> Iterator[None]:
+        """One sync at a time per sync dir (timer vs manual run): non-blocking, fail fast."""
+        if not os.path.isdir(os.path.join(self.sync_dir, ".git")):
+            raise SyncNotSetUpError("sync is not set up on this machine: run the sync init first")
+        fd = os.open(os.path.join(self.sync_dir, LOCK_FILE), os.O_WRONLY | os.O_CREAT, 0o600)
         try:
-            with os.fdopen(fd, "wb") as out:
-                self.store.dump(snapshot_id, cfg, out)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise SyncTransportError("another sync is running") from exc
+            yield
+        finally:
+            os.close(fd)  # closing releases the lock
+
+    def _dump_file(self, snapshot_id: str, cfg: str) -> str:
+        """Dump a snapshot's tar to a private file in the staging area (removed with it)."""
+        fd, path = tempfile.mkstemp(dir=self.staging, prefix="dump.", suffix=".tar")  # 0600
+        with os.fdopen(fd, "wb") as out:
+            self.store.dump(snapshot_id, cfg, out)
+        return path
+
+    @contextlib.contextmanager
+    def _dump(self, snapshot_id: str, cfg: str) -> Iterator[str]:
+        path = self._dump_file(snapshot_id, cfg)
+        try:
             yield path
         finally:
             with contextlib.suppress(FileNotFoundError):

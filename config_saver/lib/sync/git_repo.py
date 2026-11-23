@@ -8,8 +8,11 @@ import subprocess
 from config_saver.lib.errors import SyncNotSetUpError, SyncTransportError
 
 BRANCH = "main"
-GITIGNORE = ("restic/locks/", "restic-store.json", ".staging/")  # .staging/ holds plaintext
-_FALLBACK_IDENTITY = ["-c", "user.name=config-saver", "-c", "user.email=config-saver@localhost"]
+GITIGNORE = ("restic/locks/", "restic-store.json", ".staging/", ".lock")  # .staging/ holds plaintext
+# Git metadata is visible to the remote's host: every commit carries this fixed identity and
+# message, whatever the user's git config says, so it never leaks a name, host or path.
+_IDENTITY = {"NAME": "config-saver", "EMAIL": "config-saver@localhost"}
+COMMIT_MESSAGE = "sync"
 _STALE_MARKERS = ("non-fast-forward", "fetch first")
 TIMEOUT_SECONDS = 300
 
@@ -23,6 +26,9 @@ class GitRepo:
         # LC_ALL=C: we match git's output, which must not be translated.
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANGUAGE": "C"}
         env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+        for role in ("AUTHOR", "COMMITTER"):
+            for key, value in _IDENTITY.items():
+                env[f"GIT_{role}_{key}"] = value
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=TIMEOUT_SECONDS)
         except FileNotFoundError as exc:
@@ -52,20 +58,18 @@ class GitRepo:
         heads = self._run("ls-remote", "--heads", "origin", BRANCH)
         if not heads.stdout.strip():
             return  # remote branch does not exist yet
-        proc = self._run("pull", "--no-rebase", "--no-edit", "origin", BRANCH, check=False, pre=self._identity())
+        # fetch + merge (not `git pull`) so a merge commit gets our fixed message, not the remote URL.
+        self._run("fetch", "origin", BRANCH)
+        proc = self._run("merge", "--no-edit", "-m", COMMIT_MESSAGE, "FETCH_HEAD", check=False)
         if proc.returncode != 0:
             self._run("merge", "--abort", check=False)
             raise SyncTransportError(f"git pull failed: {(proc.stderr or proc.stdout).strip()}")
 
-    def _identity(self) -> list[str]:
-        email = self._run("config", "user.email", check=False).stdout.strip()
-        return [] if email else list(_FALLBACK_IDENTITY)
-
-    def commit_all(self, message: str) -> bool:
+    def commit_all(self) -> bool:
         self._run("add", "-A")
         if not self._run("status", "--porcelain").stdout.strip():
             return False
-        self._run("commit", "--no-verify", "-m", message, pre=[*self._identity(), "-c", "commit.gpgsign=false"])
+        self._run("commit", "--no-verify", "-m", COMMIT_MESSAGE, pre=["-c", "commit.gpgsign=false"])
         return True
 
     def push(self) -> bool:

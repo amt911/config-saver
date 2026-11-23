@@ -16,7 +16,13 @@ from pathlib import Path
 
 import pytest
 
-from config_saver.lib.errors import SyncConflictError, SyncNotSetUpError, UnsafeArchiveError
+from config_saver.lib.errors import (
+    ArchiveError,
+    SyncConflictError,
+    SyncNotSetUpError,
+    SyncTransportError,
+    UnsafeArchiveError,
+)
 from config_saver.lib.restic_store import HOST_TAG_PREFIX, PARENT_TAG_PREFIX, SYNC_TAG, ResticStore
 from config_saver.lib.sync import state as state_io
 from config_saver.lib.sync.classify import Fingerprint
@@ -268,7 +274,7 @@ def _craft_snapshot(m: Machine, cfg: str, members: dict[str, bytes], manifest: M
     store = ResticStore(m.sync_dir, m.engine.store.identity)
     tags = [SYNC_TAG, PARENT_TAG_PREFIX + parent, HOST_TAG_PREFIX + "evil"]
     snap, _, _ = store.backup(write, cfg, datetime.now(), None, extra_tags=tags)  # type: ignore[arg-type]
-    assert m.git.commit_all("crafted") and m.git.push()
+    assert m.git.commit_all() and m.git.push()
     return snap
 
 
@@ -382,12 +388,11 @@ def test_non_sync_config_never_uploaded(pair):
     a.write("private/notes.txt", SECRET + "\n")
     private = make_model([str(a.home / "private")])  # no sync: true
     a.engine.run({"c": a.model("cfg"), "p": private})
-    assert SECRET.encode() not in _all_bytes(os.path.join(a.sync_dir, "restic"))
     assert not a.engine.store.snapshots("p")
-    plain = os.path.join(a.sync_dir, "restic")
     dumped = io.BytesIO()
     a.engine.store.dump(a.engine.store.snapshots("c")[-1].id, "c", dumped)
-    assert SECRET.encode() not in dumped.getvalue() and plain
+    assert SECRET.encode() not in dumped.getvalue()
+    assert b"private" not in dumped.getvalue()
 
 
 def test_remote_has_no_plaintext(pair, env):
@@ -423,3 +428,115 @@ def test_skipped_remote_lists_unknown_configs(pair, monkeypatch):
     a.engine.run({"c": a.model("cfg")})
     b.use(monkeypatch)
     assert b.engine.status({"other": b.model("cfg2")}).skipped_remote == ["c"]
+
+
+def test_symlink_and_file_swap_across_machines(pair, monkeypatch):
+    a, b = pair
+    a.write("cfg/victim.txt", "victim\n")
+    a.write("cfg/was_file", "plain\n")
+    (a.home / "cfg" / "was_link").symlink_to("victim.txt")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    a.use(monkeypatch)
+    (a.home / "cfg" / "was_file").unlink()
+    (a.home / "cfg" / "was_file").symlink_to("victim.txt")  # file -> symlink
+    (a.home / "cfg" / "was_link").unlink()
+    a.write("cfg/was_link", "now a file\n")  # symlink -> file
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    assert os.readlink(b.home / "cfg" / "was_file") == "victim.txt"
+    assert not (b.home / "cfg" / "was_link").is_symlink()
+    assert (b.home / "cfg" / "was_link").read_text() == "now a file\n"
+    assert (b.home / "cfg" / "victim.txt").read_text() == "victim\n"  # never written through the old link
+
+
+def test_hostile_later_group_changes_nothing(pair, monkeypatch):
+    a, b = pair
+    a.write("cfg/old.txt", "old\n")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    # A edits old.txt (group 1: a good snapshot), then a crafted snapshot adds new.txt next to a hostile member.
+    a.use(monkeypatch)
+    a.write("cfg/old.txt", "old v2\n")
+    a.engine.run({"c": a.model("cfg")})
+    good_head = a.engine.store.snapshots("c", tag=SYNC_TAG)[-1].id
+    new = b"new\n"
+    manifest = Manifest(
+        "c",
+        ["home/user/cfg/old.txt", "home/user/cfg/new.txt"],
+        {
+            "home/user/cfg/old.txt": (_fp(b"old v2\n"), good_head),
+            "home/user/cfg/new.txt": (_fp(new), SELF),
+        },
+    )
+    _craft_snapshot(a, "c", {"home/user/cfg/new.txt": new, "home/user/../../evil": b"x"}, manifest, parent=good_head)
+    b.use(monkeypatch)
+    with pytest.raises(UnsafeArchiveError):
+        b.engine.run({"c": b.model("cfg")})
+    assert (b.home / "cfg" / "old.txt").read_text() == "old\n"
+    assert not (b.home / "cfg" / "new.txt").exists()
+
+
+def test_a_snapshot_missing_a_wanted_member_changes_nothing(pair, monkeypatch):
+    a, b = pair
+    manifest = Manifest("c", ["home/user/cfg/x.txt"], {"home/user/cfg/x.txt": (_fp(b"x"), SELF)})
+    _craft_snapshot(a, "c", {}, manifest)  # promises x.txt, holds nothing
+    b.use(monkeypatch)
+    with pytest.raises(ArchiveError):
+        b.engine.run({"c": b.model("cfg")})
+    assert not (b.home / "cfg").exists()
+
+
+def test_second_sync_at_the_same_time_fails_fast(pair):
+    import fcntl
+
+    a, _b = pair
+    a.write("cfg/app.conf", "x\n")
+    fd = os.open(os.path.join(a.sync_dir, ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for verb in (
+            lambda: a.engine.run({"c": a.model("cfg")}),
+            lambda: a.engine.status({"c": a.model("cfg")}),
+            lambda: a.engine.resolve({"c": a.model("cfg")}, "local", None),
+        ):
+            with pytest.raises(SyncTransportError, match="another sync is running"):
+                verb()
+        assert not subprocess.run(
+            ["git", "-C", a.sync_dir, "status", "--porcelain"], capture_output=True, text=True
+        ).stdout
+    finally:
+        os.close(fd)
+    a.engine.run({"c": a.model("cfg")})  # the lock is released: it works again
+
+
+def test_git_metadata_names_nothing(pair, env):
+    a, _b = pair
+    a.write("cfg/app.conf", "x\n")
+    a.engine.run({"c": a.model("cfg")})
+    log = git(env["remote"], "log", "--all", "--format=%an|%ae|%cn|%ce|%s|%b")
+    assert log.strip()
+    for line in log.splitlines():
+        assert line == "config-saver|config-saver@localhost|config-saver|config-saver@localhost|sync|"
+    for secret in ("cfg", "app.conf", "homes", env["root"].name):
+        assert secret not in log
+
+
+def test_push_race_lost_every_time_gives_up(env, monkeypatch):
+    class AlwaysStale(GitRepo):
+        def push(self) -> bool:
+            return False
+
+    a = machine(env, "a")
+    a.use(monkeypatch)
+    a.engine.init(env["remote"], env["recipient"])
+    b = machine(env, "b", git_cls=AlwaysStale)
+    b.use(monkeypatch)
+    b.engine.init(env["remote"], None)
+    b.write("cfg/x.txt", "x\n")
+    with pytest.raises(SyncTransportError, match="kept pushing"):
+        b.engine.run({"c": b.model("cfg")})
+    assert not os.path.exists(b.state_file)

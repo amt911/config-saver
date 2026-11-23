@@ -237,7 +237,8 @@ class TarDecompressor:
             content = self._denormalize_file_content(content)
 
         self._make_parents(os.path.dirname(destination) or os.sep)
-        if os.path.islink(destination):
+        # Staged writes swap the destination itself with os.replace and never follow a link there.
+        if self.staging_dir is None and os.path.islink(destination):
             raise UnsafeArchiveError(member.name, "destination already exists as a symlink")
         mode = member.mode & ~_FORBIDDEN_MODE_BITS
         if self.staging_dir is not None:
@@ -315,6 +316,25 @@ class TarDecompressor:
             if os.path.lexists(destination):
                 os.unlink(destination)
             os.link(source, destination)
+
+    def check_members(self) -> dict[str, int]:
+        """Validate every member without writing; count how often each wanted name occurs.
+
+        Raises like ``decompress`` for any hostile member, so a caller can vet several
+        archives before it writes from any of them.
+        """
+        counts = dict.fromkeys(self.members or (), 0)
+        try:
+            with tarfile.open(self.tar_path, "r:*") as tar:
+                for member in tar.getmembers():
+                    if member.name == METADATA_MEMBER:
+                        continue
+                    self._validate_member(member)
+                    if member.name in counts:
+                        counts[member.name] += 1
+        except tarfile.TarError as e:
+            raise ArchiveError(f"Could not read archive '{self.tar_path}': {e}") from e
+        return counts
 
     def decompress(self) -> DecompressResult:
         """Extract every archive member to its destination.
