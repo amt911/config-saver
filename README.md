@@ -951,6 +951,24 @@ not need this — it runs from the system manager as `User=%i`.
      journalctl --user -u config-saver.service --since "1 hour ago"
    ```
 
+### Multi-machine sync timer
+
+`contrib/systemd/user/` also ships `config-saver-sync.timer` / `.service`, which run
+`config-saver --sync` 2 minutes after boot and every 15 minutes after that (`Persistent=true`):
+
+```bash
+systemctl --user enable --now config-saver-sync.timer
+```
+
+A failed run (conflict, exit 11; git/network failure, exit 10; not set up, exit 2) starts
+`config-saver-notify@.service`, which raises a freedesktop desktop notification with `notify-send`
+(package `libnotify`; works on KDE, GNOME and others). The notifier is optional: if `notify-send`
+is missing nothing else fails, you just get no banner (see `journalctl --user -u config-saver-sync.service`
+and `config-saver --sync-status`). The notification needs `DBUS_SESSION_BUS_ADDRESS` in the user manager,
+which a graphical login provides; on a session without one run
+`systemctl --user import-environment DBUS_SESSION_BUS_ADDRESS`.
+`scripts/check-sync-notify.sh` verifies the `OnFailure=` wiring against real systemd.
+
 ### Install (system-wide)
 
 If you prefer to run the timer as a system service (e.g., root-managed), copy the files to `/etc/systemd/system/` and use `systemctl daemon-reload` and `systemctl enable --now config-saver.timer` as root.

@@ -84,3 +84,36 @@ def test_a_missed_backup_runs_immediately(path: Path) -> None:
 )
 def test_services_create_private_files(path: Path) -> None:
     assert _unit(path).get("Service", "UMask") == "0077"
+
+
+USER = CONTRIB / "user"
+
+
+def test_sync_service_runs_sync_and_notifies_on_failure() -> None:
+    unit = _unit(USER / "config-saver-sync.service")
+    assert unit.get("Service", "Type") == "oneshot"
+    assert unit.get("Service", "WorkingDirectory") == "%h"
+    assert unit.get("Service", "ExecStart") == "/usr/bin/env python3 -m config_saver --sync"
+    assert unit.get("Unit", "OnFailure") == "config-saver-notify@%n.service"
+    # Timer-driven only: enabling the service itself would run it at login.
+    assert not unit.has_section("Install")
+
+
+def test_sync_timer_values() -> None:
+    unit = _unit(USER / "config-saver-sync.timer")
+    assert unit.get("Timer", "OnBootSec") == "2min"
+    assert unit.get("Timer", "OnUnitActiveSec") == "15min"
+    assert unit.get("Timer", "Persistent") == "true"
+    assert unit.get("Timer", "Unit") == "config-saver-sync.service"
+    assert unit.get("Install", "WantedBy") == "timers.target"
+
+
+def test_notify_unit_uses_instance_and_tolerates_missing_notifier() -> None:
+    unit = _unit(USER / "config-saver-notify@.service")
+    assert unit.get("Service", "Type") == "oneshot"
+    exec_start = unit.get("Service", "ExecStart")
+    # Leading "-": a missing notify-send must not mark the unit failed.
+    assert exec_start.startswith("-/usr/bin/notify-send ")
+    assert "-u critical" in exec_start
+    assert "%i failed" in exec_start
+    assert "config-saver --sync-status" in exec_start

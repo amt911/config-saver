@@ -113,3 +113,13 @@ runs. Forcing `spawn` would make it uniform but costs an interpreter startup per
 worker, and measured *slower than sequential* for many small configurations
 (×0.44 on the 12-config corpus in `docs/BENCHMARKS.md`), so the interpreter
 default stays. Tests that move `$HOME` run batch mode with `--jobs 1`.
+
+## 2026-11-23 — The sync failure notification needed no `import-environment` here
+
+`config-saver-notify@.service` runs `notify-send` from the user manager. Measured with
+`scripts/check-sync-notify.sh` on this machine (Arch, graphical session): the user manager already
+had `DBUS_SESSION_BUS_ADDRESS` (`systemctl --user show-environment`), the notify unit ran and exited
+0 with no `systemctl --user import-environment`. A user manager started without a graphical
+session (e.g. linger-only, no login) will not have it: `notify-send` then fails and, because of the
+leading `-` in `ExecStart=`, silently. The check script proves the `OnFailure=` wiring, not that a
+banner was seen; look at the screen once.
