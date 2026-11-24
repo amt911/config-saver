@@ -33,6 +33,9 @@ All notable changes to this project are documented here. The format follows
     snapshot alive) no longer makes a machine conflict with itself. A fork loser is kept 30 days with
     the fork winner and its parent; a machine away up to 29 days merges cleanly, a longer absence may
     conflict (exit `11`, nothing lost). Snapshots without a `gen:` tag are refused.
+  - A publish counts only when the head is the new snapshot or builds on it, and one whose upload
+    took more than 6 hours is dropped and redone, so a publisher stalled mid-run (a suspended laptop)
+    can never record a snapshot the other machines moved past.
   - The head manifest is streamed from the first members of the tar (restic is stopped as soon as it
     is read) and cached by snapshot id (`sync-manifests.json`, `0600`); an unchanged head costs no
     download.

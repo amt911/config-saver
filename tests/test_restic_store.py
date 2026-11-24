@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -732,3 +733,21 @@ def test_copy_from_without_ids_refuses(tmp_path: Path, monkeypatch: pytest.Monke
     with pytest.raises(StoreError, match="no snapshot ids"):
         ResticStore.for_repository("/dst", "p").copy_from(ResticStore.for_repository("/src", "q"), [])
     assert rec.calls == []
+
+
+def test_open_dump_never_waits_on_a_child_that_keeps_stderr_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """restic killed after its grace can leave an rclone child holding stderr open: reaping must not wait on it."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "restic"
+    fake.write_text("#!/bin/sh\ntrap '' TERM\nsleep 6 &\nprintf x\nsleep 6\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(rs, "_STOP_GRACE", 0.3)
+    store = ResticStore.for_repository(str(tmp_path / "repo"), "pw")
+    start = time.monotonic()
+    with store.open_dump("a" * 64, "c") as stream:
+        assert stream.read(1) == b"x"
+    assert time.monotonic() - start < 3

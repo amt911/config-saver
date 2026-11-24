@@ -927,7 +927,11 @@ Every sync snapshot carries a generation (`gen:` tag): the head is the one of th
 so forgetting snapshots from the middle of the history never changes which snapshot is the head. A
 snapshot that lost a fork (two machines published on the same parent; the earliest wins) is kept for
 30 days together with the fork winner and the snapshot it forked from, so a machine that was away
-can still find where it stood.
+can still find where it stood. A publish counts only when the head is the new snapshot or builds on
+it; otherwise (for example a laptop suspended mid-upload while the other machine moved on) it is
+dropped and the run starts again. A snapshot is dated when its upload starts, so one whose upload
+took more than 6 hours is dropped and redone too (restic already holds the data, so the redo is
+quick): every snapshot that stays is dated close to when the other machines could first see it.
 
 **Manifest cache.** Each run needs the head's manifest (the file list). It is streamed out of the first
 members of the snapshot's tar rather than downloading the whole snapshot, and cached by snapshot id
@@ -949,13 +953,16 @@ rm -rf "$d"
 ```
 
 `key passwd` adds the new key and removes the old one in one step. Done by hand it is
-`restic key list` (note the ID of the key you are replacing, the one without the `*`), `restic key add
---new-password-file`, then `restic key remove <old key ID>` run **with the new password** (restic refuses
-to remove the key it is using):
+`restic key list` with the old password (note the ID of the key you are replacing: the one marked `*`,
+the key in use), `restic key add --new-password-file`, then `restic key remove <old key ID>` run **with
+the new password** (restic refuses to remove the key it is using):
 
 ```bash
-RESTIC_PASSWORD="$(derive old-key.txt)" restic -r <sync repository URL> key list
+RESTIC_PASSWORD="$(derive old-key.txt)" restic -r <sync repository URL> key list   # old key: marked *
+umask 077; d=$(mktemp -d)
+derive new-key.txt > "$d/new-pw"
 RESTIC_PASSWORD="$(derive old-key.txt)" restic -r <sync repository URL> key add --new-password-file "$d/new-pw"
+rm -rf "$d"
 RESTIC_PASSWORD="$(derive new-key.txt)" restic -r <sync repository URL> key remove <old key ID>
 ```
 

@@ -34,7 +34,8 @@ def load(path: str) -> dict[str, Manifest]:
                 return {}
             out[snapshot_id] = Manifest.from_json(text.encode())
         return out
-    except (OSError, ValueError, ArchiveError):  # unreadable, not JSON / UTF-8, or a manifest that fails validation
+    except (OSError, ValueError, RecursionError, ArchiveError):  # unreadable, not JSON / UTF-8 (or nested too deep),
+        # or a manifest that fails validation
         return {}
 
 

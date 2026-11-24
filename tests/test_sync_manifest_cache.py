@@ -67,6 +67,12 @@ def test_a_cache_that_is_not_utf8_is_empty(tmp_path):
     assert cache.load(str(path)) == {}
 
 
+def test_a_deeply_nested_cache_is_empty(tmp_path):
+    path = tmp_path / "cache.json"
+    path.write_text("[" * 200_000 + "]" * 200_000)  # json raises RecursionError, not ValueError
+    assert cache.load(str(path)) == {}
+
+
 def test_a_failing_save_is_silent(tmp_path):
     blocker = tmp_path / "file"
     blocker.write_text("x")

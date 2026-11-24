@@ -556,7 +556,9 @@ class ResticStore:
         proc.wait()
         if proc.stdout is not None:
             proc.stdout.close()
-        err_thread.join()
+        # A killed restic can leave an rclone child holding stderr open; the drain is a daemon thread, so
+        # giving up on it after the grace leaks nothing past the process.
+        err_thread.join(timeout=_STOP_GRACE)
 
     def forget(
         self, cfg: str, policy: RetentionModel, dry_run: bool, also_keep: Iterable[datetime] = ()

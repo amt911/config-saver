@@ -49,6 +49,7 @@ from config_saver.lib.sync.manifest import (
     SnapRef,
     forgettable,
     losers,
+    on_head_line,
     select_head,
 )
 from config_saver.lib.sync.paths import manifest_cache_path
@@ -75,6 +76,10 @@ LOSER_RETENTION = timedelta(days=30)
 # long after the machine last recorded it; a lost fork is retained for LOSER_RETENTION, so after
 # LOSER_RETENTION - SUPERSEDE_GRACE the absence can no longer be told apart from a forgotten fork.
 _RECORD_TRUST = LOSER_RETENTION - SUPERSEDE_GRACE
+# A snapshot is dated when its upload starts. One that took longer than this to land is forgotten and
+# redone, so every snapshot that stays is dated within this of when other machines could first see it:
+# the margins above (and fork order by date) assume that, with room for a few hours of clock skew.
+MAX_PUBLISH_AGE = 6 * 3600.0
 
 
 @dataclass
@@ -439,6 +444,7 @@ class SyncEngine:
         """Upload what only this machine has; empty ids if nothing, ``None`` if another machine's publish won."""
         created: dict[str, str] = {}
         manifests: dict[str, Manifest] = {}
+        stale: list[str] = []
         for c in cfgs.values():
             side, publish = merged[c.name]
             if not publish:
@@ -452,11 +458,18 @@ class SyncEngine:
                 f"{GEN_TAG_PREFIX}{self._head_gen(c) + 1}",
                 f"{HOST_TAG_PREFIX}{self.host}",
             ]
+            started = self.now()
             snapshot, _, _ = self.store.backup(
                 self._writer(compressor, only, manifest), c.name, datetime.now(), None, extra_tags=tags
             )
+            if self.now() - started > MAX_PUBLISH_AGE:
+                stale.append(snapshot.id)
+                continue
             created[c.name] = snapshot.id
             manifests[c.name] = manifest
+        if stale:
+            self.store.forget_ids(stale)  # dated too early to be ordered fairly: redo it now
+            return None
         if not created:
             return _Published({}, {}, {})
         by_cfg = self._by_cfg(self.store.snapshots(tag=SYNC_TAG))
@@ -474,11 +487,14 @@ class SyncEngine:
         if dangling:
             self.store.forget_ids([created[n] for n in dangling])
             return None
-        # Ours won when it is on the winning chain: another machine may already have built on top of it.
-        if all(snap_id not in losers(by_cfg.get(name, [])) for name, snap_id in created.items()):
+        # Ours won when it is the head or the head descends from it (another machine may already have built
+        # on top of it). Not losing a fork is not enough: see on_head_line.
+        off = [i for name, i in created.items() if not on_head_line(by_cfg.get(name, []), i)]
+        if not off:
             return _Published(created, manifests, by_cfg)
-        # Only the losers: a snapshot of another cfg that won may already have another machine on top of it.
-        self.store.forget_ids([i for name, i in created.items() if i in losers(by_cfg.get(name, []))])
+        # Only those off the head line (nobody builds on them); one of another cfg that won may already have
+        # another machine on top of it.
+        self.store.forget_ids(off)
         return None
 
     @staticmethod

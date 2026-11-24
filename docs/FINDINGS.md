@@ -173,3 +173,15 @@ Two traps, one cause: forgetting a snapshot removes a link from the middle of th
 
 The pure retention rules live in `manifest.forgettable`; `tests/test_sync_manifest.py` checks them
 against the full history with Hypothesis (the head never changes however much is forgotten).
+
+Two more consequences, found in review:
+
+- **Not losing a fork is not winning.** A publisher that stalls past the 24 h grace finds its parent
+  forgotten: its snapshot is alone in its sibling group (no fork loser) while the head is a higher
+  generation on another line. Counting it as won made the next run treat it as the base and take the
+  remote over its edits. A publish wins only when the head is it or descends from it
+  (`manifest.on_head_line`); otherwise it is forgotten and the run retried.
+- **A snapshot's date is when its upload started.** One that lands days later can win a fork by that
+  early date after the other side recorded its own snapshot, and the 30 d / 29 d margins above assume
+  date ≈ appearance. A publish whose upload took more than `MAX_PUBLISH_AGE` (6 h) is forgotten at
+  once and redone.

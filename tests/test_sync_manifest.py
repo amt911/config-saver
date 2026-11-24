@@ -13,6 +13,7 @@ from config_saver.lib.sync.manifest import (
     SnapRef,
     forgettable,
     losers,
+    on_head_line,
     select_head,
     unreferenced,
     winning_chain,
@@ -250,6 +251,38 @@ def test_a_cycle_is_all_losers_or_none_but_terminates() -> None:
     snaps = [_ref("r", None, 1, 0), _ref("a", "b", 2, 1), _ref("b", "a", 3, 2)]
     assert losers(snaps) == set()  # a and b are alone in their sibling groups: generations decide
     assert select_head(snaps) == "b"
+
+
+def test_on_head_line_the_head_and_its_listed_ancestors() -> None:
+    snaps = [_ref("a", None, 1, 0), _ref("b", "a", 2, 1), _ref("c", "b", 3, 2)]
+    assert on_head_line(snaps, "c")
+    assert on_head_line(snaps, "b")  # another machine already built on top of it
+    assert on_head_line(snaps, "a")
+
+
+def test_on_head_line_a_lone_child_of_a_forgotten_parent_below_a_higher_head_is_not() -> None:
+    # Our snapshot "late" was built on P, forgotten while we uploaded; "x" grew on another line meanwhile.
+    snaps = [_ref("x", "w", 2, 2), _ref("late", "p", 9, 1)]
+    assert losers(snaps) == set()  # not a fork loser: "not a loser" is not enough to have won
+    assert not on_head_line(snaps, "late")
+    assert on_head_line(snaps, "x")
+
+
+def test_on_head_line_a_same_generation_candidate_on_another_line_is_not() -> None:
+    snaps = [_ref("p", "x", 5, 3), _ref("q", "y", 4, 3)]
+    assert not on_head_line(snaps, "p")
+
+
+def test_on_head_line_a_fork_loser_and_an_unlisted_id_are_not() -> None:
+    snaps = [_ref("a", None, 1, 0), _ref("w", "a", 2, 1), _ref("l", "a", 3, 1)]
+    assert not on_head_line(snaps, "l")
+    assert not on_head_line(snaps, "zz")
+    assert not on_head_line([], "a")
+
+
+def test_on_head_line_stops_on_a_parent_cycle() -> None:
+    snaps = [_ref("a", "b", 2, 1), _ref("b", "a", 3, 2)]
+    assert not on_head_line(snaps, "zz")
 
 
 def _m(entries: dict[str, str]) -> Manifest:

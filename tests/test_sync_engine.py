@@ -1090,6 +1090,89 @@ def test_a_publish_built_on_a_snapshot_forgotten_meanwhile_retries(env, monkeypa
     assert (c.home / "cfg" / "b_new.txt").read_text() == "b\n"
 
 
+def test_a_publisher_stalled_past_the_grace_never_records_a_snapshot_off_the_head_line(env, monkeypatch):
+    """B analyses head P, then stalls (laptop suspended mid-run) while A publishes W and X over it.
+
+    A's housekeeping forgets P and W, so B's late snapshot L has no listed sibling: it is no fork loser,
+    yet the head is X, a generation above. Taking L as won would make B's next run treat L as its base and
+    overwrite B's edits with X's. L must be dropped and the run retried against X: a conflict, not a loss.
+    """
+    fired: list[int] = []
+
+    class Stalled(ResticStore):
+        def backup(self, write, cfg, when, description, extra_tags: Sequence[str] = ()):
+            if not fired:
+                fired.append(1)
+                a.use(monkeypatch)
+                a.write("cfg/app.conf", "a1\n")
+                a.engine.run({"c": a.model("cfg")})  # W on P; P is unreferenced and its successor old
+                a.write("cfg/app.conf", "a2\n")
+                a.engine.run({"c": a.model("cfg")})  # X on W; W goes the same way
+                b.use(monkeypatch)
+            return super().backup(write, cfg, when, description, extra_tags)
+
+    a, b = machine(env, "a", now=late()), machine(env, "b", store_cls=Stalled)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    b.write("cfg/app.conf", "from b\n")  # L replaces P's only file: its manifest names nothing forgotten
+    b.write("cfg/b_new.txt", "b only\n")
+    with pytest.raises(SyncConflictError):
+        b.engine.run({"c": b.model("cfg")})
+        b.engine.run({"c": b.model("cfg")})  # without the fix: L counts as won, and this run overwrites
+    assert (b.home / "cfg" / "app.conf").read_text() == "from b\n"
+    assert (b.home / "cfg" / "b_new.txt").read_text() == "b only\n"
+    assert _ids(b) == {a.head()}  # L is gone: nobody could have built on a snapshot off the head line
+
+
+def test_a_publish_whose_upload_outlasted_the_bound_is_dropped_and_retried(env, monkeypatch):
+    """A snapshot is dated when its upload starts. One that took days to land could win a fork by that early
+    date long after the other side recorded its own snapshot, and the loser-retention clock would then run
+    from the wrong time. A publish slower than the bound is forgotten at once and redone (restic already
+    holds the data, so the redo is quick)."""
+    clock = Clock(time.time())
+    created: list[str] = []
+
+    class Slow(ResticStore):
+        def backup(self, write, cfg, when, description, extra_tags: Sequence[str] = ()):
+            snap = super().backup(write, cfg, when, description, extra_tags)
+            created.append(snap[0].id)
+            if len(created) == 1:
+                clock.t += 7 * 3600  # the first upload took seven hours
+            return snap
+
+    a = machine(env, "a", store_cls=Slow, now=clock)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    assert len(created) == 2
+    assert _ids(a) == {created[1]}  # the slow one is gone, the quick redo is the head
+    assert a.head() == created[1]
+
+
+def test_a_publish_just_under_the_bound_stands(env, monkeypatch):
+    clock = Clock(time.time())
+    created: list[str] = []
+
+    class Slowish(ResticStore):
+        def backup(self, write, cfg, when, description, extra_tags: Sequence[str] = ()):
+            snap = super().backup(write, cfg, when, description, extra_tags)
+            created.append(snap[0].id)
+            clock.t += 6 * 3600 - 60
+            return snap
+
+    a = machine(env, "a", store_cls=Slowish, now=clock)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    assert _ids(a) == set(created) and len(created) == 1
+
+
 def test_successful_run_persists_the_hash_cache_and_reuses_it(pair, monkeypatch):
     import config_saver.lib.sync.scan as scan_mod
 

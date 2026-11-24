@@ -175,6 +175,23 @@ def select_head(snaps: list[SnapRef]) -> str | None:
     return chain[-1] if chain else None
 
 
+def on_head_line(snaps: list[SnapRef], snap_id: str) -> bool:
+    """Whether the head is ``snap_id`` or descends from it through listed parents.
+
+    Not being a fork loser is not enough to have won: a snapshot whose parent was forgotten while it
+    uploaded is alone in its sibling group, yet a candidate of a higher generation may be the head.
+    """
+    by_id = {s.id: s for s in snaps}
+    current = select_head(snaps)
+    for _ in range(len(by_id)):  # a line has at most every listed snapshot; a forged parent cycle ends here
+        if current not in by_id:
+            return False
+        if current == snap_id:
+            return True
+        current = by_id[current].parent
+    return False
+
+
 def losers(snaps: list[SnapRef]) -> set[str]:
     """Ids of fork losers and of everything listed below them."""
     return _subtrees(snaps, _fork_losers(snaps))
