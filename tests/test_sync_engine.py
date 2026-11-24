@@ -27,7 +27,14 @@ from config_saver.lib.errors import (
     SyncTransportError,
     UnsafeArchiveError,
 )
-from config_saver.lib.restic_store import HOST_TAG_PREFIX, PARENT_TAG_PREFIX, SYNC_TAG, ResticStore, Snapshot
+from config_saver.lib.restic_store import (
+    GEN_TAG_PREFIX,
+    HOST_TAG_PREFIX,
+    PARENT_TAG_PREFIX,
+    SYNC_TAG,
+    ResticStore,
+    Snapshot,
+)
 from config_saver.lib.sync import state as state_io
 from config_saver.lib.sync.classify import Fingerprint
 from config_saver.lib.sync.engine import SyncEngine
@@ -90,7 +97,12 @@ class Machine:
     def head(self) -> str:
         """The winning head of cfg ``c`` in the shared repository."""
         snaps = self.engine.store.snapshots("c", tag=SYNC_TAG)
-        return select_head([SnapRef(x.canonical, _parent(x), x.time) for x in snaps]) or ""
+        return select_head([_ref(x) for x in snaps]) or ""
+
+
+def _ref(snap) -> SnapRef:
+    gen = next(int(t[len(GEN_TAG_PREFIX) :]) for t in snap.tags if t.startswith(GEN_TAG_PREFIX))
+    return SnapRef(snap.canonical, _parent(snap), snap.time, gen)
 
 
 def _parent(snap) -> str | None:
@@ -282,7 +294,9 @@ def test_different_usernames_no_conflict(env, monkeypatch):
     assert a.engine.run({"c": a.model("cfg", normalize_content=True)}).applied == {}
 
 
-def _craft_snapshot(m: Machine, cfg: str, members: dict[str, bytes], manifest: Manifest, parent: str = "none"):
+def _craft_snapshot(
+    m: Machine, cfg: str, members: dict[str, bytes], manifest: Manifest, parent: str = "none", gen: int = 0
+):
     """Publish a hand-made sync snapshot: the attack a hostile remote could mount."""
 
     def write(out) -> object:
@@ -295,7 +309,7 @@ def _craft_snapshot(m: Machine, cfg: str, members: dict[str, bytes], manifest: M
         return None
 
     store = m.engine.store
-    tags = [SYNC_TAG, PARENT_TAG_PREFIX + parent, HOST_TAG_PREFIX + "evil"]
+    tags = [SYNC_TAG, PARENT_TAG_PREFIX + parent, f"{GEN_TAG_PREFIX}{gen}", HOST_TAG_PREFIX + "evil"]
     snap, _, _ = store.backup(write, cfg, datetime.now(), None, extra_tags=tags)  # type: ignore[arg-type]
     return snap
 
@@ -391,7 +405,7 @@ def test_fork_race_one_winner_loser_retries(env, monkeypatch):
     # B's losing first snapshot was forgotten: one linear chain of two snapshots
     snaps = b.engine.store.snapshots("c", tag=SYNC_TAG)
     assert len(snaps) == 2
-    assert losers([SnapRef(x.id, _parent(x), x.time) for x in snaps]) == set()
+    assert losers([_ref(x) for x in snaps]) == set()
 
 
 def test_a_snapshot_another_machine_built_on_is_not_forgotten(env, monkeypatch):
@@ -470,13 +484,27 @@ def test_all_cycle_history_is_a_state_error_not_a_fresh_root(pair):
         def snapshots(self, cfg=None, tag=None):
             when = datetime(2026, 1, 1)
             return [
-                Snapshot("id1", "id1", when, "c", None, (SYNC_TAG, PARENT_TAG_PREFIX + "id2")),
-                Snapshot("id2", "id2", when, "c", None, (SYNC_TAG, PARENT_TAG_PREFIX + "id1")),
+                Snapshot("id1", "id1", when, "c", None, (SYNC_TAG, PARENT_TAG_PREFIX + "id2", "gen:1")),
+                Snapshot("id2", "id2", when, "c", None, (SYNC_TAG, PARENT_TAG_PREFIX + "id1", "gen:1")),
             ]
 
     a.engine.store = Cyclic.for_repository(a.engine.store.repo, a.engine.store._password or "", ())
     a.write("cfg/app.conf", "x\n")
     with pytest.raises(SyncStateError):
+        a.engine.run({"c": a.model("cfg")})
+
+
+@pytest.mark.parametrize("tags", [(SYNC_TAG, "parent:none"), (SYNC_TAG, "parent:none", "gen:x"), (SYNC_TAG, "gen:-1")])
+def test_a_sync_snapshot_without_a_valid_gen_tag_is_a_state_error(pair, tags):
+    a, _b = pair
+
+    class Untagged(ResticStore):
+        def snapshots(self, cfg=None, tag=None):
+            return [Snapshot("id1", "id1", datetime(2026, 1, 1), "c", None, tags)]
+
+    a.engine.store = Untagged.for_repository(a.engine.store.repo, a.engine.store._password or "", ())
+    a.write("cfg/app.conf", "x\n")
+    with pytest.raises(SyncStateError, match="gen:"):
         a.engine.run({"c": a.model("cfg")})
 
 
@@ -561,7 +589,9 @@ def test_hostile_later_group_changes_nothing(pair, monkeypatch):
             "home/user/cfg/new.txt": (_fp(new), SELF),
         },
     )
-    _craft_snapshot(a, "c", {"home/user/cfg/new.txt": new, "home/user/../../evil": b"x"}, manifest, parent=good_head)
+    _craft_snapshot(
+        a, "c", {"home/user/cfg/new.txt": new, "home/user/../../evil": b"x"}, manifest, parent=good_head, gen=2
+    )
     b.use(monkeypatch)
     with pytest.raises(UnsafeArchiveError):
         b.engine.run({"c": b.model("cfg")})
@@ -711,14 +741,14 @@ class _Skewed(ResticStore):
         return super().backup(write, cfg, when, description, extra_tags)
 
 
-def _flip(env, monkeypatch, *, same_path: bool, crash: bool = False):
+def _flip(env, monkeypatch, *, same_path: bool, crash: bool = False, clock: Callable[[], float] | None = None):
     """Both machines synced on P. A publishes X, then B's earlier-dated Y on P wins. Returns (a, b)."""
 
     class Store(_Skewed):
         pass
 
     Store.fired, Store.crash = False, crash
-    a, b = machine(env, "a"), machine(env, "b", store_cls=Store)
+    a, b = machine(env, "a", now=clock), machine(env, "b", store_cls=Store, now=clock)
     a.use(monkeypatch)
     a.engine.init()
     a.write("cfg/app.conf", "v1\n")
@@ -967,7 +997,7 @@ def test_explicit_prune_forgets_and_prunes_regardless_of_the_clock(env, monkeypa
     a.engine.run({"c": a.model("cfg")})  # the weekly prune already ran here, and forgot the first snapshot
     # Plant a second root: it loses to the older chain, so it is a loser prune() must find.
     extra = a.engine.store.backup(
-        _empty_tar, "c", datetime.now(), None, extra_tags=[SYNC_TAG, f"{PARENT_TAG_PREFIX}none"]
+        _empty_tar, "c", datetime.now(), None, extra_tags=[SYNC_TAG, f"{PARENT_TAG_PREFIX}none", f"{GEN_TAG_PREFIX}0"]
     )[0].id
     before = counting.prunes
     clock.t = start + 60  # a minute later: well inside the week, so only an explicit prune() runs it
@@ -1459,3 +1489,152 @@ def test_move_with_no_snapshots_just_creates_the_target(env, monkeypatch):
     target = _target(env)
     assert a.engine.move(target) == 0
     assert target.store(env["key"]).exists()
+
+
+# ------------------------------ an idle machine, and a lost fork that must outlive its machine's absence
+
+LOSER_RETENTION_S = 30 * DAY
+
+
+def _idle_scenario(env, monkeypatch):
+    """A syncs, then rewrites f1/f2 (R); B, two days later by the clocks, publishes four full rewrites on top.
+
+    f3 stays in A's first snapshot P, so P survives while R and B's intermediate snapshots are forgotten.
+    """
+    a, b = machine(env, "a", now=late()), machine(env, "b", now=late())
+    a.use(monkeypatch)
+    a.engine.init()
+    for name in ("f1", "f2", "f3"):
+        a.write(f"cfg/{name}.txt", f"{name} v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    a.write("cfg/f1.txt", "f1 v1b\n")
+    a.write("cfg/f2.txt", "f2 v1b\n")
+    a.engine.run({"c": a.model("cfg")})
+    first = a.head()
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    for i in range(2, 6):
+        b.write("cfg/f1.txt", f"f1 v{i}\n")
+        b.write("cfg/f2.txt", f"f2 v{i}\n")
+        b.engine.run({"c": b.model("cfg")})
+    assert first not in _ids(b)  # superseded and forgotten after its grace: the normal life of a snapshot
+    a.use(monkeypatch)
+    return a, b, first
+
+
+def test_an_idle_machine_picks_up_a_remote_that_moved_on_without_a_conflict(env, monkeypatch):
+    a, _b, _first = _idle_scenario(env, monkeypatch)
+    before = _ids(a)
+    report = a.engine.run({"c": a.model("cfg")})
+    assert (a.home / "cfg" / "f1.txt").read_text() == "f1 v5\n"
+    assert (a.home / "cfg" / "f2.txt").read_text() == "f2 v5\n"
+    assert (a.home / "cfg" / "f3.txt").read_text() == "f3 v1\n"
+    assert sorted(report.applied["c"]) == ["home/user/cfg/f1.txt", "home/user/cfg/f2.txt"]
+    assert report.published == {} and report.conflicts == {} and report.deleted == {}
+    assert _ids(a) - before == set()  # nothing was written to the repository
+
+
+def test_an_idle_machine_with_a_local_edit_publishes_it_and_takes_the_remote_changes(env, monkeypatch):
+    a, b, _first = _idle_scenario(env, monkeypatch)
+    a.write("cfg/f3.txt", "f3 from a\n")
+    report = a.engine.run({"c": a.model("cfg")})
+    assert report.published == {"c": ["home/user/cfg/f3.txt"]}
+    assert (a.home / "cfg" / "f1.txt").read_text() == "f1 v5\n"
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    assert (b.home / "cfg" / "f3.txt").read_text() == "f3 from a\n"
+    assert (b.home / "cfg" / "f1.txt").read_text() == "f1 v5\n"
+
+
+def test_a_deletion_made_while_idle_is_published_not_undone(env, monkeypatch):
+    a, b, _first = _idle_scenario(env, monkeypatch)
+    (a.home / "cfg" / "f3.txt").unlink()
+    a.engine.run({"c": a.model("cfg")})
+    assert not (a.home / "cfg" / "f3.txt").exists()
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    assert not (b.home / "cfg" / "f3.txt").exists()
+
+
+def _age_the_record(m: Machine, seconds: float) -> None:
+    st = state_io.load(m.state_file)
+    st.recorded_at = {k: v - seconds for k, v in st.recorded_at.items()}
+    state_io.save(m.state_file, st)
+
+
+def test_a_record_older_than_29_days_with_the_head_gone_conflicts_and_loses_nothing(env, monkeypatch):
+    a, _b, _first = _idle_scenario(env, monkeypatch)
+    _age_the_record(a, 29 * DAY + 60)
+    with pytest.raises(SyncConflictError):
+        a.engine.run({"c": a.model("cfg")})
+    assert (a.home / "cfg" / "f1.txt").read_text() == "f1 v1b\n"  # zero writes
+
+
+def test_a_record_just_under_29_days_old_still_counts_as_superseded(env, monkeypatch):
+    a, _b, _first = _idle_scenario(env, monkeypatch)
+    _age_the_record(a, 29 * DAY - 3600)
+    a.engine.run({"c": a.model("cfg")})
+    assert (a.home / "cfg" / "f1.txt").read_text() == "f1 v5\n"
+
+
+def test_a_state_file_without_recorded_at_takes_the_cautious_path(env, monkeypatch):
+    a, _b, _first = _idle_scenario(env, monkeypatch)
+    st = state_io.load(a.state_file)
+    st.recorded_at = {}
+    state_io.save(a.state_file, st)
+    with pytest.raises(SyncConflictError):
+        a.engine.run({"c": a.model("cfg")})
+
+
+def test_a_single_machine_never_conflicts_with_itself_as_the_chain_loses_its_middle(env, monkeypatch):
+    """Carried files keep the first snapshot alive while the ones after it are forgotten: the head stays the head."""
+    a = machine(env, "a", now=late())
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/keep.txt", "keep\n")
+    a.write("cfg/f2.txt", "w1\n")
+    a.engine.run({"c": a.model("cfg")})
+    first = a.head()
+    for i in range(2, 7):
+        a.write("cfg/f2.txt", f"w{i}\n")
+        a.engine.run({"c": a.model("cfg")})  # a conflict here would raise
+    assert first in _ids(a) and len(_ids(a)) < 6  # the middle was forgotten, the carried-from snapshot stayed
+    assert a.head() != first
+    assert (a.home / "cfg" / "f2.txt").read_text() == "w6\n"
+
+
+def test_a_lost_fork_and_its_parent_outlive_the_machine_that_made_it(env, monkeypatch):
+    clock = Clock(time.time())
+    a, b = _flip(env, monkeypatch, same_path=False, clock=clock)
+    st = state_io.load(a.state_file)
+    x, p = st.heads["c"], st.parents["c"]
+    assert x in _ids(b) and p in _ids(b)  # the loser is not forgotten at once
+    clock.t += 3 * DAY
+    _assert_a_edits_survive(a, b, monkeypatch)
+
+
+def test_a_lost_fork_is_forgotten_only_after_thirty_days(env, monkeypatch):
+    clock = Clock(time.time())
+    a, b = _flip(env, monkeypatch, same_path=False, clock=clock)
+    x = state_io.load(a.state_file).heads["c"]
+    clock.t += LOSER_RETENTION_S - DAY
+    b.use(monkeypatch)
+    b.write("cfg/b_more.txt", "1\n")
+    b.engine.run({"c": b.model("cfg")})
+    assert x in _ids(b)
+    clock.t += 2 * DAY
+    b.write("cfg/b_more.txt", "2\n")
+    b.engine.run({"c": b.model("cfg")})
+    assert x not in _ids(b)
+    assert _referenced(b) <= _ids(b)
+
+
+def test_explicit_prune_keeps_a_young_loser_and_forgets_an_old_one(env, monkeypatch):
+    clock = Clock(time.time())
+    a, b = _flip(env, monkeypatch, same_path=False, clock=clock)
+    x = state_io.load(a.state_file).heads["c"]
+    b.use(monkeypatch)
+    assert x not in b.engine.prune({"c": b.model("cfg")})
+    clock.t += LOSER_RETENTION_S + DAY
+    assert x in b.engine.prune({"c": b.model("cfg")})
+    assert x not in _ids(b)

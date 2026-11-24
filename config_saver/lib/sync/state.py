@@ -20,6 +20,14 @@ class SyncState:
     parents: dict[str, str] = field(default_factory=dict)
     # Epoch seconds of the last successful ``restic prune`` from this machine; None = never (or old file).
     last_prune: float | None = None
+    # Epoch seconds of the last failed ``restic prune`` attempt from a sync run: no retry for a day.
+    last_prune_attempt: float | None = None
+    # cfg -> epoch seconds when this machine last recorded a head for it. A recorded head that has
+    # vanished from the listing is "superseded" (safe) while this is recent, "unknown" once it is old.
+    recorded_at: dict[str, float] = field(default_factory=dict)
+    # cfg -> generation of the recorded head: a head gone from the listing is "superseded" only when the
+    # current head's generation is higher. Absent in old files.
+    gens: dict[str, int] = field(default_factory=dict)
     # Hash cache (an optimisation, never trusted blindly): local path -> stat tuple + fingerprint,
     # and the home directory content normalization used when it was filled. Absent in old files.
     hash_cache: HashCache = field(default_factory=dict)
@@ -31,6 +39,10 @@ def _corrupt(path: str, why: str) -> SyncStateError:
         f"Sync state file '{path}' is unreadable ({why}). Delete it to start over: "
         "the next sync then treats every differing file as a conflict."
     )
+
+
+def _number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
 
 
 def _is_int(value: object) -> bool:
@@ -85,6 +97,15 @@ def load(path: str) -> SyncState:
         last_prune = data.get("last_prune")
         if last_prune is not None and (isinstance(last_prune, bool) or not isinstance(last_prune, int | float)):
             raise TypeError("last_prune must be a number")
+        last_attempt = data.get("last_prune_attempt")
+        if last_attempt is not None and not _number(last_attempt):
+            raise TypeError("last_prune_attempt must be a number")
+        recorded_at = data.get("recorded_at", {})
+        if not isinstance(recorded_at, dict) or not all(_number(v) for v in recorded_at.values()):
+            raise TypeError("recorded_at must map configs to numbers")
+        gens = data.get("gens", {})
+        if not isinstance(gens, dict) or not all(_is_int(v) for v in gens.values()):
+            raise TypeError("gens must map configs to integers")
         cache_home = data.get("hash_cache_home")
         cache = _load_cache(data.get("hash_cache", {}))
         if not isinstance(cache_home, str):
@@ -93,6 +114,9 @@ def load(path: str) -> SyncState:
             hash_cache=cache,
             hash_cache_home=cache_home,
             last_prune=None if last_prune is None else float(last_prune),
+            last_prune_attempt=None if last_attempt is None else float(last_attempt),
+            recorded_at={str(k): float(v) for k, v in recorded_at.items()},
+            gens={str(k): int(v) for k, v in gens.items()},
             parents={str(k): str(v) for k, v in parents.items()},
             heads={str(k): str(v) for k, v in heads.items()},
             base={
@@ -125,6 +149,9 @@ def save(path: str, state: SyncState) -> None:
         "heads": state.heads,
         "parents": state.parents,
         "last_prune": state.last_prune,
+        "last_prune_attempt": state.last_prune_attempt,
+        "recorded_at": state.recorded_at,
+        "gens": state.gens,
         "hash_cache_home": state.hash_cache_home,
         "hash_cache": {
             p: {

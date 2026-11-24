@@ -1,6 +1,5 @@
 import json
-import random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import pytest
 from hypothesis import given
@@ -12,9 +11,11 @@ from config_saver.lib.sync.manifest import (
     SELF,
     Manifest,
     SnapRef,
+    forgettable,
     losers,
     select_head,
     unreferenced,
+    winning_chain,
 )
 
 H = "a" * 64
@@ -159,78 +160,95 @@ def test_mode_bounds_are_inclusive(mode):
     assert parsed.entries["a/f"][0].mode == mode
 
 
-T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+T0 = datetime(2026, 1, 1)
+DAY = timedelta(days=1)
+GRACE = timedelta(hours=24)
+RETENTION = timedelta(days=30)
 
 
 def _t(n: int) -> datetime:
     return T0 + timedelta(seconds=n)
 
 
-def _ref(i: str, parent: str | None, n: int) -> SnapRef:
-    return SnapRef(i, parent, _t(n))
+def _ref(i: str, parent: str | None, n: int, gen: int = 0) -> SnapRef:
+    return SnapRef(i, parent, _t(n), gen)
 
 
 def test_select_head_empty() -> None:
     assert select_head([]) is None
     assert losers([]) == set()
+    assert winning_chain([]) == []
 
 
 def test_select_head_linear_chain_any_order() -> None:
-    snaps = [_ref("c", "b", 3), _ref("a", None, 1), _ref("b", "a", 2)]
+    snaps = [_ref("c", "b", 3, 2), _ref("a", None, 1, 0), _ref("b", "a", 2, 1)]
     assert select_head(snaps) == "c"
     assert losers(snaps) == set()
+    assert winning_chain(snaps) == ["a", "b", "c"]
 
 
 def test_fork_earliest_wins_regardless_of_order() -> None:
     a = _ref("a", None, 1)
-    x = _ref("x", "a", 5)
-    y = _ref("y", "a", 4)
+    x = _ref("x", "a", 5, 1)
+    y = _ref("y", "a", 4, 1)
     assert select_head([a, x, y]) == "y"
     assert select_head([y, x, a]) == "y"
     assert losers([a, x, y]) == {"x"}
+    assert winning_chain([a, x, y]) == ["a", "y"]
 
 
 def test_fork_time_tie_smaller_id_wins() -> None:
     a = _ref("a", None, 1)
-    assert select_head([a, _ref("q", "a", 4), _ref("p", "a", 4)]) == "p"
+    assert select_head([a, _ref("q", "a", 4, 1), _ref("p", "a", 4, 1)]) == "p"
 
 
 def test_losers_descendants_are_losers() -> None:
     snaps = [
-        _ref("a", None, 1),
-        _ref("w", "a", 2),
-        _ref("l", "a", 3),
-        _ref("l2", "l", 4),
-        _ref("l3", "l2", 5),
-        _ref("w2", "w", 9),
+        _ref("a", None, 1, 0),
+        _ref("w", "a", 2, 1),
+        _ref("l", "a", 3, 1),
+        _ref("l2", "l", 4, 2),
+        _ref("l3", "l2", 5, 3),
+        _ref("w2", "w", 9, 2),
     ]
     assert select_head(snaps) == "w2"
     assert losers(snaps) == {"l", "l2", "l3"}
+    assert winning_chain(snaps) == ["a", "w", "w2"]
 
 
 def test_fork_picks_by_time_not_by_descendant_depth() -> None:
-    snaps = [_ref("a", None, 1), _ref("w", "a", 2), _ref("l", "a", 3), _ref("l2", "l", 4)]
+    snaps = [_ref("a", None, 1, 0), _ref("w", "a", 2, 1), _ref("l", "a", 3, 1), _ref("l2", "l", 4, 2)]
     assert select_head(snaps) == "w"
 
 
-def test_unknown_parent_counts_as_root() -> None:
-    assert select_head([_ref("b", "gone", 2)]) == "b"
+def test_a_fork_is_seen_even_when_the_shared_parent_is_forgotten() -> None:
+    snaps = [_ref("w", "gone", 2, 5), _ref("l", "gone", 3, 5), _ref("l2", "l", 4, 6)]
+    assert losers(snaps) == {"l", "l2"}
+    assert select_head(snaps) == "w"  # a deeper loser branch does not win
+
+
+def test_the_highest_generation_wins_across_gaps() -> None:
+    snaps = [_ref("old", None, 1, 0), _ref("new", "forgotten", 9, 7)]
+    assert select_head(snaps) == "new"  # the old referenced root is not the head
+    assert winning_chain(snaps) == ["old", "new"]
+
+
+def test_same_generation_candidates_the_earliest_is_the_head() -> None:
+    snaps = [_ref("p", "x", 5, 3), _ref("q", "y", 4, 3)]
+    assert select_head(snaps) == "q"
+    assert winning_chain(snaps) == ["p", "q"]
 
 
 def test_several_roots_earliest_wins() -> None:
-    snaps = [_ref("r2", None, 2), _ref("r1", None, 1), _ref("c1", "r1", 3), _ref("c2", "r2", 4)]
+    snaps = [_ref("r2", None, 2, 0), _ref("r1", None, 1, 0), _ref("c1", "r1", 3, 1), _ref("c2", "r2", 4, 1)]
     assert select_head(snaps) == "c1"
     assert losers(snaps) == {"r2", "c2"}
+    assert winning_chain(snaps) == ["r1", "c1"]
 
 
-def test_cycle_terminates() -> None:
-    snaps = [_ref("a", "b", 1), _ref("b", "a", 2)]
-    assert select_head(snaps) is None
-    assert losers(snaps) == {"a", "b"}
-
-
-def test_cycle_hanging_off_chain_terminates() -> None:
-    snaps = [_ref("r", None, 1), _ref("a", "r", 2), _ref("b", "a", 3)]
+def test_a_cycle_is_all_losers_or_none_but_terminates() -> None:
+    snaps = [_ref("r", None, 1, 0), _ref("a", "b", 2, 1), _ref("b", "a", 3, 2)]
+    assert losers(snaps) == set()  # a and b are alone in their sibling groups: generations decide
     assert select_head(snaps) == "b"
 
 
@@ -252,42 +270,151 @@ def test_unreferenced_self_resolves_per_head_across_configs() -> None:
 
 
 def test_unreferenced_without_heads_is_everything() -> None:
-    snaps = [_ref("a", None, 1), _ref("b", "a", 2)]
+    snaps = [_ref("a", None, 1), _ref("b", "a", 2, 1)]
     assert unreferenced(snaps, {}) == {"a", "b"}
 
 
+# --------------------------------------------------------------------------- forgettable
+
+LONG_AGO = 400 * 86400  # seconds after T0: everything below is far older than any retention
+
+
+def _forgettable(snaps: list[SnapRef], heads: dict[str, Manifest], days: float) -> set[str]:
+    return forgettable(snaps, heads, T0 + timedelta(days=days), GRACE, RETENTION)
+
+
+def test_forgettable_superseded_unreferenced_candidate_waits_out_the_grace() -> None:
+    snaps = [_ref("a", None, 0, 0), _ref("b", "a", 100, 1), _ref("c", "b", 200, 2)]
+    heads = {"c": _m({"s/x": SELF})}
+    assert _forgettable(snaps, heads, 0.5) == set()
+    assert _forgettable(snaps, heads, 1.5) == {"a", "b"}  # b's successor c is 1.5 days old; a's successor b too
+
+
+def test_forgettable_grace_boundary_is_exclusive_of_the_cutoff() -> None:
+    snaps = [_ref("a", None, 0, 0), _ref("b", "a", 100, 1)]
+    heads = {"b": _m({"s/x": SELF})}
+    just_before = (_t(100) - T0 + GRACE - timedelta(seconds=1)).total_seconds() / 86400
+    exactly = (_t(100) - T0 + GRACE).total_seconds() / 86400
+    after = (_t(100) - T0 + GRACE + timedelta(seconds=1)).total_seconds() / 86400
+    assert _forgettable(snaps, heads, just_before) == set()
+    assert _forgettable(snaps, heads, exactly) == set()
+    assert _forgettable(snaps, heads, after) == {"a"}
+
+
+def test_forgettable_keeps_the_head_and_whatever_it_references() -> None:
+    snaps = [_ref("a", None, 0, 0), _ref("b", "a", 100, 1), _ref("c", "b", 200, 2)]
+    heads = {"c": _m({"s/x": "a", "s/y": SELF})}
+    assert _forgettable(snaps, heads, 50) == {"b"}
+
+
+def test_forgettable_without_the_head_manifest_keeps_the_head_anyway() -> None:
+    snaps = [_ref("a", None, 0, 0), _ref("b", "a", 100, 1)]
+    assert _forgettable(snaps, {}, 50) == {"a"}
+
+
+def test_forgettable_empty() -> None:
+    assert _forgettable([], {}, 50) == set()
+
+
+def _fork() -> list[SnapRef]:
+    """p <- w (wins, t=100) and p <- l (loses, t=200) <- l2; w <- h."""
+    return [
+        _ref("p", None, 0, 0),
+        _ref("w", "p", 100, 1),
+        _ref("l", "p", 200, 1),
+        _ref("l2", "l", 300, 2),
+        _ref("h", "w", 400, 2),
+    ]
+
+
+def test_forgettable_a_young_loser_subtree_stays_with_its_base_and_the_fork_winner() -> None:
+    heads = {"h": _m({"s/x": SELF})}
+    # p is the parent of the retained loser, w is the winner of a fork whose loser is listed
+    assert _forgettable(_fork(), heads, 29) == set()
+
+
+def test_forgettable_an_old_loser_subtree_goes_as_one_unit() -> None:
+    heads = {"h": _m({"s/x": SELF})}
+    days = 30 + 200 / 86400 + 1e-3
+    gone = _forgettable(_fork(), heads, days)
+    assert {"l", "l2"} <= gone
+    exactly = _forgettable(_fork(), heads, 30 + 200 / 86400)
+    assert {"l", "l2"}.isdisjoint(exactly)  # the loser is exactly thirty days old: not older
+
+
+def test_forgettable_the_unit_stays_whole_when_a_head_references_a_member() -> None:
+    heads = {"h": _m({"s/x": SELF, "s/y": "l2"})}
+    assert {"l", "l2"}.isdisjoint(_forgettable(_fork(), heads, 100))
+
+
+def test_forgettable_a_fork_winner_is_released_once_its_loser_is_gone() -> None:
+    heads = {"h": _m({"s/x": SELF})}
+    remaining = [s for s in _fork() if s.id not in {"l", "l2"}]
+    assert "w" in _forgettable(remaining, heads, 100)
+    assert "p" in _forgettable(remaining, heads, 100)
+
+
+def test_forgettable_keeps_the_nearest_candidate_above_a_nested_loser() -> None:
+    snaps = [
+        _ref("p", None, 0, 0),
+        _ref("w", "p", 100, 1),
+        _ref("l", "p", 200, 1),
+        _ref("m", "l", 300, 2),
+        _ref("n", "l", 310, 2),  # loses to m inside l's subtree
+        _ref("h", "w", 400, 2),
+    ]
+    heads = {"h": _m({"s/x": SELF})}
+    kept_p = _forgettable(snaps, heads, 29)
+    assert "p" not in kept_p and "w" not in kept_p
+    assert _forgettable(snaps, heads, 31) >= {"l", "m", "n"}
+
+
 @st.composite
-def _forests(draw: st.DrawFn) -> list[SnapRef]:
-    n = draw(st.integers(0, 10))
-    refs: list[SnapRef] = []
+def _histories(draw: st.DrawFn) -> list[SnapRef]:
+    """The full DAG of what several machines published: stale views fork it, clock skew reorders siblings."""
+    n = draw(st.integers(1, 14))
+    snaps: list[SnapRef] = []
     for i in range(n):
-        parent = draw(st.one_of(st.none(), st.integers(0, max(i - 1, 0)))) if i else None
-        refs.append(SnapRef(f"{i:02d}", None if parent is None else f"{parent:02d}", _t(draw(st.integers(0, 3)))))
-    return refs
+        if snaps and draw(st.integers(0, 9)) > 0:
+            parent = draw(st.sampled_from(snaps))
+            parent_id, gen = parent.id, parent.gen + 1
+        else:
+            parent_id, gen = None, 0
+        when = i * 3600 + draw(st.integers(-7200, 7200))
+        snaps.append(SnapRef(f"{i:03d}", parent_id, _t(when), gen))
+    return snaps
 
 
-@given(_forests(), st.randoms())
-def test_select_head_invariant_under_permutation(snaps: list[SnapRef], rnd: random.Random) -> None:
-    shuffled = list(snaps)
-    rnd.shuffle(shuffled)
-    assert select_head(shuffled) == select_head(snaps)
-    assert losers(shuffled) == losers(snaps)
+def _reference_head(snaps: list[SnapRef]) -> str:
+    """The parent-walk rule on a complete history: from the roots, the earliest child at every fork."""
+    children: dict[str | None, list[SnapRef]] = {}
+    for s in snaps:
+        children.setdefault(s.parent, []).append(s)
+    level = children[None]
+    head = ""
+    while level:
+        winner = min(level, key=lambda s: (s.time, s.id))
+        head = winner.id
+        level = children.get(winner.id, [])
+    return head
 
 
-@given(_forests(), st.randoms())
-def test_head_is_never_a_loser(snaps: list[SnapRef], rnd: random.Random) -> None:
-    head = select_head(snaps)
-    assert (head is None) == (not snaps)
-    if head is not None:
-        assert head not in losers(snaps)
-        assert head in {s.id for s in snaps}
-
-
-@given(_forests(), st.lists(st.integers(0, 12), max_size=6))
-def test_unreferenced_disjoint_from_heads_and_referenced(snaps: list[SnapRef], refs: list[int]) -> None:
-    head = select_head(snaps)
-    manifest = _m({f"s/{k}": f"{r:02d}" for k, r in enumerate(refs)})
-    result = unreferenced(snaps, {} if head is None else {head: manifest})
-    assert result.isdisjoint({f"{r:02d}" for r in refs})
-    assert head not in result
-    assert result == {s.id for s in snaps} - {head} - {f"{r:02d}" for r in refs}
+@given(_histories(), st.data())
+def test_head_survives_any_amount_of_forgetting(history: list[SnapRef], data: st.DataObject) -> None:
+    expected = _reference_head(history)
+    assert select_head(history) == expected  # generations agree with the parent walk on a full history
+    ids = [s.id for s in history]
+    remaining = list(history)
+    day = data.draw(st.floats(0, 120))
+    for _round in range(3):
+        head = select_head(remaining)
+        assert head == expected
+        referenced = data.draw(st.lists(st.sampled_from([s.id for s in remaining]), max_size=4))
+        manifest = _m({f"s/{k}": r for k, r in enumerate(referenced)} | {"s/self": SELF})
+        gone = forgettable(remaining, {expected: manifest}, T0 + timedelta(days=day), GRACE, RETENTION)
+        assert expected not in gone
+        assert gone.isdisjoint(referenced)
+        remaining = [s for s in remaining if s.id not in gone]
+        assert select_head(remaining) == expected
+        day += data.draw(st.floats(0, 60))
+    assert {s.id for s in remaining} <= set(ids)

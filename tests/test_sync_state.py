@@ -195,3 +195,47 @@ def test_non_string_cache_home_is_dropped(tmp_path):
     p = tmp_path / "s.json"
     p.write_text(json.dumps({"heads": {}, "base": {}, "hash_cache": {}, "hash_cache_home": 5}))
     assert load(str(p)).hash_cache_home is None
+
+
+def test_recorded_at_round_trip_and_old_files_load_empty(tmp_path):
+    path = str(tmp_path / "s.json")
+    save(path, SyncState(heads={"c": "h"}, base={"c": {}}, recorded_at={"c": 1700000000.5}))
+    assert load(path).recorded_at == {"c": 1700000000.5}
+    assert json.loads(pathlib.Path(path).read_text())["recorded_at"] == {"c": 1700000000.5}
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"heads": {"c": "h"}, "base": {"c": {}}}))
+    assert load(str(old)).recorded_at == {}
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"heads": {}, "base": {}, "recorded_at": {"c": "yesterday"}}))
+    with pytest.raises(SyncStateError):
+        load(str(bad))
+    bad.write_text(json.dumps({"heads": {}, "base": {}, "recorded_at": [1]}))
+    with pytest.raises(SyncStateError):
+        load(str(bad))
+
+
+def test_last_prune_attempt_round_trip_and_old_files_load_as_none(tmp_path):
+    path = str(tmp_path / "s.json")
+    save(path, SyncState(heads={}, base={}, last_prune_attempt=99.5))
+    assert load(path).last_prune_attempt == 99.5
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"heads": {}, "base": {}}))
+    assert load(str(old)).last_prune_attempt is None
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"heads": {}, "base": {}, "last_prune_attempt": "x"}))
+    with pytest.raises(SyncStateError):
+        load(str(bad))
+
+
+def test_gens_round_trip_and_old_files_load_empty(tmp_path):
+    path = str(tmp_path / "s.json")
+    save(path, SyncState(heads={"c": "h"}, base={"c": {}}, gens={"c": 7}))
+    assert load(path).gens == {"c": 7}
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"heads": {}, "base": {}}))
+    assert load(str(old)).gens == {}
+    for bad_value in ({"c": "1"}, {"c": True}, [1]):
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps({"heads": {}, "base": {}, "gens": bad_value}))
+        with pytest.raises(SyncStateError):
+            load(str(bad))

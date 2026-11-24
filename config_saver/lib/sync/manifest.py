@@ -10,7 +10,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from config_saver.lib.errors import ArchiveError
@@ -114,51 +114,70 @@ class Manifest:
 
 @dataclass(frozen=True)
 class SnapRef:
-    """One sync snapshot of a single config: its id, the parent it names, its time."""
+    """One sync snapshot of a single config: its id, the parent it names, its time and generation.
+
+    ``gen`` is 0 for a root and the parent's ``gen + 1`` otherwise (the ``gen:`` tag): it keeps ordering
+    snapshots meaningful after forgetting has removed links from the middle of the chain.
+    """
 
     id: str
     parent: str | None
     time: datetime
+    gen: int
 
 
-def _winning_chain(snaps: list[SnapRef]) -> list[str]:
-    """Root-to-head ids; at every fork the earliest `(time, id)` child wins.
+def _order(snap: SnapRef) -> tuple[datetime, str]:
+    return (snap.time, snap.id)
 
-    A snapshot whose parent is not listed is a root; several roots compete like
-    siblings. Every machine holding the same snapshots computes the same chain.
-    """
-    ids = {s.id for s in snaps}
-    children: dict[str | None, list[SnapRef]] = {}
+
+def _fork_losers(snaps: list[SnapRef]) -> set[str]:
+    """Siblings share a parent tag (listed or not); in each group only the earliest `(time, id)` wins."""
+    groups: dict[str | None, list[SnapRef]] = {}
     for snap in snaps:
-        key = snap.parent if snap.parent in ids else None
-        children.setdefault(key, []).append(snap)
-    chain: list[str] = []
-    seen: set[str] = set()
-    level = children.get(None, [])
-    while level:
-        winner = min(level, key=lambda s: (s.time, s.id))
-        if winner.id in seen:  # restic cannot make a cycle; never loop on one
-            break
-        seen.add(winner.id)
-        chain.append(winner.id)
-        level = children.get(winner.id, [])
-    return chain
+        groups.setdefault(snap.parent, []).append(snap)
+    out: set[str] = set()
+    for group in groups.values():
+        winner = min(group, key=_order)
+        out |= {s.id for s in group if s.id != winner.id}
+    return out
+
+
+def _subtrees(snaps: list[SnapRef], roots: set[str]) -> set[str]:
+    """``roots`` plus every listed snapshot whose chain of listed parents reaches one of them."""
+    children: dict[str | None, list[str]] = {}
+    for snap in snaps:
+        children.setdefault(snap.parent, []).append(snap.id)
+    out: set[str] = set()
+    stack = list(roots)
+    while stack:
+        current = stack.pop()
+        if current not in out:
+            out.add(current)
+            stack.extend(children.get(current, []))
+    return out
 
 
 def winning_chain(snaps: list[SnapRef]) -> list[str]:
-    """Root-to-head ids of the winning chain (public face of the fork rule)."""
-    return _winning_chain(snaps)
+    """The candidates (everything not a loser) by ascending generation; the head comes last.
+
+    It may have gaps (forgotten snapshots): that is fine, generations still order it. Among candidates of
+    one generation the earliest `(time, id)` comes last, so it is the head when that generation is the top.
+    """
+    lost = losers(snaps)
+    candidates = sorted((s for s in snaps if s.id not in lost), key=_order, reverse=True)
+    candidates.sort(key=lambda s: s.gen)  # stable: keeps the reversed (time, id) order inside a generation
+    return [s.id for s in candidates]
 
 
 def select_head(snaps: list[SnapRef]) -> str | None:
-    """Head of one config's snapshot chain, or None when there are none."""
-    chain = _winning_chain(snaps)
+    """Head of one config's snapshots: the candidate of the highest generation, or None when there are none."""
+    chain = winning_chain(snaps)
     return chain[-1] if chain else None
 
 
 def losers(snaps: list[SnapRef]) -> set[str]:
-    """Ids of snapshots that are not on the winning chain."""
-    return {s.id for s in snaps} - set(_winning_chain(snaps))
+    """Ids of fork losers and of everything listed below them."""
+    return _subtrees(snaps, _fork_losers(snaps))
 
 
 def unreferenced(snaps: list[SnapRef], heads: Mapping[str, Manifest]) -> set[str]:
@@ -171,3 +190,50 @@ def unreferenced(snaps: list[SnapRef], heads: Mapping[str, Manifest]) -> set[str
     for head_id, manifest in heads.items():
         keep.update(snap for _, snap in manifest.resolve(head_id).entries.values())
     return {s.id for s in snaps} - keep
+
+
+def forgettable(
+    snaps: list[SnapRef], heads: Mapping[str, Manifest], now: datetime, grace: timedelta, retention: timedelta
+) -> set[str]:
+    """Ids of one config's snapshots that may be forgotten without changing what `select_head` answers.
+
+    * A superseded candidate nothing references goes once the next generation's snapshot is older than
+      ``grace`` (a slower machine may still publish on top of it).
+    * A fork loser and everything below it go together, once the loser is older than ``retention``; a
+      unit a head manifest references stays whole. Younger ones stay, with the nearest candidate above
+      them (the base a machine away for weeks needs) .
+    * A fork winner stays while a losing sibling is listed: that sibling is the evidence of the fork.
+    * Heads, and anything a head manifest references, never go.
+    """
+    by_id = {s.id: s for s in snaps}
+    forks = _fork_losers(snaps)
+    lost = _subtrees(snaps, forks)
+    kept = set(by_id) - unreferenced(snaps, heads)
+    head = select_head(snaps)
+    if head is not None:
+        kept.add(head)
+    old = {i for i in forks if by_id[i].time < now - retention}
+    doomed: set[str] = set()
+    for root in old:
+        unit = _subtrees(snaps, {root})
+        if unit.isdisjoint(kept):
+            doomed |= unit
+    protected = set(kept)
+    for root in forks - doomed:
+        ancestor = by_id[root].parent
+        while ancestor in by_id and ancestor in lost:
+            ancestor = by_id[ancestor].parent
+        if ancestor in by_id:
+            protected.add(ancestor)
+    groups: dict[str | None, list[SnapRef]] = {}
+    for snap in snaps:
+        groups.setdefault(snap.parent, []).append(snap)
+    for group in groups.values():
+        if len(group) > 1:
+            protected.add(min(group, key=_order).id)
+    chain = [by_id[i] for i in winning_chain(snaps)]
+    for index, snap in enumerate(chain):
+        successor = next((later for later in chain[index + 1 :] if later.gen > snap.gen), None)
+        if successor is not None and successor.time < now - grace and snap.id not in protected:
+            doomed.add(snap.id)
+    return doomed

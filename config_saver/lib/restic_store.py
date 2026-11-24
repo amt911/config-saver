@@ -40,6 +40,7 @@ CFG_TAG_PREFIX = "cfg:"
 DESC_TAG_PREFIX = "desc:"
 SYNC_TAG = "sync"
 PARENT_TAG_PREFIX = "parent:"
+GEN_TAG_PREFIX = "gen:"
 HOST_TAG_PREFIX = "host:"
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 _PRIVATE_FILE = 0o600

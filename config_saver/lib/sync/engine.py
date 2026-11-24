@@ -32,6 +32,7 @@ from config_saver.lib.errors import (
 from config_saver.lib.models.model import Model
 from config_saver.lib.restic_store import (
     DEFAULT_IDENTITY,
+    GEN_TAG_PREFIX,
     HOST_TAG_PREFIX,
     PARENT_TAG_PREFIX,
     SYNC_TAG,
@@ -45,10 +46,9 @@ from config_saver.lib.sync.manifest import (
     SELF,
     Manifest,
     SnapRef,
+    forgettable,
     losers,
     select_head,
-    unreferenced,
-    winning_chain,
 )
 from config_saver.lib.sync.remote import SyncRemote
 from config_saver.lib.sync.scan import LocalScope, scan
@@ -64,6 +64,13 @@ PRUNE_INTERVAL = 7 * 24 * 3600.0
 # A superseded snapshot is kept until its successor is this old: a slower machine that analysed before
 # the successor existed may still publish on top of it, and that publish would name the forgotten one.
 SUPERSEDE_GRACE = timedelta(hours=24)
+# A snapshot that lost a fork is kept this long (with the ancestors that lead back to the winning chain):
+# the machine that recorded it as its head may be away for weeks and still needs its base.
+LOSER_RETENTION = timedelta(days=30)
+# A recorded head missing from the listing is believed "superseded" (forgotten after its grace) for this
+# long after the machine last recorded it; a lost fork is retained for LOSER_RETENTION, so after
+# LOSER_RETENTION - SUPERSEDE_GRACE the absence can no longer be told apart from a forgotten fork.
+_RECORD_TRUST = LOSER_RETENTION - SUPERSEDE_GRACE
 
 
 @dataclass
@@ -120,7 +127,8 @@ class _Listing:
         for s in self.snapshots:
             if s.cfg == cfg and s.canonical not in seen:
                 seen.add(s.canonical)
-                out.append(SnapRef(s.canonical, _parent_of(s), s.time))
+                out.append(_ref_of(s))
+        _check_generations(out, cfg)
         return out
 
     def ids_of(self, canonical: str) -> list[str]:
@@ -138,6 +146,27 @@ def _parent_of(snapshot: Snapshot) -> str | None:
             value = tag[len(PARENT_TAG_PREFIX) :]
             return None if value == _NO_PARENT else value
     return None
+
+
+def _ref_of(snapshot: Snapshot) -> SnapRef:
+    """The sync view of a snapshot; one without a valid ``gen:`` tag is not something this version made."""
+    for tag in snapshot.tags:
+        if tag.startswith(GEN_TAG_PREFIX):
+            value = tag[len(GEN_TAG_PREFIX) :]
+            if value.isascii() and value.isdigit():
+                return SnapRef(snapshot.canonical, _parent_of(snapshot), snapshot.time, int(value))
+    raise SyncStateError(f"sync snapshot {snapshot.canonical} of {snapshot.cfg} has no valid {GEN_TAG_PREFIX} tag")
+
+
+def _check_generations(refs: list[SnapRef], cfg: str) -> None:
+    """A snapshot is always younger than its listed parent: anything else is a cycle or a forged history."""
+    by_id = {s.id: s for s in refs}
+    for snap in refs:
+        parent = by_id.get(snap.parent) if snap.parent else None
+        if parent is not None and parent.gen >= snap.gen:
+            raise SyncStateError(
+                f"the sync history of {cfg} is inconsistent (snapshot {snap.id} is not newer than its parent)"
+            )
 
 
 _T = TypeVar("_T")
@@ -293,6 +322,8 @@ class SyncEngine:
                 state.parents.pop(c.name, None)
             else:  # the base now describes this head: later analyses must not re-derive it from the fork
                 state.heads[c.name] = c.head
+                state.recorded_at[c.name] = self.now()
+                state.gens[c.name] = self._head_gen(c)
                 state.parents[c.name] = c.head_parent or ""
         return self._run(configs, state)  # in memory only: saved if the run succeeds
 
@@ -323,6 +354,8 @@ class SyncEngine:
                     head = new_ids.get(c.name, c.head)
                     if head is not None:
                         state.heads[c.name] = head
+                        state.recorded_at[c.name] = self.now()
+                        state.gens[c.name] = self._head_gen(c) + (1 if c.name in new_ids else 0)
                         state.parents[c.name] = (c.head if c.name in new_ids else c.head_parent) or ""
                     if c.name in new_ids:
                         _extend(total.published, c.name, sorted(publish))
@@ -343,14 +376,6 @@ class SyncEngine:
         elapsed = self.now() - last
         return elapsed < 0 or elapsed >= PRUNE_INTERVAL
 
-    def _settled(self, snaps: list[SnapRef], ids: set[str]) -> set[str]:
-        """The ``ids`` whose successor on the winning chain is older than the grace period."""
-        cutoff = datetime.fromtimestamp(self.now()) - SUPERSEDE_GRACE
-        chain = winning_chain(snaps)
-        by_id = {s.id: s for s in snaps}
-        successor = {a: by_id[b] for a, b in zip(chain, chain[1:], strict=False)}
-        return {i for i in ids if i in successor and successor[i].time < cutoff}
-
     def _forget(
         self, cfgs: dict[str, _Cfg], published: _Published | None, listing: dict[str, list[SnapRef]]
     ) -> list[str]:
@@ -369,7 +394,7 @@ class SyncEngine:
             if select_head(snaps) != head:
                 continue
             known = {head: manifest} if head and manifest else {}
-            doomed |= self._settled(snaps, unreferenced(snaps, known)) | losers(snaps)
+            doomed |= forgettable(snaps, known, datetime.fromtimestamp(self.now()), SUPERSEDE_GRACE, LOSER_RETENTION)
         ids = sorted(doomed)
         self.store.forget_ids([actual for i in ids for actual in self._restic_ids(i)])
         return ids
@@ -385,7 +410,12 @@ class SyncEngine:
             manifest = self._manifest(c, side, publish)
             only = set(publish)
             compressor = TarCompressor(c.model)
-            tags = [SYNC_TAG, f"{PARENT_TAG_PREFIX}{c.head or _NO_PARENT}", f"{HOST_TAG_PREFIX}{self.host}"]
+            tags = [
+                SYNC_TAG,
+                f"{PARENT_TAG_PREFIX}{c.head or _NO_PARENT}",
+                f"{GEN_TAG_PREFIX}{self._head_gen(c) + 1}",
+                f"{HOST_TAG_PREFIX}{self.host}",
+            ]
             snapshot, _, _ = self.store.backup(
                 self._writer(compressor, only, manifest), c.name, datetime.now(), None, extra_tags=tags
             )
@@ -411,6 +441,11 @@ class SyncEngine:
         # Only the losers: a snapshot of another cfg that won may already have another machine on top of it.
         self.store.forget_ids([i for name, i in created.items() if i in losers(by_cfg.get(name, []))])
         return None
+
+    @staticmethod
+    def _head_gen(c: _Cfg) -> int:
+        """Generation of the head this run built on; -1 when there is none (the next snapshot is a root: 0)."""
+        return next((s.gen for s in c.snaps if s.id == c.head), -1)
 
     @staticmethod
     def _writer(compressor: TarCompressor, only: set[str], manifest: Manifest) -> Callable[[IO[bytes]], CompressResult]:
@@ -446,7 +481,9 @@ class SyncEngine:
             if s.canonical in seen:  # the same snapshot copied twice into one repository
                 continue
             seen.add(s.canonical)
-            by_cfg.setdefault(s.cfg, []).append(SnapRef(s.canonical, _parent_of(s), s.time))
+            by_cfg.setdefault(s.cfg, []).append(_ref_of(s))
+        for name, refs in by_cfg.items():
+            _check_generations(refs, name)
         self._actual = actual
         return by_cfg
 
@@ -470,18 +507,31 @@ class SyncEngine:
         on_chain = set(listed) - lost
         if rec in on_chain:
             return recorded
-        if rec not in listed and any(s.parent == rec for s in snaps if s.id in on_chain):
-            return recorded  # pruned after the winning chain was built on top of it
+        if rec not in listed and self._superseded(name, state, snaps):
+            return recorded
         ancestor: str | None = state.parents.get(name) or None
-        while ancestor is not None and ancestor not in on_chain:
+        visited: set[str] = set()
+        while ancestor is not None and ancestor not in on_chain and ancestor not in visited:
+            visited.add(ancestor)
             ancestor = listed[ancestor].parent if ancestor in listed else None
-        return self._read_manifest(ancestor, name).side() if ancestor else {}
+        return self._read_manifest(ancestor, name).side() if ancestor in on_chain else {}
+
+    def _superseded(self, name: str, state: SyncState, snaps: list[SnapRef]) -> bool:
+        """Is the recorded head, gone from the listing, certainly an old head that was forgotten after being replaced?
+
+        Only if the head now is of a higher generation (the history moved on past it) and the record is
+        recent enough that a fork the head lost would still be listed (see ``LOSER_RETENTION``).
+        """
+        head = select_head(snaps)
+        gen, at = state.gens.get(name), state.recorded_at.get(name)
+        if head is None or gen is None or at is None:
+            return False
+        head_gen = next(s.gen for s in snaps if s.id == head)
+        return head_gen > gen and self.now() - at < _RECORD_TRUST.total_seconds()
 
     def _analyse_one(self, name: str, model: Model, state: SyncState, snaps: list[SnapRef], seen: set[str]) -> _Cfg:
         scope, local, _total = scan(model, state.hash_cache, seen)
         head = select_head(snaps)
-        if snaps and head is None:
-            raise SyncStateError(f"the sync history of {name} has no usable head (a snapshot cycle?)")
         base = self._effective_base(name, state, snaps)
         head_parent = next((s.parent for s in snaps if s.id == head), None)
         remote = self._read_manifest(head, name) if head else None
