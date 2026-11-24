@@ -850,7 +850,8 @@ through a restic repository that you host anywhere restic can reach: an rclone r
 Proton Drive, ...), SFTP, or a plain path on a mounted disk. The store is a separate encrypted
 restic repository, built the same way as the backup store (see
 [Deduplicated storage](#deduplicated-storage-restic)); the backup store is not touched. The remote
-only ever sees ciphertext. Needs `restic` and `age`, plus `rclone` only for `rclone:` URLs.
+only ever sees ciphertext. Needs `restic` 0.17 or newer (it tells a missing repository apart by its
+exit code 10) and `age`, plus `rclone` only for `rclone:` URLs.
 
 **What syncs.** Only the YAMLs marked `sync: true`. KDE and other per-machine configurations stay
 local: leave them unmarked.
