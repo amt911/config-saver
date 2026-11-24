@@ -16,10 +16,9 @@ from typing import NoReturn
 from config_saver.lib import paths
 from config_saver.lib.errors import SyncSystemConfigError, SyncTooLargeError, SyncUnreadableError
 from config_saver.lib.models.model import Model
-from config_saver.lib.sync.classify import Fingerprint, Side
+from config_saver.lib.sync.classify import CacheEntry, Fingerprint, HashCache, Side
 from config_saver.lib.tar_compressor.tar_compressor import TarCompressor
 
-MAX_SYNC_BYTES = 50 * 1024 * 1024
 _CHUNK = 256 * 1024
 
 
@@ -90,18 +89,23 @@ def _fingerprint(compressor: TarCompressor, path: str, problems: list[str]) -> t
         return None
 
 
-def _too_large(total: int, scope: LocalScope) -> NoReturn:
+def _too_large(total: int, scope: LocalScope, limit_mb: int) -> NoReturn:
     raise SyncTooLargeError(
-        f"sync configuration too large: {total} bytes over the 50 MiB limit (roots: {sorted(scope.roots)})"
+        f"sync configuration too large: {total} bytes over the {limit_mb} MiB limit (roots: {sorted(scope.roots)})"
     )
 
 
-def scan(model: Model) -> tuple[LocalScope, Side, int]:
+def scan(model: Model, cache: HashCache | None = None, seen: set[str] | None = None) -> tuple[LocalScope, Side, int]:
     """Return ``(scope, fingerprints, total_bytes)`` for a sync-enabled model.
 
     Only regular files and symlinks are fingerprinted; symlinks are not followed.
-    Raises SyncTooLargeError past 50 MiB of regular-file content.
+    Raises SyncTooLargeError past ``model.sync_max_mb`` MiB of regular-file content.
+
+    ``cache`` (updated in place) skips re-hashing a file whose size, mtime_ns, ctime_ns, inode
+    and ``normalize_content`` all match the entry. Entries for paths this scan did not see are
+    dropped, unless the caller passes ``seen`` to collect them across several scans and prune itself.
     """
+    limit = model.sync_max_mb * 1024 * 1024
     compressor = TarCompressor(model)
     root_paths = {arcname: path for path, arcname in compressor.declared_paths()}
     scope = LocalScope(frozenset(root_paths), root_paths, compressor.is_excluded)
@@ -117,6 +121,7 @@ def scan(model: Model) -> tuple[LocalScope, Side, int]:
     problems: list[str] = []
     fingerprints: Side = {}
     total = 0
+    visited: set[str] = set()
     for path, arcname in compressor.iter_files(problems):
         # Refuse on the size alone, before reading a huge file.
         try:
@@ -126,15 +131,33 @@ def scan(model: Model) -> tuple[LocalScope, Side, int]:
         except OSError as exc:
             problems.append(f"{path} ({exc.strerror or exc})")
             continue
-        if stat.S_ISREG(declared.st_mode) and total + declared.st_size > MAX_SYNC_BYTES:
-            _too_large(total + declared.st_size, scope)
-        found = _fingerprint(compressor, path, problems)
-        if found is None:
-            continue
-        fingerprint, size = found
+        if stat.S_ISREG(declared.st_mode) and total + declared.st_size > limit:
+            _too_large(total + declared.st_size, scope, model.sync_max_mb)
+        hit = cache.get(path) if cache is not None else None
+        if (
+            hit is not None
+            and hit.size == declared.st_size
+            and hit.mtime_ns == declared.st_mtime_ns
+            and hit.ctime_ns == declared.st_ctime_ns
+            and hit.inode == declared.st_ino
+            and hit.normalize_content == model.normalize_content
+        ):
+            fingerprint, size = hit.fingerprint, (declared.st_size if stat.S_ISREG(declared.st_mode) else 0)
+        else:
+            found = _fingerprint(compressor, path, problems)
+            if found is None:
+                continue
+            fingerprint, size = found
+            if cache is not None:
+                # The stat is from before the read: a write racing the hash makes the next scan miss.
+                cache[path] = CacheEntry(
+                    declared.st_size, declared.st_mtime_ns, declared.st_ctime_ns, declared.st_ino,
+                    model.normalize_content, fingerprint,
+                )  # fmt: skip
+        visited.add(path)
         total += size
-        if total > MAX_SYNC_BYTES:
-            _too_large(total, scope)
+        if total > limit:
+            _too_large(total, scope, model.sync_max_mb)
         fingerprints[arcname] = fingerprint
     if problems:
         raise SyncUnreadableError(
@@ -142,4 +165,10 @@ def scan(model: Model) -> tuple[LocalScope, Side, int]:
             "would delete them on every other machine. Fix their permissions or ownership: "
             + "; ".join(sorted(problems))
         )
+    if cache is not None:
+        if seen is None:
+            for stale in set(cache) - visited:
+                del cache[stale]
+        else:
+            seen |= visited
     return scope, fingerprints, total

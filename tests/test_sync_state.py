@@ -96,3 +96,102 @@ def test_last_prune_round_trip_and_old_files_load_as_none(tmp_path):
     bad.write_text(json.dumps({"heads": {}, "base": {}, "last_prune": "yesterday"}))
     with pytest.raises(SyncStateError):
         load(str(bad))
+
+
+def _cache_entry(**kw):
+    from config_saver.lib.sync.classify import CacheEntry
+
+    base = {
+        "size": 4,
+        "mtime_ns": 5,
+        "ctime_ns": 6,
+        "inode": 7,
+        "normalize_content": False,
+        "fingerprint": Fingerprint("h", 0o644),
+    }
+    return CacheEntry(**{**base, **kw})
+
+
+def test_hash_cache_round_trip(tmp_path):
+    path = str(tmp_path / "s.json")
+    state = SyncState(
+        hash_cache={"/h/a": _cache_entry(), "/h/l": _cache_entry(fingerprint=Fingerprint("t", 0o777, "tg"))},
+        hash_cache_home="/h",
+    )
+    save(path, state)
+    assert load(path) == state
+
+
+def test_old_state_file_has_an_empty_cache(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"heads": {}, "base": {}}))
+    s = load(str(p))
+    assert s.hash_cache == {} and s.hash_cache_home is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        [],
+        {"/a": []},
+        {
+            "/a": {
+                "size": "4",
+                "mtime_ns": 5,
+                "ctime_ns": 6,
+                "inode": 7,
+                "normalize_content": False,
+                "sha256": "h",
+                "mode": 1,
+            }
+        },
+        {
+            "/a": {
+                "size": True,
+                "mtime_ns": 5,
+                "ctime_ns": 6,
+                "inode": 7,
+                "normalize_content": False,
+                "sha256": "h",
+                "mode": 1,
+            }
+        },
+        {"/a": {"size": 4, "mtime_ns": 5, "ctime_ns": 6, "inode": 7, "normalize_content": 0, "sha256": "h", "mode": 1}},
+        {
+            "/a": {
+                "size": 4,
+                "mtime_ns": 5,
+                "ctime_ns": 6,
+                "inode": 7,
+                "normalize_content": False,
+                "sha256": 3,
+                "mode": 1,
+            }
+        },
+        {"/a": {"size": 4, "mtime_ns": 5, "ctime_ns": 6, "inode": 7, "normalize_content": False, "sha256": "h"}},
+        {
+            "/a": {
+                "size": 4,
+                "mtime_ns": 5,
+                "ctime_ns": 6,
+                "inode": 7,
+                "normalize_content": False,
+                "sha256": "h",
+                "mode": 1,
+                "link": 9,
+            }
+        },
+    ],
+)
+def test_malformed_cache_is_dropped_not_fatal(tmp_path, bad):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"heads": {"c": "x"}, "base": {}, "hash_cache": bad, "hash_cache_home": "/h"}))
+    s = load(str(p))
+    assert s.hash_cache == {}
+    assert s.heads == {"c": "x"}
+
+
+def test_non_string_cache_home_is_dropped(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"heads": {}, "base": {}, "hash_cache": {}, "hash_cache_home": 5}))
+    assert load(str(p)).hash_cache_home is None

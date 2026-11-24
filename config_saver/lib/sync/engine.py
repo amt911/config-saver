@@ -325,8 +325,15 @@ class SyncEngine:
         all_snaps = self.store.snapshots(tag=SYNC_TAG)
         by_cfg = self._by_cfg(all_snaps)
         cfgs: dict[str, _Cfg] = {}
+        home = os.path.expanduser("~")
+        if state.hash_cache_home != home:  # content normalization depends on it: start the cache over
+            state.hash_cache = {}
+            state.hash_cache_home = home
+        seen: set[str] = set()
         for name in sorted(n for n, m in configs.items() if m.sync):
-            cfgs[name] = self._analyse_one(name, configs[name], state, by_cfg.get(name, []))
+            cfgs[name] = self._analyse_one(name, configs[name], state, by_cfg.get(name, []), seen)
+        for stale in set(state.hash_cache) - seen:
+            del state.hash_cache[stale]
         return cfgs, sorted(set(by_cfg) - set(cfgs))
 
     @staticmethod
@@ -360,8 +367,8 @@ class SyncEngine:
             ancestor = listed[ancestor].parent if ancestor in listed else None
         return self._read_manifest(ancestor, name).side() if ancestor else {}
 
-    def _analyse_one(self, name: str, model: Model, state: SyncState, snaps: list[SnapRef]) -> _Cfg:
-        scope, local, _total = scan(model)
+    def _analyse_one(self, name: str, model: Model, state: SyncState, snaps: list[SnapRef], seen: set[str]) -> _Cfg:
+        scope, local, _total = scan(model, state.hash_cache, seen)
         head = select_head(snaps)
         if snaps and head is None:
             raise SyncStateError(f"the sync history of {name} has no usable head (a snapshot cycle?)")

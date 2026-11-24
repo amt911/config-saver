@@ -51,23 +51,17 @@ def test_symlink_fingerprint_uses_target_and_permission_bits(sample_tree: Path, 
     assert total == sum(p.stat().st_size for p in sample_tree.rglob("*") if p.is_file() and not p.is_symlink())
 
 
-def test_too_large_raises(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import config_saver.lib.sync.scan as mod
-
-    monkeypatch.setattr(mod, "MAX_SYNC_BYTES", 10)
+def test_too_large_raises(fake_home: Path) -> None:
     f = fake_home / "big"
-    f.write_bytes(b"x" * 11)
+    f.write_bytes(b"x" * (1024 * 1024 + 1))
     with pytest.raises(SyncTooLargeError, match="too large"):
-        scan(make_model([str(f)]))
+        scan(make_model([str(f)], sync_max_mb=1))
 
 
-def test_exactly_at_limit_is_allowed(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import config_saver.lib.sync.scan as mod
-
-    monkeypatch.setattr(mod, "MAX_SYNC_BYTES", 10)
+def test_exactly_at_limit_is_allowed(fake_home: Path) -> None:
     f = fake_home / "ok"
-    f.write_bytes(b"x" * 10)
-    assert scan(make_model([str(f)]))[2] == 10
+    f.write_bytes(b"x" * (1024 * 1024))
+    assert scan(make_model([str(f)], sync_max_mb=1))[2] == 1024 * 1024
 
 
 # ---------------------------------------------------------------- LocalScope
@@ -169,12 +163,11 @@ def test_scope_excluded_source_drops_whole_entry(fake_home: Path) -> None:
 def test_too_large_is_refused_before_reading(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import config_saver.lib.sync.scan as mod
 
-    monkeypatch.setattr(mod, "MAX_SYNC_BYTES", 10)
     monkeypatch.setattr(mod, "_fingerprint", lambda *_a: pytest.fail("file was read"))
     f = fake_home / "big"
-    f.write_bytes(b"x" * 11)
+    f.write_bytes(b"x" * (1024 * 1024 + 1))
     with pytest.raises(SyncTooLargeError):
-        scan(make_model([str(f)]))
+        scan(make_model([str(f)], sync_max_mb=1))
 
 
 # ------------------------------------- unreadable is not deleted (final review)
@@ -257,3 +250,171 @@ def test_path_behind_an_unreachable_parent_is_not_an_absence(fake_home: Path, fo
             scan(make_model(directories))
     finally:
         d.chmod(0o700)
+
+
+# ---------------------------------------------------------------- sync_max_mb
+
+
+def test_limit_comes_from_sync_max_mb(fake_home: Path) -> None:
+    f = fake_home / "big"
+    f.write_bytes(b"x" * (1024 * 1024 + 1))
+    with pytest.raises(SyncTooLargeError, match=r"over the 1 MiB limit"):
+        scan(make_model([str(f)], sync_max_mb=1))
+    assert scan(make_model([str(f)], sync_max_mb=2))[2] == 1024 * 1024 + 1
+
+
+def test_default_limit_message_says_50_mib(fake_home: Path) -> None:
+    f = fake_home / "big"
+    f.write_bytes(b"x" * (50 * 1024 * 1024 + 1))
+    with pytest.raises(SyncTooLargeError, match=r"over the 50 MiB limit"):
+        scan(make_model([str(f)]))
+
+
+# ----------------------------------------------------------------- hash cache
+
+
+@pytest.fixture
+def hashed(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Paths the real hashing function was asked to read, in order."""
+    import config_saver.lib.sync.scan as mod
+
+    calls: list[str] = []
+    real = mod._fingerprint
+
+    def spy(compressor, path, problems):  # type: ignore[no-untyped-def]
+        calls.append(path)
+        return real(compressor, path, problems)
+
+    monkeypatch.setattr(mod, "_fingerprint", spy)
+    return calls
+
+
+def test_cache_hit_skips_hashing_and_matches_a_cold_scan(fake_home: Path, hashed: list[str]) -> None:
+    f = fake_home / "rc"
+    f.write_text("abc\n", encoding="utf-8")
+    model = make_model([str(f)])
+    cache: dict = {}
+    _s, first, t1 = scan(model, cache)
+    assert hashed == [str(f)]
+    _s, second, t2 = scan(model, cache)
+    assert hashed == [str(f)]  # no second read
+    assert (second, t2) == (first, t1)
+    assert second == scan(model)[1]
+
+
+def test_cache_hit_keeps_symlink_size_out_of_the_total(sample_tree: Path, hashed: list[str]) -> None:
+    model = make_model([str(sample_tree)])
+    cache: dict = {}
+    cold = scan(model, cache)
+    n = len(hashed)
+    warm = scan(model, cache)
+    assert len(hashed) == n
+    assert warm[1:] == cold[1:]
+
+
+def _rewrite_same_size_same_mtime(f: Path, data: bytes) -> None:
+    st = f.stat()
+    f.write_bytes(data)
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def test_same_size_same_mtime_edit_is_not_stale(fake_home: Path, hashed: list[str]) -> None:
+    """ctime still moves, so the entry is rejected even though size and mtime_ns match."""
+    f = fake_home / "rc"
+    f.write_bytes(b"aaaa")
+    model = make_model([str(f)])
+    cache: dict = {}
+    old = scan(model, cache)[1]["home/user/rc"]
+    _rewrite_same_size_same_mtime(f, b"bbbb")
+    new = scan(model, cache)[1]["home/user/rc"]
+    assert new != old
+    assert new.sha256 == hashlib.sha256(b"bbbb").hexdigest()
+    assert len(hashed) == 2
+
+
+def _entry(cache: dict, f: Path) -> tuple:
+    return cache[str(f)]
+
+
+def test_each_field_of_the_validity_tuple_forces_a_rehash(fake_home: Path, hashed: list[str]) -> None:
+    f = fake_home / "rc"
+    f.write_bytes(b"aaaa")
+    model = make_model([str(f)])
+    cache: dict = {}
+    scan(model, cache)
+    base = cache[str(f)]
+    st = f.stat()
+
+    def rescan_with(**changes: object) -> None:
+        mutated = base._replace(**changes)
+        cache[str(f)] = mutated
+        before = len(hashed)
+        scan(model, cache)
+        assert len(hashed) == before + 1, changes
+        assert cache[str(f)] == base  # refreshed to the truth
+
+    rescan_with(size=st.st_size + 1)
+    rescan_with(mtime_ns=st.st_mtime_ns + 1)
+    rescan_with(ctime_ns=st.st_ctime_ns + 1)
+    rescan_with(inode=st.st_ino + 1)
+    rescan_with(normalize_content=True)
+    before = len(hashed)
+    scan(model, cache)
+    assert len(hashed) == before  # the untouched entry is a hit
+
+
+def test_chmod_bumps_ctime_and_rehashes(fake_home: Path, hashed: list[str]) -> None:
+    f = fake_home / "rc"
+    f.write_bytes(b"aaaa")
+    model = make_model([str(f)])
+    cache: dict = {}
+    scan(model, cache)
+    os.chmod(f, 0o600)
+    side = scan(model, cache)[1]
+    assert len(hashed) == 2
+    assert side["home/user/rc"].mode == 0o600
+
+
+def test_replaced_file_with_same_size_and_mtime_rehashes(fake_home: Path, hashed: list[str]) -> None:
+    f = fake_home / "rc"
+    f.write_bytes(b"aaaa")
+    model = make_model([str(f)])
+    cache: dict = {}
+    scan(model, cache)
+    st = f.stat()
+    other = fake_home / "other"
+    other.write_bytes(b"bbbb")
+    os.utime(other, ns=(st.st_atime_ns, st.st_mtime_ns))
+    os.replace(other, f)
+    side = scan(model, cache)[1]
+    assert len(hashed) == 2
+    assert side["home/user/rc"].sha256 == hashlib.sha256(b"bbbb").hexdigest()
+
+
+def test_normalize_content_flip_rehashes(fake_home: Path, hashed: list[str]) -> None:
+    f = fake_home / "rc"
+    f.write_text(f"X={fake_home}\n", encoding="utf-8")
+    cache: dict = {}
+    a = scan(make_model([str(f)], normalize_content=False), cache)[1]["home/user/rc"]
+    b = scan(make_model([str(f)], normalize_content=True), cache)[1]["home/user/rc"]
+    assert len(hashed) == 2
+    assert a.sha256 != b.sha256
+
+
+def test_entries_for_unseen_paths_are_dropped(fake_home: Path) -> None:
+    f, g = fake_home / "f", fake_home / "g"
+    f.write_text("1")
+    g.write_text("2")
+    cache: dict = {}
+    scan(make_model([str(f), str(g)]), cache)
+    assert set(cache) == {str(f), str(g)}
+    g.unlink()
+    scan(make_model([str(f), str(g)]), cache)
+    assert set(cache) == {str(f)}
+
+
+def test_a_failed_scan_does_not_cache_unreadable_files(fake_home: Path) -> None:
+    f = fake_home / "gone"
+    cache: dict = {}
+    scan(make_model([str(f)]), cache)
+    assert cache == {}

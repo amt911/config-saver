@@ -1046,3 +1046,52 @@ def test_a_publish_built_on_a_snapshot_forgotten_meanwhile_retries(env, monkeypa
     c.engine.run({"c": c.model("cfg")})
     assert (c.home / "cfg" / "app.conf").read_text() == "from a\n"
     assert (c.home / "cfg" / "b_new.txt").read_text() == "b\n"
+
+
+def test_successful_run_persists_the_hash_cache_and_reuses_it(pair, monkeypatch):
+    import config_saver.lib.sync.scan as scan_mod
+
+    a, _b = pair
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    saved = state_io.load(a.state_file)
+    key = str(a.home / "cfg" / "app.conf")
+    assert set(saved.hash_cache) == {key}
+    assert saved.hash_cache_home == str(a.home)
+
+    calls: list[str] = []
+    real = scan_mod._fingerprint
+    monkeypatch.setattr(scan_mod, "_fingerprint", lambda c, p, pr: (calls.append(p), real(c, p, pr))[1])
+    a.engine.run({"c": a.model("cfg")})
+    assert calls == []  # unchanged file: served from the persisted cache
+
+
+def test_cache_recorded_for_another_home_is_discarded(pair, monkeypatch):
+    import config_saver.lib.sync.scan as scan_mod
+
+    a, _b = pair
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    st = state_io.load(a.state_file)
+    st.hash_cache_home = "/somewhere/else"
+    state_io.save(a.state_file, st)
+
+    calls: list[str] = []
+    real = scan_mod._fingerprint
+    monkeypatch.setattr(scan_mod, "_fingerprint", lambda c, p, pr: (calls.append(p), real(c, p, pr))[1])
+    a.engine.run({"c": a.model("cfg")})
+    assert calls == [str(a.home / "cfg" / "app.conf")]
+    assert state_io.load(a.state_file).hash_cache_home == str(a.home)
+
+
+def test_conflict_leaves_the_state_file_untouched_cache_included(pair, monkeypatch):
+    a, b = _synced_pair(pair, monkeypatch)
+    a.use(monkeypatch)
+    a.write("cfg/app.conf", "from a\n")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.write("cfg/app.conf", "from b\n")
+    before = Path(b.state_file).read_bytes()
+    with pytest.raises(SyncConflictError):
+        b.engine.run({"c": b.model("cfg")})
+    assert Path(b.state_file).read_bytes() == before

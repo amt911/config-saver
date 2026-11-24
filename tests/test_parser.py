@@ -102,3 +102,14 @@ def test_sync_with_only_root_user_rejected(fake_home: Path) -> None:
     """A root-only config cannot be shared with the user's other machines."""
     with pytest.raises(ValidationError, match="sync cannot be combined with only_root_user"):
         make_model([str(fake_home / "data")], sync=True, only_root_user=True)
+
+
+def test_sync_max_mb_defaults_to_50_and_accepts_larger() -> None:
+    assert make_model(["/x"]).sync_max_mb == 50
+    assert make_model(["/x"], sync_max_mb=3000).sync_max_mb == 3000
+
+
+@pytest.mark.parametrize("bad", [0, -1, "many", 1.5])
+def test_sync_max_mb_must_be_a_positive_integer(bad: object) -> None:
+    with pytest.raises(ValidationError):
+        make_model(["/x"], sync_max_mb=bad)

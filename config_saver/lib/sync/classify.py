@@ -7,6 +7,7 @@ pull, publish or abort on conflict. No IO: everything is a dict of fingerprints.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,25 @@ class Fingerprint:
 
 
 Side = dict[str, Fingerprint]
+
+
+class CacheEntry(NamedTuple):
+    """One remembered hash: the stat tuple it was computed under, and the fingerprint.
+
+    Valid only while every stat field and ``normalize_content`` still match. ``ctime_ns``
+    is the one a writer cannot forge (utime sets mtime, never ctime), so a same-size,
+    same-mtime edit still invalidates the entry.
+    """
+
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    inode: int
+    normalize_content: bool
+    fingerprint: Fingerprint
+
+
+HashCache = dict[str, CacheEntry]
 
 
 @dataclass

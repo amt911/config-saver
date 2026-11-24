@@ -32,6 +32,12 @@ class Model(BaseModel):
         default=False,
         description="Share this configuration's files with other machines through `--sync`",
     )
+    sync_max_mb: int = Field(
+        default=50,
+        ge=1,
+        strict=True,
+        description="Largest total size, in MiB, this configuration may have when synced with `--sync`",
+    )
     encrypt: EncryptionModel | None = Field(
         default=None,
         description="Encrypt the resulting archive with age or gpg (a .tar.gz is not confidential)",
