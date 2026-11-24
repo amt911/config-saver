@@ -55,7 +55,8 @@ def load_remote(path: str) -> SyncRemote:
             data = json.load(handle)
     except FileNotFoundError as exc:
         raise SyncNotSetUpError(
-            f"sync is not set up: run config-saver --sync-init <restic-repo> (missing {path})"
+            "sync is not set up: run config-saver --sync-init <restic repository, "
+            f"e.g. rclone:Google Drive:config-saver-sync> (missing {path})"
         ) from exc
     except (OSError, ValueError) as exc:
         raise SyncStateError(f"the sync remote file {path} is unreadable: {exc}") from exc

@@ -57,6 +57,16 @@ class Snapshot:
     cfg: str
     description: str | None
     tags: tuple[str, ...] = ()
+    original: str | None = None
+
+    @property
+    def canonical(self) -> str:
+        """The identity sync reasons about: the id this snapshot had where it was first created.
+
+        ``restic copy`` gives a copied snapshot a new id and records the source's in ``original``, so
+        manifests and ``parent:`` tags (which name ids) stay valid in the copy.
+        """
+        return self.original or self.id
 
 
 class StorageMode(Enum):
@@ -310,11 +320,11 @@ class ResticStore:
             return False
         raise self._explain(done.stderr, done.returncode)
 
-    def copy_from(self, src: ResticStore, ids: list[str]) -> None:
-        """Copy snapshots ``ids`` from ``src`` into this repository; the source credentials travel in the environment."""
-        if not ids:
-            raise StoreError("refusing to copy with no snapshot ids: restic would copy every snapshot")
-        # -o options are process-global: the one restic process needs both repositories' options.
+    def _from_args(self, src: ResticStore) -> tuple[dict[str, str], list[str]]:
+        """The environment and ``-o`` options a process needs to read ``src`` while working on this repository.
+
+        -o options are process-global: the one restic process needs both repositories' options.
+        """
         merged: dict[str, str] = {}
         for option in (*self._options, *src._options):
             key = option.partition("=")[0]
@@ -325,7 +335,19 @@ class ResticStore:
             extra["RESTIC_FROM_PASSWORD"] = src._password
         else:
             extra["RESTIC_FROM_PASSWORD_COMMAND"] = src._env()["RESTIC_PASSWORD_COMMAND"]
-        self._run(["copy", *ids], extra, list(merged.values()))
+        return extra, list(merged.values())
+
+    def init_from(self, src: ResticStore) -> None:
+        """Create this repository with ``src``'s chunker parameters, so copied data deduplicates against it."""
+        extra, options = self._from_args(src)
+        self._run(["init", "--copy-chunker-params"], extra, options)
+
+    def copy_from(self, src: ResticStore, ids: list[str]) -> None:
+        """Copy snapshots ``ids`` from ``src`` into this repository; the source credentials travel in the environment."""
+        if not ids:
+            raise StoreError("refusing to copy with no snapshot ids: restic would copy every snapshot")
+        extra, options = self._from_args(src)
+        self._run(["copy", *ids], extra, options)
 
     def backup(
         self,
@@ -451,6 +473,7 @@ class ResticStore:
                     cfg=name,
                     description=decode_description(desc_tag) if desc_tag else None,
                     tags=tuple(tag_list),
+                    original=entry.get("original") or None,
                 )
             )
         return sorted(found, key=lambda s: (s.time, s.id))

@@ -106,3 +106,72 @@ def test_two_machines_sync_conflict_and_resolve(machines: tuple[Machine, Machine
     assert resolved.returncode == 0, resolved.stderr + resolved.stdout
     assert b.file.read_text() == "from a\n"
     assert b.sync("--sync-status").returncode == 0
+
+
+def _remote_in_use(m: Machine) -> str:
+    import json
+
+    return str(json.loads((m.home / ".config" / "config-saver" / "sync.json").read_text())["repository"])
+
+
+def test_init_is_idempotent_private_and_refuses_another_repository(machines: tuple[Machine, Machine, str]) -> None:
+    a, _b, remote = machines
+    assert "created" in a.sync("--sync-init", remote).stdout
+    again = a.sync("--sync-init", remote)
+    assert again.returncode == 0 and "joined" in again.stdout
+    conf = a.home / ".config" / "config-saver"
+    assert (conf / "sync.json").stat().st_mode & 0o777 == 0o600
+    assert conf.stat().st_mode & 0o777 == 0o700
+    other = a.sync("--sync-init", remote + "-other")
+    assert other.returncode == 6, other.stderr + other.stdout
+    assert f"--sync-move {remote}-other" in other.stdout
+    assert _remote_in_use(a) == remote
+
+
+def test_prune_exits_zero(machines: tuple[Machine, Machine, str]) -> None:
+    a, _b, remote = machines
+    a.write("one\n")
+    a.sync("--sync-init", remote)
+    assert a.sync("--sync").returncode == 0
+    pruned = a.sync("--sync-prune")
+    assert pruned.returncode == 0, pruned.stderr + pruned.stdout
+
+
+def test_move_switches_every_machine_and_sync_continues(machines: tuple[Machine, Machine, str]) -> None:
+    a, b, remote = machines
+    new = remote + "-moved"
+    a.write("one\n")
+    a.sync("--sync-init", remote)
+    b.sync("--sync-init", remote)
+    assert a.sync("--sync").returncode == 0
+    assert b.sync("--sync").returncode == 0
+    moved = a.sync("--sync-move", new)
+    assert moved.returncode == 0, moved.stderr + moved.stdout
+    assert _remote_in_use(a) == new
+    assert _remote_in_use(b) == remote  # B has not moved yet
+    moved_b = b.sync("--sync-move", new)  # the second machine: copy skips what is already there
+    assert moved_b.returncode == 0, moved_b.stderr + moved_b.stdout
+    assert _remote_in_use(b) == new
+    a.write("two\n")
+    assert a.sync("--sync").returncode == 0
+    assert b.sync("--sync").returncode == 0
+    assert b.file.read_text() == "two\n"
+    assert b.sync("--sync-status").returncode == 0
+
+
+def test_a_move_that_cannot_reach_the_target_leaves_sync_json_alone(machines: tuple[Machine, Machine, str]) -> None:
+    a, _b, remote = machines
+    a.write("one\n")
+    a.sync("--sync-init", remote)
+    assert a.sync("--sync").returncode == 0
+    foreign = a.home / "foreign"  # a repository that opens with another password: the target cannot be used
+    subprocess.run(
+        ["restic", "init", "--repo", str(foreign)],
+        env={**a.env, "RESTIC_PASSWORD": "not-the-derived-one"},
+        check=True,
+        capture_output=True,
+    )
+    failed = a.sync("--sync-move", str(foreign))
+    assert failed.returncode == 10, failed.stderr + failed.stdout
+    assert _remote_in_use(a) == remote
+    assert a.sync("--sync-status").returncode == 0  # still works against the old one

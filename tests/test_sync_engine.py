@@ -7,6 +7,7 @@ engine's job is the interplay of those with the real filesystem, and mocking the
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -89,7 +90,7 @@ class Machine:
     def head(self) -> str:
         """The winning head of cfg ``c`` in the shared repository."""
         snaps = self.engine.store.snapshots("c", tag=SYNC_TAG)
-        return select_head([SnapRef(x.id, _parent(x), x.time) for x in snaps]) or ""
+        return select_head([SnapRef(x.canonical, _parent(x), x.time) for x in snaps]) or ""
 
 
 def _parent(snap) -> str | None:
@@ -1229,3 +1230,232 @@ def test_a_last_prune_in_the_future_counts_as_due(env, monkeypatch, counting):
     a.engine.run({"c": a.model("cfg")})
     assert counting.prunes == before + 1
     assert state_io.load(a.state_file).last_prune == T0
+
+
+# ------------------------------------------- canonical ids: snapshots carried by `restic copy`
+
+
+def _copy_all(env, src: Machine) -> str:
+    """Copy every sync snapshot of the shared repository to a second one; return its path."""
+    dest = str(env["root"] / "repo2")
+    store = ResticStore.for_repository(dest, derive_password(env["key"]), ())
+    store.init_plain()
+    ids = [s.id for s in src.engine.store.snapshots(tag=SYNC_TAG)]
+    store.copy_from(src.engine.store, ids)
+    return dest
+
+
+def _carried(env, old: Machine, name: str, monkeypatch) -> Machine:
+    """A machine on the copied repository holding the old machine's files and recorded state."""
+    new = Machine(env["root"], name, "tester", env["key"], _copy_all(env, old))
+    shutil.copytree(old.home, new.home, symlinks=True, dirs_exist_ok=True)
+    shutil.copy(old.state_file, new.state_file)
+    new.use(monkeypatch)
+    return new
+
+
+def test_every_snapshot_of_a_copy_has_a_new_id_but_keeps_its_canonical_one(env, monkeypatch):
+    a = machine(env, "a")
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "one\n")
+    a.engine.run({"c": a.model("cfg")})
+    c = _carried(env, a, "c", monkeypatch)
+    old, new = a.engine.store.snapshots(tag=SYNC_TAG)[0], c.engine.store.snapshots(tag=SYNC_TAG)[0]
+    assert new.id != old.id and new.original == old.id
+    assert new.canonical == old.id and old.canonical == old.id
+
+
+def test_recorded_head_stays_valid_after_a_copy(env, monkeypatch):
+    a = machine(env, "a")
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "one\n")
+    a.engine.run({"c": a.model("cfg")})
+    a.write("cfg/f.txt", "two\n")
+    a.engine.run({"c": a.model("cfg")})
+    c = _carried(env, a, "c", monkeypatch)
+    before = [s.id for s in c.engine.store.snapshots(tag=SYNC_TAG)]
+    report = c.engine.run({"c": c.model("cfg")})
+    assert not (report.applied or report.deleted or report.published or report.conflicts)
+    assert [s.id for s in c.engine.store.snapshots(tag=SYNC_TAG)] == before  # nothing was re-published
+
+
+def test_carried_files_restore_from_copied_snapshots(env, monkeypatch):
+    a = machine(env, "a", now=late())
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f1.txt", "one\n")
+    a.engine.run({"c": a.model("cfg")})
+    a.write("cfg/f2.txt", "two\n")
+    a.engine.run({"c": a.model("cfg")})
+    c = _carried(env, a, "c", monkeypatch)
+    fresh = Machine(env["root"], "fresh", "tester", env["key"], c.engine.remote.repository)
+    fresh.use(monkeypatch)
+    fresh.engine.run({"c": fresh.model("cfg")})
+    assert (fresh.home / "cfg" / "f1.txt").read_text() == "one\n"  # held by the older snapshot
+    assert (fresh.home / "cfg" / "f2.txt").read_text() == "two\n"
+
+
+def test_a_new_publish_on_a_copy_is_parented_on_the_canonical_head(env, monkeypatch):
+    a = machine(env, "a")
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "one\n")
+    a.engine.run({"c": a.model("cfg")})
+    first = a.head()
+    c = _carried(env, a, "c", monkeypatch)
+    c.write("cfg/f.txt", "two\n")
+    c.engine.run({"c": c.model("cfg")})
+    newest = c.engine.store.snapshots(tag=SYNC_TAG)[-1]
+    assert f"{PARENT_TAG_PREFIX}{first}" in newest.tags
+    assert c.head() == newest.id
+
+
+def test_forget_works_on_copied_snapshots(env, monkeypatch):
+    a = machine(env, "a")
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f1.txt", "one\n")
+    a.engine.run({"c": a.model("cfg")})
+    a.write("cfg/f1.txt", "one v2\n")
+    a.engine.run({"c": a.model("cfg")})
+    a.write("cfg/f2.txt", "two\n")
+    a.engine.run({"c": a.model("cfg")})
+    c = _carried(env, a, "c", monkeypatch)
+    c.engine.now = late()
+    forgotten = c.engine.prune({"c": c.model("cfg")})
+    assert forgotten and all(f not in {s.canonical for s in c.engine.store.snapshots(tag=SYNC_TAG)} for f in forgotten)
+    fresh = Machine(env["root"], "fresh", "tester", env["key"], c.engine.remote.repository)
+    fresh.use(monkeypatch)
+    fresh.engine.run({"c": fresh.model("cfg")})
+    assert (fresh.home / "cfg" / "f1.txt").read_text() == "one v2\n"
+    assert (fresh.home / "cfg" / "f2.txt").read_text() == "two\n"
+
+
+def test_winner_flip_recovery_on_a_copy(env, monkeypatch):
+    a, b = _flip(env, monkeypatch, same_path=False)
+    a2 = _carried(env, a, "a2", monkeypatch)
+    a2.engine.run({"c": a2.model("cfg")})
+    assert (a2.home / "cfg" / "app.conf").read_text() == "from a\n"
+    assert (a2.home / "cfg" / "a_new.txt").read_text() == "a new\n"
+    assert (a2.home / "cfg" / "b_new.txt").read_text() == "from b\n"
+
+
+# ------------------------------------------------------------------------------------ move
+
+
+def _target(env, name: str = "repo2") -> SyncRemote:
+    return SyncRemote(str(env["root"] / name))
+
+
+def _published(env, monkeypatch, name: str = "a", steps: int = 2) -> Machine:
+    m = machine(env, name)
+    m.use(monkeypatch)
+    m.engine.init()
+    for i in range(steps):
+        m.write("cfg/f.txt", f"v{i}\n")
+        m.write(f"cfg/extra{i}.txt", "x\n")
+        m.engine.run({"c": m.model("cfg")})
+    return m
+
+
+def _on(env, name: str, repo: SyncRemote, monkeypatch, like: Machine | None = None) -> Machine:
+    m = Machine(env["root"], name, "tester", env["key"], repo.repository)
+    if like is not None:
+        shutil.copytree(like.home, m.home, symlinks=True, dirs_exist_ok=True)
+        shutil.copy(like.state_file, m.state_file)
+    m.use(monkeypatch)
+    return m
+
+
+def test_move_copies_everything_and_the_other_machine_keeps_syncing(env, monkeypatch):
+    a = _published(env, monkeypatch)
+    b = machine(env, "b")
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    target = _target(env)
+    copied = a.engine.move(target)
+    assert copied == len(a.engine.store.snapshots(tag=SYNC_TAG))
+    new_store = target.store(env["key"])
+    assert {s.canonical for s in new_store.snapshots(tag=SYNC_TAG)} == {
+        s.canonical for s in a.engine.store.snapshots(tag=SYNC_TAG)
+    }
+    # B moves too (its recorded head is still valid), then edits and A, on the new repository, receives it
+    b2 = _on(env, "b2", target, monkeypatch, like=b)
+    b2.write("cfg/f.txt", "from b\n")
+    assert b2.engine.run({"c": b2.model("cfg")}).published["c"]
+    a2 = _on(env, "a2", target, monkeypatch, like=a)
+    a2.engine.run({"c": a2.model("cfg")})
+    assert (a2.home / "cfg" / "f.txt").read_text() == "from b\n"
+
+
+def test_move_into_an_existing_repository_skips_what_was_already_copied(env, monkeypatch):
+    a = _published(env, monkeypatch)
+    target = _target(env)
+    first = a.engine.move(target)
+    again = a.engine.move(target)  # second machine's move after the first one's
+    assert again == first
+    assert len(target.store(env["key"]).snapshots(tag=SYNC_TAG)) == first
+
+
+def test_move_on_a_second_machine_after_the_first_moved_copies_what_it_published_meanwhile(env, monkeypatch):
+    a = _published(env, monkeypatch)
+    b = machine(env, "b")
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    target = _target(env)
+    a.use(monkeypatch)
+    a.engine.move(target)
+    b.use(monkeypatch)
+    b.write("cfg/b_only.txt", "meanwhile\n")
+    b.engine.run({"c": b.model("cfg")})  # published to the OLD repository
+    b.engine.move(target)
+    c = _on(env, "c", target, monkeypatch)
+    c.engine.run({"c": c.model("cfg")})
+    assert (c.home / "cfg" / "b_only.txt").read_text() == "meanwhile\n"
+    assert (c.home / "cfg" / "f.txt").read_text() == "v1\n"
+
+
+def test_move_keeps_the_chunker_parameters_of_the_source(env, monkeypatch):
+    a = _published(env, monkeypatch)
+    target = _target(env)
+    a.engine.move(target)
+
+    def poly(store: ResticStore) -> str:
+        out = subprocess.run(["restic", "cat", "config"], env=store._env(), capture_output=True, text=True, check=True)
+        return str(json.loads(out.stdout)["chunker_polynomial"])
+
+    assert poly(target.store(env["key"])) == poly(a.engine.store)
+
+
+def test_move_failure_in_the_copy_is_a_transport_error(env, monkeypatch):
+    a = _published(env, monkeypatch)
+
+    def boom(self, src, ids):
+        raise StoreError("restic failed: network down")
+
+    monkeypatch.setattr(ResticStore, "copy_from", boom)
+    with pytest.raises(SyncTransportError, match="network down"):
+        a.engine.move(_target(env))
+
+
+def test_move_that_fails_verification_raises_and_names_the_mismatch(env, monkeypatch):
+    a = _published(env, monkeypatch)
+    real = ResticStore.copy_from
+
+    def lossy(self, src, ids):
+        real(self, src, ids[:-1])  # the newest snapshot never arrives
+
+    monkeypatch.setattr(ResticStore, "copy_from", lossy)
+    with pytest.raises(SyncTransportError, match="verif"):
+        a.engine.move(_target(env))
+
+
+def test_move_with_no_snapshots_just_creates_the_target(env, monkeypatch):
+    a = machine(env, "a")
+    a.use(monkeypatch)
+    a.engine.init()
+    target = _target(env)
+    assert a.engine.move(target) == 0
+    assert target.store(env["key"]).exists()

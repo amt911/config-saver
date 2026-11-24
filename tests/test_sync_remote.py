@@ -74,7 +74,9 @@ def test_save_overwrites_atomically(tmp_path: Path) -> None:
 
 
 def test_load_missing_points_at_sync_init(tmp_path: Path) -> None:
-    with pytest.raises(SyncNotSetUpError, match=r"--sync-init <restic-repo>"):
+    with pytest.raises(
+        SyncNotSetUpError, match=r"--sync-init <restic repository, e\.g\. rclone:Google Drive:config-saver-sync>"
+    ):
         load_remote(str(tmp_path / "sync.json"))
 
 

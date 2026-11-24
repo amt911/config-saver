@@ -259,6 +259,25 @@ class CLI:
             help="Set up sync against this restic repository (joins it if it exists, else creates it)",
         )
         parser.add_argument(
+            "--sync-move",
+            metavar="URL",
+            default=None,
+            help="Move the sync repository to this restic repository: copy every snapshot, verify, then switch",
+        )
+        parser.add_argument(
+            "--sync-option",
+            action="append",
+            default=None,
+            metavar="K=V",
+            help="With --sync-init/--sync-move: a restic -o option for the repository, e.g. "
+            "rclone.program=... (repeatable)",
+        )
+        parser.add_argument(
+            "--sync-prune",
+            action="store_true",
+            help="Forget the sync snapshots no head needs and reclaim their space now",
+        )
+        parser.add_argument(
             "--sync-status", action="store_true", help="Show what --sync would do (exit 11 on conflicts)"
         )
         parser.add_argument(
@@ -373,7 +392,7 @@ class CLI:
             help="Show program version and exit",
         )
         args = parser.parse_args(self.argv)
-        if not any(getattr(args, a) for a in _ACTIONS) and not sync_commands.sync_verbs(args):
+        if not any(getattr(args, a) for a in _ACTIONS) and not sync_commands.sync_verbs(args) and not args.sync_option:
             parser.error("one of the arguments --compress/-c --decompress/-d --list/-l ... --sync is required")
         return args
 
@@ -588,7 +607,13 @@ class CLI:
 
     def _sync(self, args: argparse.Namespace, sync_verbs: list[str]) -> int:
         if not sync_verbs:
-            print(Fore.RED + "--path only applies to --sync-resolve.")
+            print(Fore.RED + "--path only applies to --sync-resolve; --sync-option to --sync-init and --sync-move.")
+            return EXIT_USAGE
+        if args.encrypt_to or args.encrypt_method:
+            print(
+                Fore.RED + "--encrypt-to/--encrypt-method do not apply to --sync*: the sync repository's password "
+                "is derived from the age identity."
+            )
             return EXIT_USAGE
         if any(getattr(args, a) for a in _ACTIONS):
             print(Fore.RED + "Sync flags cannot be combined with other actions.")
@@ -614,7 +639,7 @@ class CLI:
             print(Fore.RED + misplaced)
             return EXIT_USAGE
         sync_verbs = sync_commands.sync_verbs(args)
-        if sync_verbs or args.path:
+        if sync_verbs or args.path or args.sync_option:
             return self._sync(args, sync_verbs)
         manager = BackupManager()
         saves_dir = manager.ensure_saves_dir()

@@ -104,6 +104,29 @@ class _Cfg:
     conflicts: list[str]
 
 
+class _Listing:
+    """One repository's sync snapshots: canonical refs per config, and the restic ids behind each."""
+
+    def __init__(self, store: ResticStore, snapshots: list[Snapshot]):
+        self.store = store
+        self.snapshots = snapshots
+        self._ids: dict[str, list[str]] = {}
+        for s in snapshots:
+            self._ids.setdefault(s.canonical, []).append(s.id)
+
+    def refs(self, cfg: str) -> list[SnapRef]:
+        seen: set[str] = set()
+        out = []
+        for s in self.snapshots:
+            if s.cfg == cfg and s.canonical not in seen:
+                seen.add(s.canonical)
+                out.append(SnapRef(s.canonical, _parent_of(s), s.time))
+        return out
+
+    def ids_of(self, canonical: str) -> list[str]:
+        return self._ids[canonical]
+
+
 def _extend(into: dict[str, list[str]], cfg: str, paths: list[str]) -> None:
     if paths:
         into.setdefault(cfg, []).extend(paths)
@@ -145,7 +168,10 @@ class SyncEngine:
         self.state_file = state_file
         self.lock_file = lock_file
         self.host = re.sub(r"[\s,]+", "-", host) or "unknown"
-        self.store = store or remote.store(identity or DEFAULT_IDENTITY)
+        self.identity = identity or DEFAULT_IDENTITY
+        self.store = store or remote.store(self.identity)
+        # canonical id -> the ids restic knows it by (a copied snapshot has a new id); refreshed on every listing
+        self._actual: dict[str, list[str]] = {}
         self.staging_root = staging_root
         self.staging = os.path.join(staging_root, _STAGING)
 
@@ -172,6 +198,53 @@ class SyncEngine:
     def run(self, configs: Mapping[str, Model]) -> SyncReport:
         with self._locked():
             return _transport(lambda: self._run(configs, state_file_io.load(self.state_file)))
+
+    def move(self, new: SyncRemote) -> int:
+        """Copy the whole sync history to ``new`` and verify it; the caller switches ``sync.json`` only afterwards.
+
+        Returns the number of this repository's snapshots now present in ``new``. Snapshots already
+        copied (by another machine's move) are skipped by restic; ones only the target has are left alone.
+        """
+        with self._locked():
+            return _transport(lambda: self._move(new))
+
+    def _move(self, new: SyncRemote) -> int:
+        target = new.store(self.identity)
+        if not target.exists():
+            target.init_from(self.store)
+        source_snaps = self.store.snapshots(tag=SYNC_TAG)
+        if source_snaps:  # restic copy with no ids would copy everything: nothing to copy here
+            target.copy_from(self.store, [s.id for s in source_snaps])
+        with self._workspace():
+            self._verify_copy(source_snaps, target, new.repository)
+        return len({s.canonical for s in source_snaps})
+
+    def _verify_copy(self, source_snaps: list[Snapshot], target: ResticStore, where: str) -> None:
+        """Every source snapshot is in the target, and each config's head there (among them) has the same manifest."""
+        wanted = {s.canonical for s in source_snaps}
+        mine = _Listing(self.store, source_snaps)
+        theirs = _Listing(target, [s for s in target.snapshots(tag=SYNC_TAG) if s.canonical in wanted])
+        missing = wanted - {s.canonical for s in theirs.snapshots}
+        if missing:
+            raise SyncTransportError(
+                f"move verification failed: {len(missing)} snapshot(s) did not arrive in {where}; "
+                "sync.json still points at the old repository"
+            )
+        for cfg in sorted({s.cfg for s in source_snaps}):
+            head = select_head(mine.refs(cfg))
+            if head is None or select_head(theirs.refs(cfg)) != head:
+                raise SyncTransportError(
+                    f"move verification failed: the head of {cfg} differs in {where}; "
+                    "sync.json still points at the old repository"
+                )
+            if self._manifest_in(mine, head, cfg) != self._manifest_in(theirs, head, cfg):
+                raise SyncTransportError(
+                    f"move verification failed: the manifest of {cfg} differs in {where}; "
+                    "sync.json still points at the old repository"
+                )
+
+    def _manifest_in(self, listing: _Listing, head: str, cfg: str) -> Manifest:
+        return self._read_manifest(head, cfg, listing.store, listing.ids_of(head))
 
     def prune(self, configs: Mapping[str, Model]) -> list[str]:
         """Forget what no head needs, then reclaim the space whatever the clock says. Returns forgotten ids."""
@@ -298,7 +371,7 @@ class SyncEngine:
             known = {head: manifest} if head and manifest else {}
             doomed |= self._settled(snaps, unreferenced(snaps, known)) | losers(snaps)
         ids = sorted(doomed)
-        self.store.forget_ids(ids)
+        self.store.forget_ids([actual for i in ids for actual in self._restic_ids(i)])
         return ids
 
     def _publish(self, cfgs: dict[str, _Cfg], merged: dict[str, tuple[Side, set[str]]]) -> _Published | None:
@@ -363,12 +436,22 @@ class SyncEngine:
             del state.hash_cache[stale]
         return cfgs, sorted(set(by_cfg) - set(cfgs))
 
-    @staticmethod
-    def _by_cfg(snapshots: list[Snapshot]) -> dict[str, list[SnapRef]]:
+    def _by_cfg(self, snapshots: list[Snapshot]) -> dict[str, list[SnapRef]]:
+        """Per-config refs keyed by canonical id; also learns which restic ids stand behind each."""
         by_cfg: dict[str, list[SnapRef]] = {}
+        seen: set[str] = set()
+        actual: dict[str, list[str]] = {}
         for s in snapshots:
-            by_cfg.setdefault(s.cfg, []).append(SnapRef(s.id, _parent_of(s), s.time))
+            actual.setdefault(s.canonical, []).append(s.id)
+            if s.canonical in seen:  # the same snapshot copied twice into one repository
+                continue
+            seen.add(s.canonical)
+            by_cfg.setdefault(s.cfg, []).append(SnapRef(s.canonical, _parent_of(s), s.time))
+        self._actual = actual
         return by_cfg
+
+    def _restic_ids(self, canonical: str) -> list[str]:
+        return self._actual.get(canonical, [canonical])
 
     def _effective_base(self, name: str, state: SyncState, snaps: list[SnapRef]) -> Side:
         """The recorded base, unless the head it was recorded at is no longer on the winning chain.
@@ -410,8 +493,10 @@ class SyncEngine:
             plan.take_remote, plan.delete_local, plan.publish, plan.conflicts,
         )  # fmt: skip
 
-    def _read_manifest(self, snapshot_id: str, cfg: str) -> Manifest:
-        with self._dump(snapshot_id, cfg) as tar_path:
+    def _read_manifest(
+        self, snapshot_id: str, cfg: str, store: ResticStore | None = None, restic_ids: list[str] | None = None
+    ) -> Manifest:
+        with self._dump(snapshot_id, cfg, store, restic_ids) as tar_path:
             try:
                 with tarfile.open(tar_path, "r:*") as tar:
                     handle = tar.extractfile(tar.getmember(MANIFEST_MEMBER))
@@ -520,16 +605,23 @@ class SyncEngine:
         finally:
             os.close(fd)  # closing releases the lock
 
-    def _dump_file(self, snapshot_id: str, cfg: str) -> str:
-        """Dump a snapshot's tar to a private file in the staging area (removed with it)."""
+    def _dump_file(
+        self, snapshot_id: str, cfg: str, store: ResticStore | None = None, restic_ids: list[str] | None = None
+    ) -> str:
+        """Dump a snapshot's tar to a private file in the staging area (removed with it).
+
+        ``snapshot_id`` is canonical; restic is asked by the id it knows the snapshot by.
+        """
         fd, path = tempfile.mkstemp(dir=self.staging, prefix="dump.", suffix=".tar")  # 0600
         with os.fdopen(fd, "wb") as out:
-            self.store.dump(snapshot_id, cfg, out)
+            (store or self.store).dump((restic_ids or self._restic_ids(snapshot_id))[0], cfg, out)
         return path
 
     @contextlib.contextmanager
-    def _dump(self, snapshot_id: str, cfg: str) -> Iterator[str]:
-        path = self._dump_file(snapshot_id, cfg)
+    def _dump(
+        self, snapshot_id: str, cfg: str, store: ResticStore | None = None, restic_ids: list[str] | None = None
+    ) -> Iterator[str]:
+        path = self._dump_file(snapshot_id, cfg, store, restic_ids)
         try:
             yield path
         finally:

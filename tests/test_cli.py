@@ -1218,6 +1218,19 @@ def test_prune_totals_read_as_sentences(
         ["--sync-resolve", "local", "--sync"],
         ["--compress", "--path", "~/x"],
         ["--sync", "--path", "~/x"],
+        ["--sync-move", "url", "--sync"],
+        ["--sync-move", "url", "--sync-init", "url"],
+        ["--sync-prune", "--sync"],
+        ["--sync-prune", "--sync-status"],
+        ["--sync-init", "url", "--encrypt-to", "age1abc"],
+        ["--sync", "--encrypt-to", "age1abc"],
+        ["--sync-prune", "--encrypt-method", "gpg"],
+        ["--sync-move", "url", "--encrypt-to", "age1abc"],
+        ["--sync-option", "a=b"],
+        ["--sync", "--sync-option", "a=b"],
+        ["--sync-init", "url", "--sync-option", "novalue"],
+        ["--sync-move", "url", "--sync-option", "=v"],
+        ["--sync-init", "url", "--sync-option", "a=b", "--sync-option", " =x"],
     ],
 )
 def test_sync_flag_combinations_exit_usage(argv: list[str], fake_home: Path) -> None:
@@ -1232,6 +1245,74 @@ def test_sync_without_setup_exits_not_found(
     for flag in (["--sync"], ["--sync-status"], ["--sync-resolve", "local"]):
         assert run(flag) == EXIT_NOT_FOUND
         assert "sync is not set up" in capsys.readouterr().out
+
+
+def _remote_file(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / "conf"))
+    return fake_home / "conf" / "config-saver" / "sync.json"
+
+
+def test_sync_init_against_another_repository_than_the_configured_one_points_at_move(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from config_saver.lib.sync.remote import SyncRemote, load_remote, save_remote
+
+    path = _remote_file(fake_home, monkeypatch)
+    save_remote(str(path), SyncRemote("/old/repo"))
+    monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
+    assert run(["--sync-init", "/new/repo"]) == EXIT_USAGE
+    assert "--sync-move /new/repo" in capsys.readouterr().out
+    assert load_remote(str(path)).repository == "/old/repo"  # untouched
+
+
+@pytest.mark.parametrize("flags", [["--sync-move", "/new/repo"], ["--sync-prune"]])
+def test_sync_move_and_prune_without_setup_exit_not_found_with_the_hint(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], flags: list[str]
+) -> None:
+    _remote_file(fake_home, monkeypatch)
+    monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
+    assert run(flags) == EXIT_NOT_FOUND
+    assert "config-saver --sync-init <restic repository, e.g. rclone:Google Drive:config-saver-sync>" in (
+        capsys.readouterr().out
+    )
+
+
+def test_sync_remote_file_with_an_unknown_key_exits_validation(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _remote_file(fake_home, monkeypatch)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"repository": "/r", "options": [], "extra": 1}')
+    monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
+    assert run(["--sync-prune"]) == EXIT_VALIDATION
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "missing"),
+    [("/old", "rclone:drive:x", "rclone"), ("rclone:drive:x", "/new", "rclone")],
+)
+def test_sync_move_needs_rclone_when_either_side_uses_it(
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    old: str,
+    new: str,
+    missing: str,
+) -> None:
+    from config_saver.lib.sync.remote import SyncRemote, save_remote
+
+    save_remote(str(_remote_file(fake_home, monkeypatch)), SyncRemote(old))
+    monkeypatch.setattr("shutil.which", lambda tool: None if tool == missing else "/usr/bin/fake")
+    assert run(["--sync-move", new]) == EXIT_NOT_FOUND
+    assert missing in capsys.readouterr().out
+
+
+def test_sync_move_to_the_same_repository_exits_usage(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from config_saver.lib.sync.remote import SyncRemote, save_remote
+
+    save_remote(str(_remote_file(fake_home, monkeypatch)), SyncRemote("/same"))
+    monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
+    assert run(["--sync-move", "/same"]) == EXIT_USAGE
 
 
 def test_sync_with_rclone_remote_needs_rclone(

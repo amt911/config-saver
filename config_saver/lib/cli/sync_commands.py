@@ -1,4 +1,4 @@
-"""CLI handlers for the multi-machine sync verbs (--sync, --sync-init, --sync-status, --sync-resolve)."""
+"""CLI handlers for the multi-machine sync verbs (--sync, --sync-init, --sync-move, --sync-prune, --sync-status, --sync-resolve)."""
 
 from __future__ import annotations
 
@@ -30,6 +30,10 @@ def sync_verbs(args: argparse.Namespace) -> list[str]:
         given.append("--sync")
     if args.sync_init:
         given.append("--sync-init")
+    if args.sync_move:
+        given.append("--sync-move")
+    if args.sync_prune:
+        given.append("--sync-prune")
     if args.sync_status:
         given.append("--sync-status")
     if args.sync_resolve:
@@ -99,31 +103,87 @@ def _engine(args: argparse.Namespace, remote: SyncRemote) -> SyncEngine:
     )
 
 
-def _require_tools(remote: SyncRemote | None) -> None:
+def _require_tools(*remotes: SyncRemote) -> None:
+    """restic and age always; rclone when any of the given remotes goes through it."""
     needed = list(REQUIRED_TOOLS)
-    if remote is not None and remote.needs_rclone:
+    if any(r.needs_rclone for r in remotes):
         needed.append("rclone")
     missing = [tool for tool in needed if shutil.which(tool) is None]
     if missing:
         raise SyncNotSetUpError(f"sync needs {', '.join(missing)} installed and on PATH")
 
 
+def _parse_options(given: list[str] | None) -> tuple[str, ...] | None:
+    """``--sync-option K=V`` values; None (after saying why) when one is malformed."""
+    for option in given or []:
+        key, sep, _value = option.partition("=")
+        if not sep or not key.strip():
+            print(Fore.RED + f"--sync-option takes KEY=VALUE, got {option!r}.")
+            return None
+    return tuple(given or [])
+
+
+def _init(args: argparse.Namespace, remote: SyncRemote) -> int:
+    path = sync_paths.remote_config_path()
+    try:
+        current: SyncRemote | None = load_remote(path)
+    except SyncNotSetUpError:
+        current = None
+    if current is not None and current.repository != remote.repository:
+        print(
+            Fore.RED + f"Sync is already set up against {current.repository}. "
+            f"To switch repositories (and carry the history) use: config-saver --sync-move {remote.repository}"
+        )
+        return EXIT_USAGE
+    _require_tools(remote)
+    outcome = _engine(args, remote).init()
+    save_remote(path, remote)  # only once the repository is usable
+    print(Fore.GREEN + f"Sync repository {outcome}. Mark configurations with 'sync: true'.")
+    return EXIT_OK
+
+
+def _move(args: argparse.Namespace, new: SyncRemote) -> int:
+    path = sync_paths.remote_config_path()
+    old = load_remote(path)
+    if old.repository == new.repository:
+        print(Fore.RED + f"Sync already uses {old.repository}: nothing to move.")
+        return EXIT_USAGE
+    _require_tools(old, new)
+    copied = _engine(args, old).move(new)
+    save_remote(path, new)  # only after the copy was verified
+    print(
+        Fore.GREEN + f"Moved {copied} sync snapshot(s) to {new.repository}. Every machine runs: "
+        f"config-saver --sync-move {new.repository}"
+    )
+    return EXIT_OK
+
+
 def handle(args: argparse.Namespace, load_configs: ConfigLoader) -> int:
     """Run the one sync verb requested; exit codes are mapped by CLI.run()."""
     if len(sync_verbs(args)) > 1:
-        print(Fore.RED + "Use only one of --sync, --sync-init, --sync-status and --sync-resolve.")
+        print(
+            Fore.RED + "Use only one of --sync, --sync-init, --sync-move, --sync-prune, --sync-status "
+            "and --sync-resolve."
+        )
+        return EXIT_USAGE
+    options = _parse_options(args.sync_option)
+    if options is None:
+        return EXIT_USAGE
+    if args.sync_option and not (args.sync_init or args.sync_move):
+        print(Fore.RED + "--sync-option only applies to --sync-init and --sync-move.")
         return EXIT_USAGE
     if args.sync_init:
-        remote = SyncRemote(args.sync_init, ())
-        _require_tools(remote)
-        outcome = _engine(args, remote).init()
-        save_remote(sync_paths.remote_config_path(), remote)  # only once the repository is usable
-        print(Fore.GREEN + f"Sync repository {outcome}. Mark configurations with 'sync: true'.")
-        return EXIT_OK
-    _require_tools(None)
+        return _init(args, SyncRemote(args.sync_init, options))
+    if args.sync_move:
+        return _move(args, SyncRemote(args.sync_move, options))
+    _require_tools()
     remote = load_remote(sync_paths.remote_config_path())
     _require_tools(remote)
     engine = _engine(args, remote)
+    if args.sync_prune:
+        forgotten = engine.prune(load_configs())
+        print(Fore.GREEN + f"Forgot {len(forgotten)} unreferenced sync snapshot(s) and reclaimed their space.")
+        return EXIT_OK
     if args.sync_status:
         report = engine.status(load_configs())
         _print_report(report, dry=True)
