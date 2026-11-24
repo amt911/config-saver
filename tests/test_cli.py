@@ -1324,7 +1324,20 @@ def test_sync_with_rclone_remote_needs_rclone(
     save_remote(str(fake_home / "conf" / "config-saver" / "sync.json"), SyncRemote("rclone:drive:backups"))
     monkeypatch.setattr("shutil.which", lambda tool: None if tool == "rclone" else "/usr/bin/fake")
     assert run(["--sync"]) == EXIT_NOT_FOUND
-    assert "rclone" in capsys.readouterr().out
+    # the exact message: any other not-found (a missing identity) would also mention the repository
+    assert "sync needs rclone installed" in capsys.readouterr().out
+
+
+def test_sync_with_a_local_remote_never_asks_for_rclone(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from config_saver.lib.sync.remote import SyncRemote, save_remote
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / "conf"))
+    save_remote(str(fake_home / "conf" / "config-saver" / "sync.json"), SyncRemote("/local/repo"))
+    monkeypatch.setattr("shutil.which", lambda tool: None if tool == "rclone" else "/usr/bin/fake")
+    run(["--sync"])  # fails later (no age identity in a unit test), but never for rclone
+    assert "rclone" not in capsys.readouterr().out
 
 
 def test_sync_with_a_missing_tool_names_it(
@@ -1471,3 +1484,59 @@ def test_sync_status_with_nothing_to_do_says_so(
     cfg = write_config(tmp_path / "zsh.yaml", [str(data_dir)], sync=True)
     assert run(["--sync-status", "--input", str(cfg)]) == 0
     assert "Nothing to sync." in capsys.readouterr().out
+
+
+def test_sync_init_again_without_options_keeps_the_stored_ones(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from config_saver.lib.sync.engine import SyncEngine
+    from config_saver.lib.sync.remote import SyncRemote, load_remote, save_remote
+
+    path = _remote_file(fake_home, monkeypatch)
+    save_remote(str(path), SyncRemote("/the/repo", ("rclone.args=--drive-chunk-size=64M",)))
+    monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
+    used: list[SyncRemote] = []
+    monkeypatch.setattr(SyncEngine, "__init__", lambda self, remote, *_a, **_k: used.append(remote))
+    monkeypatch.setattr(SyncEngine, "init", lambda self: "joined")
+    assert run(["--sync-init", "/the/repo"]) == EXIT_OK
+    assert load_remote(str(path)).options == ("rclone.args=--drive-chunk-size=64M",)  # not wiped
+    assert used[0].options == ("rclone.args=--drive-chunk-size=64M",)  # and the init ran with them
+
+
+def test_sync_init_again_with_options_replaces_the_stored_ones(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from config_saver.lib.sync.engine import SyncEngine
+    from config_saver.lib.sync.remote import SyncRemote, load_remote, save_remote
+
+    path = _remote_file(fake_home, monkeypatch)
+    save_remote(str(path), SyncRemote("/the/repo", ("old=1",)))
+    monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
+    monkeypatch.setattr(SyncEngine, "__init__", lambda self, *_a, **_k: None)
+    monkeypatch.setattr(SyncEngine, "init", lambda self: "joined")
+    assert run(["--sync-init", "/the/repo", "--sync-option", "new=2"]) == EXIT_OK
+    assert load_remote(str(path)).options == ("new=2",)
+
+
+def test_sync_move_saves_sync_json_from_inside_the_engine_lock(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from config_saver.lib.sync.engine import SyncEngine
+    from config_saver.lib.sync.remote import SyncRemote, load_remote, save_remote
+
+    path = _remote_file(fake_home, monkeypatch)
+    save_remote(str(path), SyncRemote("/old/repo"))
+    monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
+    monkeypatch.setattr(SyncEngine, "__init__", lambda self, *_a, **_k: None)
+    seen: list[str] = []
+
+    def move(self: SyncEngine, new: SyncRemote, on_verified: object = None) -> int:
+        seen.append(load_remote(str(path)).repository)  # still the old one while the engine holds the lock
+        assert callable(on_verified)
+        on_verified()
+        seen.append(load_remote(str(path)).repository)
+        return 3
+
+    monkeypatch.setattr(SyncEngine, "move", move)
+    assert run(["--sync-move", "/new/repo"]) == EXIT_OK
+    assert seen == ["/old/repo", "/new/repo"]

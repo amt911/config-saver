@@ -64,6 +64,7 @@ _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _MANIFEST_SEARCH = 8  # the manifest is written right after the metadata: it is among the first members
 _STAGING = ".staging"
 PRUNE_INTERVAL = 7 * 24 * 3600.0
+PRUNE_BACKOFF = 24 * 3600.0  # after a failed prune, sync runs leave it alone this long (--sync-prune still tries)
 # A superseded snapshot is kept until its successor is this old: a slower machine that analysed before
 # the successor existed may still publish on top of it, and that publish would name the forgotten one.
 SUPERSEDE_GRACE = timedelta(hours=24)
@@ -233,14 +234,19 @@ class SyncEngine:
         with self._locked():
             return _transport(lambda: self._run(configs, state_file_io.load(self.state_file)))
 
-    def move(self, new: SyncRemote) -> int:
-        """Copy the whole sync history to ``new`` and verify it; the caller switches ``sync.json`` only afterwards.
+    def move(self, new: SyncRemote, on_verified: Callable[[], None] | None = None) -> int:
+        """Copy the whole sync history to ``new`` and verify it, then call ``on_verified`` (switch ``sync.json``).
 
-        Returns the number of this repository's snapshots now present in ``new``. Snapshots already
-        copied (by another machine's move) are skipped by restic; ones only the target has are left alone.
+        ``on_verified`` runs while the lock is still held, so no ``--sync`` can run on the old repository
+        between the verification and the switch. Returns the number of this repository's snapshots now
+        present in ``new``. Snapshots already copied (by another machine's move) are skipped by restic;
+        ones only the target has are left alone.
         """
         with self._locked():
-            return _transport(lambda: self._move(new))
+            copied = _transport(lambda: self._move(new))
+            if on_verified is not None:
+                on_verified()
+            return copied
 
     def _move(self, new: SyncRemote) -> int:
         target = new.store(self.identity)
@@ -292,6 +298,7 @@ class SyncEngine:
             forgotten = self._forget(cfgs, None, {c.name: c.snaps for c in cfgs.values()})
         self.store.prune()
         state.last_prune = self.now()
+        state.last_prune_attempt = None
         state_file_io.save(self.state_file, state)
         return forgotten
 
@@ -341,6 +348,7 @@ class SyncEngine:
                 cfgs, skipped = self._analyse(configs, state)
                 conflicts = {c.name: c.conflicts for c in cfgs.values() if c.conflicts}
                 if conflicts:
+                    self._save_hash_cache_only(state)
                     raise SyncConflictError(conflicts)
                 total.skipped_remote = skipped
                 staged = [(c, self._stage(c)) for c in cfgs.values()]  # dump + vet everything first
@@ -367,12 +375,31 @@ class SyncEngine:
                 state_file_io.save(self.state_file, state)
                 # Housekeeping only after the publish is durable: a failure here loses nothing.
                 self._forget(cfgs, published, published.by_cfg)
-                if self._prune_due(state.last_prune):
-                    self.store.prune()
+                if self._prune_due(state.last_prune) and not self._prune_backed_off(state.last_prune_attempt):
+                    try:
+                        self.store.prune()
+                    except StoreError:
+                        state.last_prune_attempt = self.now()
+                        state_file_io.save(self.state_file, state)
+                        raise
                     state.last_prune = self.now()
+                    state.last_prune_attempt = None
                     state_file_io.save(self.state_file, state)
                 return total
         raise SyncTransportError("another machine kept publishing; try again")
+
+    def _save_hash_cache_only(self, state: SyncState) -> None:
+        """A conflict stops the run with the sync state untouched, except the hashes it already paid for.
+
+        Without this, the timer would rehash every file again on each run for as long as the conflict stands.
+        """
+        saved = state_file_io.load(self.state_file)
+        saved.hash_cache, saved.hash_cache_home = state.hash_cache, state.hash_cache_home
+        state_file_io.save(self.state_file, saved)
+
+    def _prune_backed_off(self, attempt: float | None) -> bool:
+        """A prune failed less than a day ago (a clock that went backwards does not extend the wait)."""
+        return attempt is not None and 0 <= self.now() - attempt < PRUNE_BACKOFF
 
     def _prune_due(self, last: float | None) -> bool:
         """Never pruned, a week ago, or a clock that went backwards (``now < last``) all mean due."""

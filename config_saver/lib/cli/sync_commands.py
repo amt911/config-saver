@@ -135,6 +135,8 @@ def _init(args: argparse.Namespace, remote: SyncRemote) -> int:
             f"To switch repositories (and carry the history) use: config-saver --sync-move {remote.repository}"
         )
         return EXIT_USAGE
+    if current is not None and not args.sync_option:
+        remote = current  # the same repository again, no options given: keep what is stored, never wipe it
     _require_tools(remote)
     outcome = _engine(args, remote).init()
     save_remote(path, remote)  # only once the repository is usable
@@ -149,8 +151,8 @@ def _move(args: argparse.Namespace, new: SyncRemote) -> int:
         print(Fore.RED + f"Sync already uses {old.repository}: nothing to move.")
         return EXIT_USAGE
     _require_tools(old, new)
-    copied = _engine(args, old).move(new)
-    save_remote(path, new)  # only after the copy was verified
+    # sync.json switches inside the engine's lock, right after the copy was verified
+    copied = _engine(args, old).move(new, on_verified=lambda: save_remote(path, new))
     print(
         Fore.GREEN + f"Moved {copied} sync snapshot(s) to {new.repository}. Every machine runs: "
         f"config-saver --sync-move {new.repository}"

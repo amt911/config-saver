@@ -1117,19 +1117,6 @@ def test_cache_recorded_for_another_home_is_discarded(pair, monkeypatch):
     assert state_io.load(a.state_file).hash_cache_home == str(a.home)
 
 
-def test_conflict_leaves_the_state_file_untouched_cache_included(pair, monkeypatch):
-    a, b = _synced_pair(pair, monkeypatch)
-    a.use(monkeypatch)
-    a.write("cfg/app.conf", "from a\n")
-    a.engine.run({"c": a.model("cfg")})
-    b.use(monkeypatch)
-    b.write("cfg/app.conf", "from b\n")
-    before = Path(b.state_file).read_bytes()
-    with pytest.raises(SyncConflictError):
-        b.engine.run({"c": b.model("cfg")})
-    assert Path(b.state_file).read_bytes() == before
-
-
 # ----------------------------------------------- a superseded snapshot waits out the grace period
 
 
@@ -1789,3 +1776,146 @@ def test_a_snapshot_restic_cannot_dump_is_a_store_error_not_an_unreadable_archiv
     a.engine.init()
     with a.engine._workspace(), pytest.raises(StoreError, match="restic failed"):
         a.engine._read_manifest("0" * 64, "c")
+
+
+# ------------------------------------------------------------------------ planned minors
+
+
+def test_a_conflict_run_keeps_the_sync_state_but_saves_the_hash_cache(pair, monkeypatch):
+    import config_saver.lib.sync.scan as scan_mod
+
+    a, b = _synced_pair(pair, monkeypatch)
+    a.use(monkeypatch)
+    a.write("cfg/app.conf", "from a\n")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.write("cfg/app.conf", "from b, much longer\n")
+    before = state_io.load(b.state_file)
+    with pytest.raises(SyncConflictError):
+        b.engine.run({"c": b.model("cfg")})
+    after = state_io.load(b.state_file)
+    for name in ("heads", "base", "parents", "last_prune", "last_prune_attempt", "recorded_at", "gens"):
+        assert getattr(after, name) == getattr(before, name), name
+    key = str(b.home / "cfg" / "app.conf")
+    assert key in after.hash_cache and after.hash_cache.get(key) != before.hash_cache.get(
+        key
+    )  # hashed once, remembered
+    calls: list[str] = []
+    real = scan_mod._fingerprint
+    monkeypatch.setattr(scan_mod, "_fingerprint", lambda c, p, pr: (calls.append(p), real(c, p, pr))[1])
+    with pytest.raises(SyncConflictError):
+        b.engine.run({"c": b.model("cfg")})
+    assert calls == []  # the timer would otherwise rehash everything every run while the conflict stands
+
+
+def test_resolve_that_conflicts_nowhere_still_saves_state_normally(pair, monkeypatch):
+    a, b = _synced_pair(pair, monkeypatch)
+    a.use(monkeypatch)
+    a.write("cfg/app.conf", "from a\n")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.write("cfg/app.conf", "from b\n")
+    with pytest.raises(SyncConflictError):
+        b.engine.run({"c": b.model("cfg")})
+    b.engine.resolve({"c": b.model("cfg")}, "remote", None)
+    assert state_io.load(b.state_file).heads["c"] == b.head()
+
+
+def test_a_failed_prune_is_not_retried_by_sync_runs_for_a_day(env, monkeypatch, counting):
+    clock = Clock()
+    a = machine(env, "a", store_cls=counting, now=clock)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    counting.fail_prune = True
+    with pytest.raises(SyncTransportError, match="prune"):
+        a.engine.run({"c": a.model("cfg")})
+    assert state_io.load(a.state_file).last_prune_attempt == T0
+    assert counting.prunes == 1
+    a.write("cfg/f.txt", "2\n")
+    clock.t += DAY - 60
+    a.engine.run({"c": a.model("cfg")})  # inside the back-off: the run succeeds without trying
+    assert counting.prunes == 1
+    clock.t += 120
+    a.write("cfg/f.txt", "3\n")
+    with pytest.raises(SyncTransportError, match="prune"):
+        a.engine.run({"c": a.model("cfg")})  # a day on: tried again, failing again
+    assert counting.prunes == 2
+    counting.fail_prune = False
+    a.engine.prune({"c": a.model("cfg")})  # --sync-prune always tries, whatever the back-off says
+    assert counting.prunes == 3
+    assert state_io.load(a.state_file).last_prune == clock.t
+
+
+def test_a_successful_prune_clears_the_back_off_and_a_clock_in_the_past_does_not_extend_it(env, monkeypatch, counting):
+    clock = Clock()
+    a = machine(env, "a", store_cls=counting, now=clock)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    counting.fail_prune = True
+    with pytest.raises(SyncTransportError):
+        a.engine.run({"c": a.model("cfg")})
+    clock.t -= 3600  # the clock went backwards: a stale attempt in the "future" must not block pruning
+    counting.fail_prune = False
+    a.write("cfg/f.txt", "2\n")
+    a.engine.run({"c": a.model("cfg")})
+    assert counting.prunes == 2
+    assert state_io.load(a.state_file).last_prune == clock.t
+
+
+def test_a_move_half_copied_earlier_completes_on_retry(env, monkeypatch):
+    a = _published(env, monkeypatch, steps=3)
+    target = _target(env)
+    new_store = target.store(env["key"])
+    new_store.init_from(a.engine.store)
+    ids = [s.id for s in a.engine.store.snapshots(tag=SYNC_TAG)]
+    new_store.copy_from(a.engine.store, ids[:-1])  # the interrupted first attempt
+    assert len(new_store.snapshots(tag=SYNC_TAG)) == len(ids) - 1
+    assert a.engine.move(target) == len(ids)
+    assert {s.canonical for s in new_store.snapshots(tag=SYNC_TAG)} == {
+        s.canonical for s in a.engine.store.snapshots(tag=SYNC_TAG)
+    }
+
+
+def test_move_runs_the_switch_inside_the_lock_and_only_after_verification(env, monkeypatch):
+    import fcntl
+
+    a = _published(env, monkeypatch)
+    target = _target(env)
+    held: list[bool] = []
+
+    def switch() -> None:
+        fd = os.open(a.lock_file, os.O_WRONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.append(False)  # we got it: the engine had already let go
+        except OSError:
+            held.append(True)
+        finally:
+            os.close(fd)
+        with pytest.raises(SyncTransportError, match="another sync is running"):
+            a.engine.run({"c": a.model("cfg")})  # a concurrent --sync cannot slip in before sync.json changes
+
+    a.engine.move(target, on_verified=switch)
+    assert held == [True]
+    a.engine.run({"c": a.model("cfg")})  # released afterwards
+
+
+def test_the_switch_is_not_called_when_verification_fails(env, monkeypatch):
+    a = _published(env, monkeypatch)
+    called: list[int] = []
+
+    class Lossy(ResticStore):
+        def copy_from(self, src, ids):
+            super().copy_from(src, ids[:-1])
+
+    target = _target(env)
+    a.engine.store = Lossy.for_repository(a.engine.store.repo, derive_password(env["key"]), ())
+    # The verifying target is the SyncRemote's own store; make it the lossy one
+    monkeypatch.setattr(
+        SyncRemote, "store", lambda self, identity: Lossy.for_repository(self.repository, derive_password(identity), ())
+    )
+    with pytest.raises(SyncTransportError, match="verification failed"):
+        a.engine.move(target, on_verified=lambda: called.append(1))
+    assert called == []

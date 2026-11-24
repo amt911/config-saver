@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from config_saver.lib.errors import SyncTooLargeError
+from config_saver.lib.errors import SyncTooLargeError, SyncUnreadableError
 from config_saver.lib.sync.scan import LocalScope, scan
 from config_saver.lib.tar_compressor.tar_compressor import TarCompressor
 from tests.conftest import make_model
@@ -418,3 +418,25 @@ def test_a_failed_scan_does_not_cache_unreadable_files(fake_home: Path) -> None:
     cache: dict = {}
     scan(make_model([str(f)]), cache)
     assert cache == {}
+
+
+def test_a_warm_cache_never_lets_a_smaller_limit_through(fake_home: Path, hashed: list[str]) -> None:
+    f = fake_home / "big"
+    f.write_bytes(b"x" * (3 * 1024 * 1024))
+    cache: dict = {}
+    scan(make_model([str(f)], sync_max_mb=4), cache)
+    assert hashed == [str(f)]
+    with pytest.raises(SyncTooLargeError):
+        scan(make_model([str(f)], sync_max_mb=2), cache)  # served from the cache, still over the limit
+    assert hashed == [str(f)]  # and nothing was rehashed to find out
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 0o000 file")
+def test_an_unreadable_file_is_never_cached(fake_home: Path) -> None:
+    f = fake_home / "secret"
+    f.write_text("x")
+    f.chmod(0)
+    cache: dict = {}
+    with pytest.raises(SyncUnreadableError):
+        scan(make_model([str(f)]), cache)
+    assert str(f) not in cache
