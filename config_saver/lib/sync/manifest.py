@@ -145,6 +145,11 @@ def _winning_chain(snaps: list[SnapRef]) -> list[str]:
     return chain
 
 
+def winning_chain(snaps: list[SnapRef]) -> list[str]:
+    """Root-to-head ids of the winning chain (public face of the fork rule)."""
+    return _winning_chain(snaps)
+
+
 def select_head(snaps: list[SnapRef]) -> str | None:
     """Head of one config's snapshot chain, or None when there are none."""
     chain = _winning_chain(snaps)

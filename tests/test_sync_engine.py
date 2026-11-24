@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tarfile
+import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -182,9 +183,7 @@ def test_conflict_aborts_without_writes(pair, monkeypatch):
     assert exc.value.conflicts == {"c": ["home/user/cfg/app.conf"]}
     assert (b.home / "cfg" / "app.conf").read_text() == "from b\n"
     assert Path(b.state_file).read_bytes() == before_state
-    assert (
-        len(b.engine.store.snapshots("c", tag=SYNC_TAG)) == 1
-    )  # nothing of ours was published (A's first is forgotten as unreferenced)
+    assert len(b.engine.store.snapshots("c", tag=SYNC_TAG)) == 2  # nothing of ours was published
 
 
 def test_status_reports_without_writing(pair, monkeypatch):
@@ -837,6 +836,7 @@ def test_only_the_losing_cfg_snapshot_is_forgotten(env, monkeypatch):
 # ------------------------------------------------------------------ pruning
 
 DAY = 86400.0
+SUPERSEDE_GRACE_S = 24 * 3600
 T0 = 1_000_000.0
 
 
@@ -846,6 +846,11 @@ class Clock:
 
     def __call__(self) -> float:
         return self.t
+
+
+def late() -> Clock:
+    """A clock two days ahead of the snapshots the real clock is about to stamp: grace has passed."""
+    return Clock(time.time() + 2 * DAY)
 
 
 def _ids(m: Machine) -> set[str]:
@@ -862,7 +867,7 @@ def _referenced(m: Machine, cfg: str = "c") -> set[str]:
 
 
 def test_unreferenced_snapshots_are_forgotten_and_carried_files_stay_restorable(env, monkeypatch):
-    a, b, c = machine(env, "a"), machine(env, "b"), machine(env, "c")
+    a, b, c = machine(env, "a", now=late()), machine(env, "b", now=late()), machine(env, "c")
     a.use(monkeypatch)
     a.engine.init()
     a.write("cfg/f1.txt", "one\n")
@@ -950,29 +955,26 @@ def test_prune_runs_at_most_once_a_week(env, monkeypatch, counting):
 
 
 def test_explicit_prune_forgets_and_prunes_regardless_of_the_clock(env, monkeypatch, counting):
-    clock = Clock()
+    clock = late()
+    start = clock.t
     a = machine(env, "a", store_cls=counting, now=clock)
     a.use(monkeypatch)
     a.engine.init()
     a.write("cfg/f.txt", "1\n")
     a.engine.run({"c": a.model("cfg")})
-    first = a.head()
     a.write("cfg/f.txt", "2\n")
-    # Publish with housekeeping out of the way: make the forget in run a no-op by recording only.
-    a.engine.run({"c": a.model("cfg")})
-    # The run above already forgot `first`; plant a new orphan to find with prune().
-    store = a.engine.store
-    extra = store.backup(
-        lambda out: _empty_tar(out), "c", datetime.now(), None, extra_tags=[SYNC_TAG, f"{PARENT_TAG_PREFIX}none"]
+    a.engine.run({"c": a.model("cfg")})  # the weekly prune already ran here, and forgot the first snapshot
+    # Plant a second root: it loses to the older chain, so it is a loser prune() must find.
+    extra = a.engine.store.backup(
+        _empty_tar, "c", datetime.now(), None, extra_tags=[SYNC_TAG, f"{PARENT_TAG_PREFIX}none"]
     )[0].id
-    assert first not in _ids(a)
     before = counting.prunes
-    clock.t = T0 + 60  # well inside the week
+    clock.t = start + 60  # a minute later: well inside the week, so only an explicit prune() runs it
     forgotten = a.engine.prune({"c": a.model("cfg")})
     assert extra in forgotten
     assert extra not in _ids(a)
     assert counting.prunes == before + 1
-    assert state_io.load(a.state_file).last_prune == T0 + 60
+    assert state_io.load(a.state_file).last_prune == start + 60
 
 
 def _empty_tar(out):
@@ -987,7 +989,7 @@ def _empty_tar(out):
 
 
 def test_forget_failure_after_publish_keeps_the_publish_and_the_state(env, monkeypatch, counting):
-    a = machine(env, "a", store_cls=counting)
+    a = machine(env, "a", store_cls=counting, now=late())
     a.use(monkeypatch)
     a.engine.init()
     a.write("cfg/f.txt", "1\n")
@@ -1032,7 +1034,7 @@ def test_a_publish_built_on_a_snapshot_forgotten_meanwhile_retries(env, monkeypa
                 b.use(monkeypatch)
             return super().backup(write, cfg, when, description, extra_tags)
 
-    a, b, c = machine(env, "a"), machine(env, "b", store_cls=Slow), machine(env, "c")
+    a, b, c = machine(env, "a", now=late()), machine(env, "b", store_cls=Slow), machine(env, "c")
     a.use(monkeypatch)
     a.engine.init()
     a.write("cfg/app.conf", "v1\n")
@@ -1095,3 +1097,135 @@ def test_conflict_leaves_the_state_file_untouched_cache_included(pair, monkeypat
     with pytest.raises(SyncConflictError):
         b.engine.run({"c": b.model("cfg")})
     assert Path(b.state_file).read_bytes() == before
+
+
+# ----------------------------------------------- a superseded snapshot waits out the grace period
+
+
+def test_superseded_snapshot_is_kept_until_its_successor_is_a_day_old(env, monkeypatch):
+    clock = Clock(time.time())
+    a = machine(env, "a", now=clock)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    a.engine.run({"c": a.model("cfg")})
+    first = a.head()
+    a.write("cfg/f.txt", "2\n")
+    a.engine.run({"c": a.model("cfg")})
+    assert first in _ids(a)  # unreferenced, but its successor is minutes old
+    clock.t += SUPERSEDE_GRACE_S - 3600
+    a.write("cfg/f.txt", "3\n")
+    a.engine.run({"c": a.model("cfg")})
+    assert first in _ids(a)  # the successor is 23 hours old
+    clock.t += 2 * 3600
+    a.write("cfg/f.txt", "4\n")
+    a.engine.run({"c": a.model("cfg")})
+    assert first not in _ids(a)
+    assert _referenced(a) <= _ids(a)
+
+
+def test_explicit_prune_honours_the_grace_period_too(env, monkeypatch):
+    clock = Clock(time.time())
+    a = machine(env, "a", now=clock)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    a.engine.run({"c": a.model("cfg")})
+    first = a.head()
+    a.write("cfg/f.txt", "2\n")
+    a.engine.run({"c": a.model("cfg")})
+    assert first not in a.engine.prune({"c": a.model("cfg")})
+    assert first in _ids(a)
+    clock.t += 25 * 3600
+    assert first in a.engine.prune({"c": a.model("cfg")})
+    assert first not in _ids(a)
+
+
+class _Deferring(ResticStore):
+    """A's store: its forgets are only recorded, so the test can run them at the worst moment."""
+
+    deferred: list[str] = []
+
+    def forget_ids(self, ids):
+        type(self).deferred += list(ids)
+
+
+def test_a_slow_machine_publishing_on_a_superseded_snapshot_loses_nothing(env, monkeypatch):
+    """A supersedes P and decides what to forget; slower B (analysed before) then publishes Y on P.
+
+    Y is dated earlier, so it wins and carries P's file: forgetting P at that point would leave every
+    machine unable to restore it. The grace period keeps P out of what A decided to forget.
+    """
+
+    class Store(_Skewed):
+        pass
+
+    Store.fired, Store.crash = False, False
+    _Deferring.deferred = []
+    a = machine(env, "a", store_cls=_Deferring)
+    b = machine(env, "b", store_cls=Store)
+    c = machine(env, "c")
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+
+    def a_supersedes() -> None:
+        a.use(monkeypatch)
+        a.write("cfg/app.conf", "from a\n")  # X replaces every file P had: P is unreferenced
+        a.engine.run({"c": a.model("cfg")})
+        b.use(monkeypatch)
+
+    Store.before = staticmethod(a_supersedes)
+    b.write("cfg/b_new.txt", "from b\n")
+    b.engine.run({"c": b.model("cfg")})  # Y on P, dated earlier: wins, carries app.conf from P
+    ResticStore.forget_ids(a.engine.store, _Deferring.deferred)  # A's decision lands only now
+    assert _referenced(b) <= _ids(b)
+    c.use(monkeypatch)
+    c.engine.run({"c": c.model("cfg")})
+    assert (c.home / "cfg" / "b_new.txt").read_text() == "from b\n"
+    assert (c.home / "cfg" / "app.conf").exists()
+
+
+def test_recorded_head_and_its_parent_both_forgotten_never_overwrites(env, monkeypatch):
+    a, b = machine(env, "a", now=late()), machine(env, "b", now=late())
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    a.write("cfg/app.conf", "v2\n")
+    a.engine.run({"c": a.model("cfg")})
+    x = a.head()
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    b.write("cfg/app.conf", "from b\n")
+    b.engine.run({"c": b.model("cfg")})  # Y on X, replacing everything: X and its parent are unreferenced
+    a.use(monkeypatch)
+    ids = _ids(a)
+    a.engine.store.forget_ids([i for i in ids if i != b.head()])  # the recorded head and its parent are gone
+    assert x not in _ids(a)
+    a.write("cfg/app.conf", "from a\n")
+    a.write("cfg/a_only.txt", "a only\n")
+    with pytest.raises(SyncConflictError):
+        a.engine.run({"c": a.model("cfg")})
+    assert (a.home / "cfg" / "app.conf").read_text() == "from a\n"  # nothing was overwritten
+    assert (a.home / "cfg" / "a_only.txt").read_text() == "a only\n"
+
+
+def test_a_last_prune_in_the_future_counts_as_due(env, monkeypatch, counting):
+    clock = Clock()
+    a = machine(env, "a", store_cls=counting, now=clock)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    a.engine.run({"c": a.model("cfg")})
+    state = state_io.load(a.state_file)
+    state.last_prune = T0 + 30 * DAY  # the clock went backwards since
+    state_io.save(a.state_file, state)
+    before = counting.prunes
+    a.write("cfg/f.txt", "2\n")
+    a.engine.run({"c": a.model("cfg")})
+    assert counting.prunes == before + 1
+    assert state_io.load(a.state_file).last_prune == T0

@@ -19,7 +19,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import IO, Literal, TypeVar
 
 from config_saver.lib.errors import (
@@ -40,7 +40,16 @@ from config_saver.lib.restic_store import (
 )
 from config_saver.lib.sync import state as state_file_io
 from config_saver.lib.sync.classify import Side, classify
-from config_saver.lib.sync.manifest import MANIFEST_MEMBER, SELF, Manifest, SnapRef, losers, select_head, unreferenced
+from config_saver.lib.sync.manifest import (
+    MANIFEST_MEMBER,
+    SELF,
+    Manifest,
+    SnapRef,
+    losers,
+    select_head,
+    unreferenced,
+    winning_chain,
+)
 from config_saver.lib.sync.remote import SyncRemote
 from config_saver.lib.sync.scan import LocalScope, scan
 from config_saver.lib.sync.state import SyncState
@@ -52,6 +61,9 @@ _NO_PARENT = "none"
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _STAGING = ".staging"
 PRUNE_INTERVAL = 7 * 24 * 3600.0
+# A superseded snapshot is kept until its successor is this old: a slower machine that analysed before
+# the successor existed may still publish on top of it, and that publish would name the forgotten one.
+SUPERSEDE_GRACE = timedelta(hours=24)
 
 
 @dataclass
@@ -244,12 +256,27 @@ class SyncEngine:
                 state_file_io.save(self.state_file, state)
                 # Housekeeping only after the publish is durable: a failure here loses nothing.
                 self._forget(cfgs, published, published.by_cfg)
-                if state.last_prune is None or self.now() - state.last_prune >= PRUNE_INTERVAL:
+                if self._prune_due(state.last_prune):
                     self.store.prune()
                     state.last_prune = self.now()
                     state_file_io.save(self.state_file, state)
                 return total
         raise SyncTransportError("another machine kept publishing; try again")
+
+    def _prune_due(self, last: float | None) -> bool:
+        """Never pruned, a week ago, or a clock that went backwards (``now < last``) all mean due."""
+        if last is None:
+            return True
+        elapsed = self.now() - last
+        return elapsed < 0 or elapsed >= PRUNE_INTERVAL
+
+    def _settled(self, snaps: list[SnapRef], ids: set[str]) -> set[str]:
+        """The ``ids`` whose successor on the winning chain is older than the grace period."""
+        cutoff = datetime.fromtimestamp(self.now()) - SUPERSEDE_GRACE
+        chain = winning_chain(snaps)
+        by_id = {s.id: s for s in snaps}
+        successor = {a: by_id[b] for a, b in zip(chain, chain[1:], strict=False)}
+        return {i for i in ids if i in successor and successor[i].time < cutoff}
 
     def _forget(
         self, cfgs: dict[str, _Cfg], published: _Published | None, listing: dict[str, list[SnapRef]]
@@ -269,7 +296,7 @@ class SyncEngine:
             if select_head(snaps) != head:
                 continue
             known = {head: manifest} if head and manifest else {}
-            doomed |= unreferenced(snaps, known) | losers(snaps)
+            doomed |= self._settled(snaps, unreferenced(snaps, known)) | losers(snaps)
         ids = sorted(doomed)
         self.store.forget_ids(ids)
         return ids
