@@ -665,3 +665,149 @@ def test_unreachable_parent_never_publishes_a_deletion(pair):
     assert Path(a.state_file).read_bytes() == state_before
     assert a.head() == head_before
     assert len(a.engine.store.snapshots("c", tag=SYNC_TAG)) == 1
+
+
+# ------------------------------------------------- the winner flips after a publisher finished
+
+
+class _Skewed(ResticStore):
+    """B's store: before its first backup lands, `before(self)` runs (A publishes); the backup is dated earlier.
+
+    ``crash`` simulates B dying right after its backup, before it re-lists (an orphan snapshot).
+    """
+
+    before = None
+    crash = False
+    fired = False
+
+    def backup(self, write, cfg, when, description, extra_tags: Sequence[str] = ()):
+        if not type(self).fired:
+            type(self).fired = True
+            type(self).before()  # type: ignore[misc]
+            when = when - timedelta(hours=1)
+            snap = super().backup(write, cfg, when, description, extra_tags)
+            if type(self).crash:
+                raise RuntimeError("B crashed before re-listing")
+            return snap
+        return super().backup(write, cfg, when, description, extra_tags)
+
+
+def _flip(env, monkeypatch, *, same_path: bool, crash: bool = False):
+    """Both machines synced on P. A publishes X, then B's earlier-dated Y on P wins. Returns (a, b)."""
+
+    class Store(_Skewed):
+        pass
+
+    Store.fired, Store.crash = False, crash
+    a, b = machine(env, "a"), machine(env, "b", store_cls=Store)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+
+    def a_publishes() -> None:
+        a.use(monkeypatch)
+        a.write("cfg/app.conf", "from a\n")
+        a.write("cfg/a_new.txt", "a new\n")
+        a.engine.run({"c": a.model("cfg")})
+        b.use(monkeypatch)
+
+    Store.before = staticmethod(a_publishes)
+    b.write("cfg/app.conf" if same_path else "cfg/b_new.txt", "from b\n")
+    if crash:
+        with pytest.raises(RuntimeError, match="crashed"):
+            b.engine.run({"c": b.model("cfg")})
+    else:
+        b.engine.run({"c": b.model("cfg")})
+    a.use(monkeypatch)
+    return a, b
+
+
+def _assert_a_edits_survive(a: Machine, b: Machine, monkeypatch) -> None:
+    a.use(monkeypatch)
+    a.engine.run({"c": a.model("cfg")})
+    assert (a.home / "cfg" / "app.conf").read_text() == "from a\n"
+    assert (a.home / "cfg" / "a_new.txt").read_text() == "a new\n"
+    assert (a.home / "cfg" / "b_new.txt").read_text() == "from b\n"
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    assert (b.home / "cfg" / "app.conf").read_text() == "from a\n"
+    assert (b.home / "cfg" / "a_new.txt").read_text() == "a new\n"
+    assert (b.home / "cfg" / "b_new.txt").read_text() == "from b\n"
+
+
+def test_winner_flip_after_publisher_finished_loses_nothing(env, monkeypatch):
+    a, b = _flip(env, monkeypatch, same_path=False)
+    _assert_a_edits_survive(a, b, monkeypatch)
+
+
+def test_winner_flip_same_path_is_a_conflict_with_zero_writes(env, monkeypatch):
+    a, _b = _flip(env, monkeypatch, same_path=True)
+    with pytest.raises(SyncConflictError) as exc:
+        a.engine.run({"c": a.model("cfg")})
+    assert exc.value.conflicts == {"c": ["home/user/cfg/app.conf"]}
+    assert (a.home / "cfg" / "app.conf").read_text() == "from a\n"
+    assert (a.home / "cfg" / "a_new.txt").read_text() == "a new\n"
+    assert not (a.home / "cfg" / "b_new.txt").exists()
+    assert a.engine.resolve({"c": a.model("cfg")}, "local", None).published  # resolve still works from a fork
+
+
+def test_orphan_with_an_earlier_time_wins_without_loss(env, monkeypatch):
+    a, b = _flip(env, monkeypatch, same_path=False, crash=True)
+    _assert_a_edits_survive(a, b, monkeypatch)
+
+
+def test_recorded_head_absent_from_the_listing_loses_nothing(pair, monkeypatch):
+    a, b = pair
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    b.write("cfg/b_new.txt", "from b\n")
+    a.use(monkeypatch)
+    a.write("cfg/app.conf", "from a\n")
+    a.write("cfg/a_new.txt", "a new\n")
+    a.engine.run({"c": a.model("cfg")})
+    a.engine.store.forget_ids([a.head()])  # the head A recorded is gone (pruned, forgotten)
+    _assert_a_edits_survive_after_forget(a, b, monkeypatch)
+
+
+def _assert_a_edits_survive_after_forget(a: Machine, b: Machine, monkeypatch) -> None:
+    a.engine.run({"c": a.model("cfg")})
+    assert (a.home / "cfg" / "app.conf").read_text() == "from a\n"
+    assert (a.home / "cfg" / "a_new.txt").read_text() == "a new\n"
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    assert (b.home / "cfg" / "app.conf").read_text() == "from a\n"
+    assert (b.home / "cfg" / "a_new.txt").read_text() == "a new\n"
+
+
+def test_only_the_losing_cfg_snapshot_is_forgotten(env, monkeypatch):
+    created: dict[str, list[str]] = {}
+
+    class Racing(ResticStore):
+        def backup(self, write, cfg, when, description, extra_tags: Sequence[str] = ()):
+            if not created:
+                a.use(monkeypatch)
+                a.write("cfg/from_a.txt", "a\n")
+                a.engine.run({"c": a.model("cfg")})
+                b.use(monkeypatch)
+                when = when + timedelta(hours=1)  # B's c loses
+            snap = super().backup(write, cfg, when, description, extra_tags)
+            created.setdefault(cfg, []).append(snap[0].id)
+            return snap
+
+    a, b = machine(env, "a"), machine(env, "b", store_cls=Racing)
+    a.use(monkeypatch)
+    a.engine.init()
+    b.use(monkeypatch)
+    b.write("cfg/from_b.txt", "b\n")
+    b.write("cfg2/x.txt", "x\n")
+    models = {"c": b.model("cfg"), "d": b.model("cfg2")}
+    b.engine.run(models)
+    alive = {s.id for s in b.engine.store.snapshots(tag=SYNC_TAG)}
+    assert created["c"][0] not in alive  # the loser
+    assert created["d"][0] in alive  # d's first snapshot won: another machine may already build on it
+    assert len(created["d"]) == 1

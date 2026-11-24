@@ -15,6 +15,9 @@ from config_saver.lib.sync.classify import Fingerprint, Side
 class SyncState:
     heads: dict[str, str] = field(default_factory=dict)
     base: dict[str, Side] = field(default_factory=dict)
+    # cfg -> parent id of the recorded head ("" = none): lets a later run find the recorded head's
+    # nearest surviving ancestor when that head lost a fork or was pruned. Absent in old files.
+    parents: dict[str, str] = field(default_factory=dict)
 
 
 def _corrupt(path: str, why: str) -> SyncStateError:
@@ -40,7 +43,11 @@ def load(path: str) -> SyncState:
         base = data["base"]
         if not isinstance(heads, dict) or not isinstance(base, dict):
             raise TypeError("heads and base must be objects")
+        parents = data.get("parents", {})
+        if not isinstance(parents, dict):
+            raise TypeError("parents must be an object")
         return SyncState(
+            parents={str(k): str(v) for k, v in parents.items()},
             heads={str(k): str(v) for k, v in heads.items()},
             base={
                 cfg: {p: Fingerprint(fp["sha256"], int(fp["mode"]), fp.get("link")) for p, fp in side.items()}
@@ -70,6 +77,7 @@ def save(path: str, state: SyncState) -> None:
     os.makedirs(parent, mode=0o700, exist_ok=True)
     payload = {
         "heads": state.heads,
+        "parents": state.parents,
         "base": {
             cfg: {p: {"sha256": fp.sha256, "mode": fp.mode, "link": fp.link} for p, fp in side.items()}
             for cfg, side in state.base.items()

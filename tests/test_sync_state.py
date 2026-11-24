@@ -74,3 +74,12 @@ def test_save_fsyncs_data_before_the_rename(tmp_path, monkeypatch):
     save(str(tmp_path / "s.json"), SyncState())
     assert calls[:2] == ["fsync", "replace"]
     assert calls.count("fsync") == 2  # the file, then the directory
+
+
+def test_parents_round_trip_and_old_files_load(tmp_path):
+    path = str(tmp_path / "s.json")
+    save(path, SyncState(heads={"c": "h"}, base={"c": {}}, parents={"c": "p", "d": ""}))
+    assert load(path).parents == {"c": "p", "d": ""}
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"heads": {"c": "h"}, "base": {"c": {}}}))
+    assert load(str(old)) == SyncState(heads={"c": "h"}, base={"c": {}}, parents={})

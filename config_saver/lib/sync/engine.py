@@ -71,6 +71,7 @@ class _Cfg:
     local: Side
     local_scope: set[str]
     head: str | None
+    head_parent: str | None
     remote: Manifest | None
     base: Side
     take_remote: list[str]
@@ -164,7 +165,7 @@ class SyncEngine:
                 raise ValueError(f"not a current conflict: {path}")
         chosen = current if paths is None else set(paths)
         for c in cfgs.values():
-            base = dict(state.base.get(c.name, {}))
+            base = dict(c.base)  # the effective base: after a fork it is not the recorded one
             other = (c.remote.side() if c.remote else {}) if side == "local" else c.local
             for path in c.conflicts:
                 if path in chosen:
@@ -173,6 +174,12 @@ class SyncEngine:
                     else:
                         base.pop(path, None)
             state.base[c.name] = base
+            if c.head is None:
+                state.heads.pop(c.name, None)
+                state.parents.pop(c.name, None)
+            else:  # the base now describes this head: later analyses must not re-derive it from the fork
+                state.heads[c.name] = c.head
+                state.parents[c.name] = c.head_parent or ""
         return self._run(configs, state)  # in memory only: saved if the run succeeds
 
     # --------------------------------------------------------------- the run
@@ -201,6 +208,7 @@ class SyncEngine:
                     head = new_ids.get(c.name, c.head)
                     if head is not None:
                         state.heads[c.name] = head
+                        state.parents[c.name] = (c.head if c.name in new_ids else c.head_parent) or ""
                     if c.name in new_ids:
                         _extend(total.published, c.name, sorted(publish))
                 state_file_io.save(self.state_file, state)
@@ -228,7 +236,8 @@ class SyncEngine:
         # Ours won when it is on the winning chain: another machine may already have built on top of it.
         if all(snap_id not in losers(by_cfg.get(name, [])) for name, snap_id in created.items()):
             return created
-        self.store.forget_ids(list(created.values()))
+        # Only the losers: a snapshot of another cfg that won may already have another machine on top of it.
+        self.store.forget_ids([i for name, i in created.items() if i in losers(by_cfg.get(name, []))])
         return None
 
     @staticmethod
@@ -245,7 +254,7 @@ class SyncEngine:
         by_cfg = self._by_cfg(all_snaps)
         cfgs: dict[str, _Cfg] = {}
         for name in sorted(n for n, m in configs.items() if m.sync):
-            cfgs[name] = self._analyse_one(name, configs[name], state.base.get(name, {}), by_cfg.get(name, []))
+            cfgs[name] = self._analyse_one(name, configs[name], state, by_cfg.get(name, []))
         return cfgs, sorted(set(by_cfg) - set(cfgs))
 
     @staticmethod
@@ -255,17 +264,43 @@ class SyncEngine:
             by_cfg.setdefault(s.cfg, []).append(SnapRef(s.id, _parent_of(s), s.time))
         return by_cfg
 
-    def _analyse_one(self, name: str, model: Model, base: Side, snaps: list[SnapRef]) -> _Cfg:
+    def _effective_base(self, name: str, state: SyncState, snaps: list[SnapRef]) -> Side:
+        """The recorded base, unless the head it was recorded at is no longer on the winning chain.
+
+        Another machine's earlier-dated publish can flip the fork winner after we finished. Our
+        recorded base describes a head that lost (or was pruned), so comparing against it would let
+        the winner overwrite our edits. Then the base is the manifest of the nearest ancestor of
+        the recorded head that is on the winning chain, or empty when the fork reaches the root.
+        """
+        recorded = state.base.get(name, {})
+        rec = state.heads.get(name)
+        if rec is None:
+            return recorded
+        lost = losers(snaps)
+        listed = {s.id: s for s in snaps}
+        on_chain = set(listed) - lost
+        if rec in on_chain:
+            return recorded
+        if rec not in listed and any(s.parent == rec for s in snaps if s.id in on_chain):
+            return recorded  # pruned after the winning chain was built on top of it
+        ancestor: str | None = state.parents.get(name) or None
+        while ancestor is not None and ancestor not in on_chain:
+            ancestor = listed[ancestor].parent if ancestor in listed else None
+        return self._read_manifest(ancestor, name).side() if ancestor else {}
+
+    def _analyse_one(self, name: str, model: Model, state: SyncState, snaps: list[SnapRef]) -> _Cfg:
         scope, local, _total = scan(model)
         head = select_head(snaps)
         if snaps and head is None:
             raise SyncStateError(f"the sync history of {name} has no usable head (a snapshot cycle?)")
+        base = self._effective_base(name, state, snaps)
+        head_parent = next((s.parent for s in snaps if s.id == head), None)
         remote = self._read_manifest(head, name) if head else None
         remote_side = remote.side() if remote else {}
         local_scope = {p for p in set(base) | set(local) | set(remote_side) if scope.contains(p)}
         plan = classify(base, local, remote_side, local_scope, set(remote.scope) if remote else set())
         return _Cfg(
-            name, model, scope, local, local_scope, head, remote, base,
+            name, model, scope, local, local_scope, head, head_parent, remote, base,
             plan.take_remote, plan.delete_local, plan.publish, plan.conflicts,
         )  # fmt: skip
 
