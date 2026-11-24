@@ -152,5 +152,24 @@ idle; the server closes it (rc=141, "Connection to github.com closed by remote h
 ## `restic prune` can fail after a successful sync publish
 
 `restic prune` needs an exclusive repository lock. If another machine is mid-backup it fails, and the
-sync run exits `10` even though the publish already succeeded. Nothing is lost; the next run retries
-(the 7-day throttle is only recorded after a prune succeeds, and `--sync-prune` forces it).
+sync run exits `10` even though the publish already succeeded. Nothing is lost; sync runs retry after a
+24 h back-off (`last_prune_attempt`; the 7-day throttle is only recorded after a prune succeeds, and
+`--sync-prune` always tries).
+
+## Forgotten ancestors: why heads use generations, and why a record expires
+
+Two traps, one cause: forgetting a snapshot removes a link from the middle of the history.
+
+- A parent-link walk from the roots picked the **oldest referenced root** as head once the snapshots
+  after it were forgotten (carried files keep the first snapshot alive, its successors are
+  unreferenced and go after 24 h). One machine alone then conflicted with itself on its fifth run.
+  Fix: every sync snapshot has a `gen:` tag; the head is the candidate of the highest generation;
+  forks are siblings that share a `parent:` tag, listed or not.
+- An idle machine (laptop away for days) records a head that was superseded and forgotten meanwhile.
+  "Head absent" is then safe to treat as superseded only if the current head has a higher generation
+  than the recorded one **and** the record is younger than `LOSER_RETENTION - SUPERSEDE_GRACE` (29 d):
+  a fork loser is kept 30 d, so a recent record whose head is gone cannot be a forgotten loser. Past
+  that the run falls back to the ancestor walk or an empty base: a conflict, never a loss.
+
+The pure retention rules live in `manifest.forgettable`; `tests/test_sync_manifest.py` checks them
+against the full history with Hypothesis (the head never changes however much is forgotten).

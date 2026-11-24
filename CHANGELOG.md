@@ -28,6 +28,19 @@ All notable changes to this project are documented here. The format follows
     run it on every machine. History and recorded state survive the move.
   - Pruning: snapshots no head needs are forgotten after a successful sync (a superseded one is kept
     24 h); `restic prune` runs at most every 7 days; `--sync-prune` forces it.
+  - Every sync snapshot is tagged `gen:<n>` (root 0, else parent + 1) and the head is the highest
+    generation: forgetting snapshots from the middle of the history (carried files keep the first
+    snapshot alive) no longer makes a machine conflict with itself. A fork loser is kept 30 days with
+    the fork winner and its parent; a machine away up to 29 days merges cleanly, a longer absence may
+    conflict (exit `11`, nothing lost). Snapshots without a `gen:` tag are refused.
+  - The head manifest is streamed from the first members of the tar (restic is stopped as soon as it
+    is read) and cached by snapshot id (`sync-manifests.json`, `0600`); an unchanged head costs no
+    download.
+  - A conflict run still saves the hash cache (only that), so the timer does not rehash everything
+    every 15 minutes while a conflict stands. After a failed `restic prune`, sync runs wait 24 h
+    before trying again. `--sync-move` switches `sync.json` inside the engine lock, and
+    `--sync-init` again on the same repository keeps the stored `--sync-option`s unless new ones are
+    given.
   - `sync_max_mb` per configuration (default 50, minimum 1) replaces the fixed 50 MiB limit. A hash
     cache in the state file skips unchanged files.
   - Definitions stay per machine: each machine syncs only what its own YAML declares, and never
