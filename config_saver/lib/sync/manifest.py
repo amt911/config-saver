@@ -183,12 +183,12 @@ def losers(snaps: list[SnapRef]) -> set[str]:
 def unreferenced(snaps: list[SnapRef], heads: Mapping[str, Manifest]) -> set[str]:
     """Snapshot ids that are neither a head nor referenced by any head manifest.
 
-    `heads` maps each head snapshot id to its manifest; the self marker in a
-    manifest resolves to that head's own id.
+    `heads` maps each head snapshot id to its manifest. The self marker in an entry names
+    the head itself, which is kept anyway, so it needs no resolving (the marker is not an id).
     """
     keep = set(heads)
-    for head_id, manifest in heads.items():
-        keep.update(snap for _, snap in manifest.resolve(head_id).entries.values())
+    for manifest in heads.values():
+        keep.update(snap for _, snap in manifest.entries.values())
     return {s.id for s in snaps} - keep
 
 
@@ -201,7 +201,7 @@ def forgettable(
       ``grace`` (a slower machine may still publish on top of it).
     * A fork loser and everything below it go together, once the loser is older than ``retention``; a
       unit a head manifest references stays whole. Younger ones stay, with the nearest candidate above
-      them (the base a machine away for weeks needs) .
+      them (the base a machine away for weeks needs).
     * A fork winner stays while a losing sibling is listed: that sibling is the evidence of the fork.
     * Heads, and anything a head manifest references, never go.
     """

@@ -12,6 +12,7 @@ Instances hold plain attributes only, so they can be pickled to worker processes
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -20,7 +21,7 @@ import shlex
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -45,6 +46,8 @@ HOST_TAG_PREFIX = "host:"
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 _PRIVATE_FILE = 0o600
 _PRIVATE_DIR = 0o700
+_EXIT_WAIT = 1.0  # seconds to learn whether restic ended by itself after the reader gave up
+_STOP_GRACE = 10.0  # seconds restic gets to leave cleanly after SIGTERM
 _RESTIC_NO_REPOSITORY = 10  # restic exit status: the repository does not exist
 
 
@@ -502,6 +505,58 @@ class ResticStore:
         err_thread.join()
         if returncode != 0:
             raise self._explain(b"".join(err_chunks), returncode)
+
+    @contextlib.contextmanager
+    def open_dump(self, snapshot_id: str, cfg: str) -> Iterator[IO[bytes]]:
+        """Stream snapshot ``snapshot_id``'s tar of ``cfg``; leaving the block early stops restic and reaps it.
+
+        For reading only the start of a tar (the sync manifest) without pulling all of it. restic is asked
+        to stop (SIGTERM, so it releases its repository lock and ends an rclone child), then killed if it
+        lingers. A restic that failed on its own before the reader finished surfaces as a StoreError.
+        """
+        try:
+            proc = subprocess.Popen(
+                self._argv(["dump", snapshot_id, f"/{cfg}.tar"]),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self._env(),
+            )
+        except OSError as exc:
+            raise StoreError(f"could not run restic: {exc}") from exc
+        assert proc.stdout is not None and proc.stderr is not None
+        err_thread, err_chunks = drain(proc.stderr)
+        try:
+            yield proc.stdout
+        except BaseException as exc:
+            early = self._exited(proc)
+            self._stop(proc, err_thread)
+            if early is not None and early != 0:
+                raise self._explain(b"".join(err_chunks), early) from exc
+            raise
+        else:
+            self._stop(proc, err_thread)
+
+    @staticmethod
+    def _exited(proc: subprocess.Popen[bytes]) -> int | None:
+        """restic's own exit status if it ends within a moment (it closed the pipe because it failed), else None."""
+        try:
+            return proc.wait(timeout=_EXIT_WAIT)
+        except subprocess.TimeoutExpired:
+            return None
+
+    @staticmethod
+    def _stop(proc: subprocess.Popen[bytes], err_thread: threading.Thread) -> None:
+        """Ask a restic child to stop, kill it if it does not, and reap it; no zombie, no stray output."""
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=_STOP_GRACE)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        proc.wait()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        err_thread.join()
 
     def forget(
         self, cfg: str, policy: RetentionModel, dry_run: bool, also_keep: Iterable[datetime] = ()

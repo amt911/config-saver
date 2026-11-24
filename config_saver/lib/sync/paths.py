@@ -23,3 +23,8 @@ def remote_config_path() -> str:
 
 def lock_path() -> str:
     return os.path.join(_xdg("XDG_STATE_HOME", "~/.local/state"), "config-saver", "sync.lock")
+
+
+def manifest_cache_path(state_file: str) -> str:
+    """The manifest cache lives next to the sync state it belongs to."""
+    return os.path.join(os.path.dirname(state_file), "sync-manifests.json")

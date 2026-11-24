@@ -39,6 +39,7 @@ from config_saver.lib.restic_store import (
     ResticStore,
     Snapshot,
 )
+from config_saver.lib.sync import manifest_cache
 from config_saver.lib.sync import state as state_file_io
 from config_saver.lib.sync.classify import Side, classify
 from config_saver.lib.sync.manifest import (
@@ -50,6 +51,7 @@ from config_saver.lib.sync.manifest import (
     losers,
     select_head,
 )
+from config_saver.lib.sync.paths import manifest_cache_path
 from config_saver.lib.sync.remote import SyncRemote
 from config_saver.lib.sync.scan import LocalScope, scan
 from config_saver.lib.sync.state import SyncState
@@ -59,6 +61,7 @@ from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
 MAX_ATTEMPTS = 3
 _NO_PARENT = "none"
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+_MANIFEST_SEARCH = 8  # the manifest is written right after the metadata: it is among the first members
 _STAGING = ".staging"
 PRUNE_INTERVAL = 7 * 24 * 3600.0
 # A superseded snapshot is kept until its successor is this old: a slower machine that analysed before
@@ -196,6 +199,8 @@ class SyncEngine:
         self.remote = remote
         self.state_file = state_file
         self.lock_file = lock_file
+        self.manifest_cache = manifest_cache_path(state_file)
+        self._manifests: dict[str, Manifest] | None = None  # canonical id -> resolved manifest; loaded lazily
         self.host = re.sub(r"[\s,]+", "-", host) or "unknown"
         self.identity = identity or DEFAULT_IDENTITY
         self.store = store or remote.store(self.identity)
@@ -397,6 +402,10 @@ class SyncEngine:
             doomed |= forgettable(snaps, known, datetime.fromtimestamp(self.now()), SUPERSEDE_GRACE, LOSER_RETENTION)
         ids = sorted(doomed)
         self.store.forget_ids([actual for i in ids for actual in self._restic_ids(i)])
+        for i in ids:
+            self._cached_manifests().pop(i, None)
+            self._actual.pop(i, None)
+        self._save_manifests()
         return ids
 
     def _publish(self, cfgs: dict[str, _Cfg], merged: dict[str, tuple[Side, set[str]]]) -> _Published | None:
@@ -424,6 +433,9 @@ class SyncEngine:
         if not created:
             return _Published({}, {}, {})
         by_cfg = self._by_cfg(self.store.snapshots(tag=SYNC_TAG))
+        for name, snap_id in created.items():  # a snapshot is its own cache seed: nobody needs to dump it again
+            self._cached_manifests()[snap_id] = manifests[name].resolve(snap_id)
+        self._save_manifests()
         listed = {s.id for snaps in by_cfg.values() for s in snaps}
         # A manifest naming a snapshot that is gone (another machine's housekeeping forgot it while we
         # uploaded) cannot be restored: treat it like a lost race, never publish it.
@@ -469,6 +481,7 @@ class SyncEngine:
             cfgs[name] = self._analyse_one(name, configs[name], state, by_cfg.get(name, []), seen)
         for stale in set(state.hash_cache) - seen:
             del state.hash_cache[stale]
+        self._save_manifests()
         return cfgs, sorted(set(by_cfg) - set(cfgs))
 
     def _by_cfg(self, snapshots: list[Snapshot]) -> dict[str, list[SnapRef]]:
@@ -543,24 +556,57 @@ class SyncEngine:
             plan.take_remote, plan.delete_local, plan.publish, plan.conflicts,
         )  # fmt: skip
 
+    def _cached_manifests(self) -> dict[str, Manifest]:
+        if self._manifests is None:
+            self._manifests = manifest_cache.load(self.manifest_cache)
+        return self._manifests
+
+    def _save_manifests(self) -> None:
+        """Persist the cache, forgetting entries whose snapshot is no longer in the last listing."""
+        manifest_cache.save(self.manifest_cache, self._cached_manifests(), set(self._actual))
+
     def _read_manifest(
         self, snapshot_id: str, cfg: str, store: ResticStore | None = None, restic_ids: list[str] | None = None
     ) -> Manifest:
-        with self._dump(snapshot_id, cfg, store, restic_ids) as tar_path:
-            try:
-                with tarfile.open(tar_path, "r:*") as tar:
-                    handle = tar.extractfile(tar.getmember(MANIFEST_MEMBER))
-                    data = handle.read(_MAX_MANIFEST_BYTES + 1) if handle else b""
-            except KeyError as exc:
-                raise ArchiveError(f"sync snapshot {snapshot_id} of {cfg} has no manifest") from exc
-            except tarfile.TarError as exc:
-                raise ArchiveError(f"sync snapshot {snapshot_id} of {cfg} is unreadable: {exc}") from exc
-        if len(data) > _MAX_MANIFEST_BYTES:
-            raise ArchiveError(f"sync manifest of {cfg} is implausibly large")
+        """The resolved manifest of a snapshot: from the cache, else streamed from the first members of its tar.
+
+        Snapshots are immutable, so a cached manifest needs no other check. Reading from another
+        repository (``store`` given: the move verification) never touches the cache.
+        """
+        cache = self._cached_manifests() if store is None else {}
+        hit = cache.get(snapshot_id)
+        if hit is not None and hit.cfg == cfg:
+            return hit
+        target = store or self.store
+        ids = restic_ids or self._restic_ids(snapshot_id)
+        with target.open_dump(ids[0], cfg) as stream:
+            data = self._manifest_bytes(stream, snapshot_id, cfg)
         manifest = Manifest.from_json(data)
         if manifest.cfg != cfg:
             raise ArchiveError(f"sync snapshot {snapshot_id} claims to be config {manifest.cfg!r}, not {cfg!r}")
-        return manifest.resolve(snapshot_id)
+        resolved = manifest.resolve(snapshot_id)
+        if store is None:
+            cache[snapshot_id] = resolved
+        return resolved
+
+    @staticmethod
+    def _manifest_bytes(stream: IO[bytes], snapshot_id: str, cfg: str) -> bytes:
+        """Read the manifest member out of a tar stream, looking at no more than the first few members.
+
+        Member names are untrusted: they are only compared, never used as a path.
+        """
+        try:
+            with tarfile.open(fileobj=stream, mode="r|*") as tar:
+                for _, member in zip(range(_MANIFEST_SEARCH), tar, strict=False):
+                    if member.name != MANIFEST_MEMBER:
+                        continue
+                    if member.size > _MAX_MANIFEST_BYTES:
+                        raise ArchiveError(f"sync manifest of {cfg} is implausibly large")
+                    handle = tar.extractfile(member)
+                    return handle.read() if handle else b""
+        except tarfile.TarError as exc:
+            raise ArchiveError(f"sync snapshot {snapshot_id} of {cfg} is unreadable: {exc}") from exc
+        raise ArchiveError(f"sync snapshot {snapshot_id} of {cfg} has no manifest")
 
     @staticmethod
     def _report(cfgs: dict[str, _Cfg], skipped: list[str]) -> SyncReport:
@@ -666,14 +712,3 @@ class SyncEngine:
         with os.fdopen(fd, "wb") as out:
             (store or self.store).dump((restic_ids or self._restic_ids(snapshot_id))[0], cfg, out)
         return path
-
-    @contextlib.contextmanager
-    def _dump(
-        self, snapshot_id: str, cfg: str, store: ResticStore | None = None, restic_ids: list[str] | None = None
-    ) -> Iterator[str]:
-        path = self._dump_file(snapshot_id, cfg, store, restic_ids)
-        try:
-            yield path
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(path)

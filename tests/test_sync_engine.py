@@ -1638,3 +1638,154 @@ def test_explicit_prune_keeps_a_young_loser_and_forgets_an_old_one(env, monkeypa
     clock.t += LOSER_RETENTION_S + DAY
     assert x in b.engine.prune({"c": b.model("cfg")})
     assert x not in _ids(b)
+
+
+# ------------------------------------------------ the manifest is streamed and cached, never the whole tar
+
+
+class _Dumping(ResticStore):
+    """Counts how often snapshot data is pulled from the repository, and how many bytes of the streams."""
+
+    dumps = 0
+    streamed = 0
+
+    def dump(self, snapshot_id, cfg, out):
+        type(self).dumps += 1
+        super().dump(snapshot_id, cfg, out)
+
+    def open_dump(self, snapshot_id, cfg):
+        type(self).dumps += 1
+        return super().open_dump(snapshot_id, cfg)
+
+
+def _fresh_engine(m: Machine, env, store_cls: type[ResticStore]) -> SyncEngine:
+    """A second process on the same machine: same state files, new engine object, new in-memory state."""
+    store = store_cls.for_repository(env["repo"], derive_password(env["key"]), ())
+    return SyncEngine(SyncRemote(env["repo"]), env["key"], m.state_file, m.sync_dir, m.lock_file, "x", store=store)
+
+
+def test_a_second_run_with_an_unchanged_head_dumps_nothing(env, monkeypatch):
+    class Store(_Dumping):
+        pass
+
+    Store.dumps = 0
+    a, b = machine(env, "a", store_cls=Store), machine(env, "b", store_cls=Store)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    a.engine.run({"c": a.model("cfg")})
+    Store.dumps = 0
+    _fresh_engine(a, env, Store).run({"c": a.model("cfg")})
+    assert Store.dumps == 0  # the publish seeded the cache; the listing is the only repository traffic
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    assert Store.dumps >= 1  # B had never seen this head: it reads the manifest and restores the file
+    Store.dumps = 0
+    _fresh_engine(b, env, Store).run({"c": b.model("cfg")})
+    assert Store.dumps == 0
+
+
+def test_the_cache_lists_only_snapshots_that_still_exist(env, monkeypatch):
+    a = machine(env, "a", now=late())
+    a.use(monkeypatch)
+    a.engine.init()
+    for i in range(3):
+        a.write("cfg/f.txt", f"{i}\n")
+        a.engine.run({"c": a.model("cfg")})
+    cached = json.loads(Path(a.engine.manifest_cache).read_text())["manifests"]
+    assert set(cached) <= _ids(a)
+    assert a.head() in cached
+    assert (os.stat(a.engine.manifest_cache).st_mode & 0o777) == 0o600
+
+
+def test_a_hostile_cache_file_is_ignored(env, monkeypatch):
+    class Store(_Dumping):
+        pass
+
+    Store.dumps = 0
+    a = machine(env, "a", store_cls=Store)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    a.engine.run({"c": a.model("cfg")})
+    head = a.head()
+    hostile = Manifest("c", ["x"], {"../../etc/passwd": (Fingerprint("a" * 64, 0o644, None), "@")}).to_json().decode()
+    Path(a.engine.manifest_cache).write_text(json.dumps({"version": 1, "manifests": {head: hostile}}))
+    Store.dumps = 0
+    _fresh_engine(a, env, Store).run({"c": a.model("cfg")})
+    assert Store.dumps >= 1  # the cache was not trusted: the manifest was read from the repository
+    assert (a.home / "cfg" / "f.txt").read_text() == "1\n"
+
+
+class _Counted:
+    def __init__(self, stream):
+        self.stream, self.n = stream, 0
+
+    def read(self, size=-1):
+        data = self.stream.read(size)
+        self.n += len(data)
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def test_the_manifest_of_a_big_snapshot_is_read_without_pulling_the_whole_tar(env, monkeypatch):
+    import contextlib
+
+    seen: list[_Counted] = []
+
+    class Store(ResticStore):
+        @contextlib.contextmanager
+        def open_dump(self, snapshot_id, cfg):
+            with super().open_dump(snapshot_id, cfg) as stream:
+                seen.append(_Counted(stream))
+                yield seen[-1]
+
+    a = machine(env, "a", store_cls=Store)
+    a.use(monkeypatch)
+    a.engine.init()
+    big = os.urandom(20 * 1024 * 1024)  # incompressible, and after the manifest in the tar
+    manifest = Manifest("c", ["home/user/cfg/f.txt"], {"home/user/cfg/f.txt": (_fp(b"x"), SELF)})
+    snap = _craft_snapshot(a, "c", {"home/user/cfg/big.bin": big}, manifest)
+    with a.engine._workspace():
+        read = a.engine._read_manifest(snap.id, "c")
+    assert read.entries["home/user/cfg/f.txt"][1] == snap.id
+    assert seen and seen[0].n < 2 * 1024 * 1024  # the 20 MB behind the manifest was never read
+    with pytest.raises(ChildProcessError):  # restic was stopped and reaped: no zombie, nothing left running
+        os.waitpid(-1, os.WNOHANG)
+
+
+def test_a_manifest_that_is_not_among_the_first_members_is_refused(env, monkeypatch):
+    a = machine(env, "a")
+    a.use(monkeypatch)
+    a.engine.init()
+    manifest = Manifest("c", [], {})
+
+    def write(out) -> object:
+        with tarfile.open(fileobj=out, mode="w|") as tar:
+            for i in range(12):
+                info = tarfile.TarInfo(f"m{i}")
+                tar.addfile(info, io.BytesIO(b""))
+            info = tarfile.TarInfo(MANIFEST_MEMBER)
+            info.size = len(manifest.to_json())
+            tar.addfile(info, io.BytesIO(manifest.to_json()))
+        return None
+
+    snap, _, _ = a.engine.store.backup(
+        write,
+        "c",
+        datetime.now(),
+        None,
+        extra_tags=[SYNC_TAG, "parent:none", "gen:0"],  # type: ignore[arg-type]
+    )
+    with a.engine._workspace(), pytest.raises(ArchiveError, match="no manifest"):
+        a.engine._read_manifest(snap.id, "c")
+
+
+def test_a_snapshot_restic_cannot_dump_is_a_store_error_not_an_unreadable_archive(env, monkeypatch):
+    a = machine(env, "a")
+    a.use(monkeypatch)
+    a.engine.init()
+    with a.engine._workspace(), pytest.raises(StoreError, match="restic failed"):
+        a.engine._read_manifest("0" * 64, "c")
