@@ -44,6 +44,7 @@ HOST_TAG_PREFIX = "host:"
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 _PRIVATE_FILE = 0o600
 _PRIVATE_DIR = 0o700
+_RESTIC_NO_REPOSITORY = 10  # restic exit status: the repository does not exist
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,24 @@ class ResticStore:
         # Absolute, so a store set up from one directory still works from the timer's.
         chosen = identity or self._recorded_identity() or DEFAULT_IDENTITY
         self.identity = os.path.abspath(os.path.expanduser(chosen))
+        self._password: str | None = None
+        self._options: tuple[str, ...] = ()
+
+    @classmethod
+    def for_repository(cls, repository: str, password: str, options: Sequence[str] = ()) -> ResticStore:
+        """A store on an arbitrary restic repository with an explicit password (no saves_dir, no age file).
+
+        The password reaches restic through ``RESTIC_PASSWORD`` in the environment, never on argv.
+        """
+        store = cls.__new__(cls)
+        store.saves_dir = ""
+        store.repo = repository
+        store.password_file = ""
+        store.settings_file = ""
+        store.identity = ""
+        store._password = password
+        store._options = tuple(options)
+        return store
 
     def _recorded_identity(self) -> str | None:
         try:
@@ -169,6 +188,11 @@ class ResticStore:
 
     # ----------------------------------------------------------------- plumbing
 
+    def _argv(self, args: Sequence[str]) -> list[str]:
+        """The restic command line: every configured option becomes a global ``-o`` pair."""
+        options = [part for option in self._options for part in ("-o", option)]
+        return ["restic", *options, *args]
+
     def _check_paths(self) -> None:
         """restic splits the password command on quotes itself; refuse what it cannot carry."""
         for path in (self.identity, self.password_file):
@@ -178,10 +202,13 @@ class ResticStore:
                 )
 
     def _env(self) -> dict[str, str]:
-        self._check_paths()
         # Inherited RESTIC_* settings (repository file, key hint, ...) would fight ours.
         env = {k: v for k, v in os.environ.items() if not k.startswith("RESTIC_") or k == "RESTIC_CACHE_DIR"}
         env["RESTIC_REPOSITORY"] = self.repo
+        if self._password is not None:
+            env["RESTIC_PASSWORD"] = self._password
+            return env
+        self._check_paths()
         env["RESTIC_PASSWORD_COMMAND"] = f"age -d -i {shlex.quote(self.identity)} {shlex.quote(self.password_file)}"
         return env
 
@@ -192,11 +219,16 @@ class ResticStore:
             return StoreError(f"cannot decrypt the store password with {self.identity}")
         return StoreError(f"restic failed: {text or f'exit status {returncode}'}")
 
-    def _run(self, args: list[str]) -> bytes:
+    def _exec(self, args: Sequence[str], extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
         try:
-            done = subprocess.run(["restic", *args], env=self._env(), capture_output=True, check=False)
+            return subprocess.run(
+                self._argv(args), env={**self._env(), **(extra_env or {})}, capture_output=True, check=False
+            )
         except OSError as exc:
             raise StoreError(f"could not run restic: {exc}") from exc
+
+    def _run(self, args: Sequence[str], extra_env: dict[str, str] | None = None) -> bytes:
+        done = self._exec(args, extra_env)
         if done.returncode != 0:
             raise self._explain(done.stderr, done.returncode)
         return bytes(done.stdout)
@@ -257,6 +289,28 @@ class ResticStore:
                     pass
             raise
 
+    def init_plain(self) -> None:
+        """Create the repository with this store's explicit password (``for_repository`` stores)."""
+        self._run(["init"])
+
+    def exists(self) -> bool:
+        """True when the repository exists and opens; False only when restic says it does not exist (exit 10)."""
+        done = self._exec(["cat", "config"])
+        if done.returncode == 0:
+            return True
+        if done.returncode == _RESTIC_NO_REPOSITORY:
+            return False
+        raise self._explain(done.stderr, done.returncode)
+
+    def copy_from(self, src: ResticStore, ids: list[str]) -> None:
+        """Copy snapshots ``ids`` from ``src`` into this repository; the source credentials travel in the environment."""
+        extra = {"RESTIC_FROM_REPOSITORY": src.repo}
+        if src._password is not None:
+            extra["RESTIC_FROM_PASSWORD"] = src._password
+        else:
+            extra["RESTIC_FROM_PASSWORD_COMMAND"] = src._env()["RESTIC_PASSWORD_COMMAND"]
+        self._run(["copy", *ids], extra)
+
     def backup(
         self,
         write: Callable[[IO[bytes]], CompressResult],
@@ -270,7 +324,6 @@ class ResticStore:
         for tag in extra_tags:
             self._check_tag(tag)
         argv = [
-            "restic",
             "backup",
             "--stdin",
             "--stdin-filename",
@@ -287,7 +340,7 @@ class ResticStore:
         argv += ["--time", when.strftime(_TIME_FORMAT), "--json"]
         try:
             proc = subprocess.Popen(
-                argv,
+                self._argv(argv),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -390,7 +443,7 @@ class ResticStore:
         """Write snapshot ``snapshot_id``'s tar of ``cfg`` to ``out``."""
         try:
             proc = subprocess.Popen(
-                ["restic", "dump", snapshot_id, f"/{cfg}.tar"],
+                self._argv(["dump", snapshot_id, f"/{cfg}.tar"]),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=self._env(),

@@ -15,3 +15,11 @@ def sync_dir() -> str:
 
 def state_path() -> str:
     return os.path.join(_xdg("XDG_STATE_HOME", "~/.local/state"), "config-saver", "sync-state.json")
+
+
+def remote_config_path() -> str:
+    return os.path.join(_xdg("XDG_CONFIG_HOME", "~/.config"), "config-saver", "sync.json")
+
+
+def lock_path() -> str:
+    return os.path.join(_xdg("XDG_STATE_HOME", "~/.local/state"), "config-saver", "sync.lock")

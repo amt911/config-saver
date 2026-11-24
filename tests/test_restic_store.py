@@ -619,3 +619,85 @@ def test_snapshots_fill_tags_and_and_the_extra_tag_filter(tmp_path: Path, monkey
 def test_snapshots_rejects_bad_tag_filter(tmp_path: Path) -> None:
     with pytest.raises(StoreError, match="tag"):
         _store(tmp_path).snapshots(tag="a,b")
+
+
+# ------------------------------------------------------------ for_repository
+
+
+def test_for_repository_env_has_password_and_nothing_inherited(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESTIC_PASSWORD_COMMAND", "leak")
+    monkeypatch.setenv("RESTIC_PASSWORD_FILE", "/leak")
+    env = ResticStore.for_repository("/srv/r", "s3cret")._env()
+    assert env["RESTIC_REPOSITORY"] == "/srv/r"
+    assert env["RESTIC_PASSWORD"] == "s3cret"
+    assert "RESTIC_PASSWORD_COMMAND" not in env and "RESTIC_PASSWORD_FILE" not in env
+
+
+def test_for_repository_options_become_o_pairs_and_password_not_on_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    store = ResticStore.for_repository("/srv/r", "s3cret", ["a=b", "c=d e"])
+    store.init_plain()
+    argv = rec.calls[0]["argv"]
+    assert argv == ["restic", "-o", "a=b", "-o", "c=d e", "init"]
+    assert "s3cret" not in " ".join(argv)
+    assert rec.calls[0]["env"]["RESTIC_PASSWORD"] == "s3cret"
+
+
+def test_for_repository_options_reach_backup_and_dump(monkeypatch: pytest.MonkeyPatch) -> None:
+    cls = _popen(monkeypatch, out=SUMMARY)
+    store = ResticStore.for_repository("/srv/r", "p", ["a=b"])
+    store.backup(_writer(), "cfg", WHEN, None)
+    assert cls.last.argv[:4] == ["restic", "-o", "a=b", "backup"]
+    store.dump(SID, "cfg", io.BytesIO())
+    assert cls.last.argv[:5] == ["restic", "-o", "a=b", "dump", SID]
+
+
+def test_default_constructor_is_unchanged(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    assert store._argv(["snapshots"]) == ["restic", "snapshots"]
+    assert "RESTIC_PASSWORD" not in store._env()
+
+
+def test_for_repository_store_is_picklable() -> None:
+    store = ResticStore.for_repository("/srv/r", "p", ["a=b"])
+    again = pickle.loads(pickle.dumps(store))
+    assert (again.repo, again._password, again._options) == ("/srv/r", "p", ("a=b",))
+
+
+def test_exists_distinguishes_missing_from_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = ResticStore.for_repository("/srv/r", "p")
+    for rc, expected in ((0, True), (10, False)):
+        rec = Recorder(tmp_path)
+        rec.returncode = rc
+        monkeypatch.setattr(rs.subprocess, "run", rec.run)
+        assert store.exists() is expected
+        assert rec.calls[0]["argv"] == ["restic", "cat", "config"]
+    rec.returncode = 12
+    with pytest.raises(StoreError):
+        store.exists()
+
+
+def test_copy_from_passes_source_credentials_by_env_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    dst = ResticStore.for_repository("/dst", "dstpw")
+    dst.copy_from(ResticStore.for_repository("/src", "srcpw"), [SID])
+    call = rec.calls[0]
+    assert call["argv"] == ["restic", "copy", SID]
+    assert call["env"]["RESTIC_FROM_REPOSITORY"] == "/src"
+    assert call["env"]["RESTIC_FROM_PASSWORD"] == "srcpw"
+    assert call["env"]["RESTIC_PASSWORD"] == "dstpw" and call["env"]["RESTIC_REPOSITORY"] == "/dst"
+    assert "srcpw" not in " ".join(call["argv"])
+
+
+def test_copy_from_age_store_uses_password_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    ResticStore.for_repository("/dst", "p").copy_from(_store(tmp_path), [SID])
+    env = rec.calls[0]["env"]
+    assert env["RESTIC_FROM_REPOSITORY"] == str(tmp_path / "restic")
+    assert env["RESTIC_FROM_PASSWORD_COMMAND"].startswith("age -d -i ")
+    assert "RESTIC_FROM_PASSWORD" not in env

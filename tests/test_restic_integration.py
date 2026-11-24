@@ -287,3 +287,17 @@ def test_real_restic_sync_tags_roundtrip(tmp_path: Path, sample_tree: Path, monk
     assert [s.id for s in found] == [tagged.id]
     assert {SYNC_TAG, f"{PARENT_TAG_PREFIX}none"} <= set(found[0].tags)
     assert len(store.snapshots("my-cfg")) == 2 and plain.id != tagged.id
+
+
+def test_plain_repository_init_exists_and_wrong_password(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESTIC_CACHE_DIR", str(tmp_path / "cache"))
+    repo = str(tmp_path / "plain-repo")
+    store = ResticStore.for_repository(repo, "pw-one")
+    assert store.exists() is False
+    store.init_plain()
+    assert store.exists() is True
+    assert store.snapshots() == []
+    with pytest.raises(StoreError):
+        ResticStore.for_repository(repo, "pw-two").exists()
+    with pytest.raises(StoreError):
+        ResticStore.for_repository(repo, "pw-two").snapshots()
