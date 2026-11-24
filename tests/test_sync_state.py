@@ -83,3 +83,16 @@ def test_parents_round_trip_and_old_files_load(tmp_path):
     old = tmp_path / "old.json"
     old.write_text(json.dumps({"heads": {"c": "h"}, "base": {"c": {}}}))
     assert load(str(old)) == SyncState(heads={"c": "h"}, base={"c": {}}, parents={})
+
+
+def test_last_prune_round_trip_and_old_files_load_as_none(tmp_path):
+    path = str(tmp_path / "s.json")
+    save(path, SyncState(heads={"c": "h"}, base={"c": {}}, last_prune=1234.5))
+    assert load(path).last_prune == 1234.5
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"heads": {"c": "h"}, "base": {"c": {}}}))
+    assert load(str(old)).last_prune is None
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"heads": {}, "base": {}, "last_prune": "yesterday"}))
+    with pytest.raises(SyncStateError):
+        load(str(bad))

@@ -18,6 +18,8 @@ class SyncState:
     # cfg -> parent id of the recorded head ("" = none): lets a later run find the recorded head's
     # nearest surviving ancestor when that head lost a fork or was pruned. Absent in old files.
     parents: dict[str, str] = field(default_factory=dict)
+    # Epoch seconds of the last successful ``restic prune`` from this machine; None = never (or old file).
+    last_prune: float | None = None
 
 
 def _corrupt(path: str, why: str) -> SyncStateError:
@@ -46,7 +48,11 @@ def load(path: str) -> SyncState:
         parents = data.get("parents", {})
         if not isinstance(parents, dict):
             raise TypeError("parents must be an object")
+        last_prune = data.get("last_prune")
+        if last_prune is not None and (isinstance(last_prune, bool) or not isinstance(last_prune, int | float)):
+            raise TypeError("last_prune must be a number")
         return SyncState(
+            last_prune=None if last_prune is None else float(last_prune),
             parents={str(k): str(v) for k, v in parents.items()},
             heads={str(k): str(v) for k, v in heads.items()},
             base={
@@ -78,6 +84,7 @@ def save(path: str, state: SyncState) -> None:
     payload = {
         "heads": state.heads,
         "parents": state.parents,
+        "last_prune": state.last_prune,
         "base": {
             cfg: {p: {"sha256": fp.sha256, "mode": fp.mode, "link": fp.link} for p, fp in side.items()}
             for cfg, side in state.base.items()

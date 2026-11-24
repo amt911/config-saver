@@ -11,7 +11,7 @@ import os
 import shutil
 import subprocess
 import tarfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -19,6 +19,7 @@ import pytest
 
 from config_saver.lib.errors import (
     ArchiveError,
+    StoreError,
     SyncConflictError,
     SyncStateError,
     SyncTransportError,
@@ -47,7 +48,14 @@ class Machine:
     """One fake machine: HOME, state, staging and lock paths, an engine on the shared repository."""
 
     def __init__(
-        self, root: Path, name: str, user: str, key: str, repo: str, store_cls: type[ResticStore] | None = None
+        self,
+        root: Path,
+        name: str,
+        user: str,
+        key: str,
+        repo: str,
+        store_cls: type[ResticStore] | None = None,
+        now: Callable[[], float] | None = None,
     ):
         self.home = root / name / "homes" / user
         self.home.mkdir(parents=True)
@@ -58,7 +66,10 @@ class Machine:
         store = None
         if store_cls is not None:
             store = store_cls.for_repository(repo, derive_password(key), ())
-        self.engine = SyncEngine(remote, key, self.state_file, self.sync_dir, self.lock_file, name, store=store)
+        extra = {"now": now} if now else {}
+        self.engine = SyncEngine(
+            remote, key, self.state_file, self.sync_dir, self.lock_file, name, store=store, **extra
+        )
 
     def model(self, *dirs: str, **kwargs):
         return make_model([str(self.home / d) for d in dirs], sync=True, **kwargs)
@@ -97,8 +108,14 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return {"key": str(key), "repo": str(tmp_path / "repo"), "root": tmp_path}
 
 
-def machine(env, name: str, user: str = "tester", store_cls: type[ResticStore] | None = None) -> Machine:
-    return Machine(env["root"], name, user, env["key"], env["repo"], store_cls)
+def machine(
+    env,
+    name: str,
+    user: str = "tester",
+    store_cls: type[ResticStore] | None = None,
+    now: Callable[[], float] | None = None,
+) -> Machine:
+    return Machine(env["root"], name, user, env["key"], env["repo"], store_cls, now)
 
 
 @pytest.fixture
@@ -165,7 +182,9 @@ def test_conflict_aborts_without_writes(pair, monkeypatch):
     assert exc.value.conflicts == {"c": ["home/user/cfg/app.conf"]}
     assert (b.home / "cfg" / "app.conf").read_text() == "from b\n"
     assert Path(b.state_file).read_bytes() == before_state
-    assert len(b.engine.store.snapshots("c", tag=SYNC_TAG)) == 2  # nothing of ours was published
+    assert (
+        len(b.engine.store.snapshots("c", tag=SYNC_TAG)) == 1
+    )  # nothing of ours was published (A's first is forgotten as unreferenced)
 
 
 def test_status_reports_without_writing(pair, monkeypatch):
@@ -703,6 +722,7 @@ def _flip(env, monkeypatch, *, same_path: bool, crash: bool = False):
     a.use(monkeypatch)
     a.engine.init()
     a.write("cfg/app.conf", "v1\n")
+    a.write("cfg/keep.txt", "keep\n")  # X carries it, so P stays referenced and survives A's housekeeping
     a.engine.run({"c": a.model("cfg")})
     b.use(monkeypatch)
     b.engine.run({"c": b.model("cfg")})
@@ -762,6 +782,7 @@ def test_orphan_with_an_earlier_time_wins_without_loss(env, monkeypatch):
 def test_recorded_head_absent_from_the_listing_loses_nothing(pair, monkeypatch):
     a, b = pair
     a.write("cfg/app.conf", "v1\n")
+    a.write("cfg/keep.txt", "keep\n")  # keeps P referenced
     a.engine.run({"c": a.model("cfg")})
     b.use(monkeypatch)
     b.engine.run({"c": b.model("cfg")})
@@ -811,3 +832,217 @@ def test_only_the_losing_cfg_snapshot_is_forgotten(env, monkeypatch):
     assert created["c"][0] not in alive  # the loser
     assert created["d"][0] in alive  # d's first snapshot won: another machine may already build on it
     assert len(created["d"]) == 1
+
+
+# ------------------------------------------------------------------ pruning
+
+DAY = 86400.0
+T0 = 1_000_000.0
+
+
+class Clock:
+    def __init__(self, t: float = T0):
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def _ids(m: Machine) -> set[str]:
+    return {s.id for s in m.engine.store.snapshots(tag=SYNC_TAG)}
+
+
+def _referenced(m: Machine, cfg: str = "c") -> set[str]:
+    """Every snapshot id the head manifest names (self resolved), plus the head."""
+    engine = m.engine
+    head = m.head()
+    with engine._workspace():
+        manifest = engine._read_manifest(head, cfg)
+    return {head} | {snap for _, snap in manifest.entries.values()}
+
+
+def test_unreferenced_snapshots_are_forgotten_and_carried_files_stay_restorable(env, monkeypatch):
+    a, b, c = machine(env, "a"), machine(env, "b"), machine(env, "c")
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f1.txt", "one\n")
+    a.engine.run({"c": a.model("cfg")})
+    first = a.head()
+    a.write("cfg/f1.txt", "one v2\n")
+    a.engine.run({"c": a.model("cfg")})
+    a.write("cfg/f2.txt", "two\n")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    b.write("cfg/f3.txt", "three\n")
+    b.engine.run({"c": b.model("cfg")})
+
+    alive = _ids(b)
+    assert first not in alive  # nothing references it any more
+    assert _referenced(b) <= alive  # and nothing a head names was forgotten
+    assert len(alive) < 4
+    c.use(monkeypatch)
+    c.engine.run({"c": c.model("cfg")})
+    assert (c.home / "cfg" / "f1.txt").read_text() == "one v2\n"  # carried from an older snapshot
+    assert (c.home / "cfg" / "f2.txt").read_text() == "two\n"
+    assert (c.home / "cfg" / "f3.txt").read_text() == "three\n"
+
+
+def test_cfgs_this_machine_does_not_sync_are_never_forgotten(env, monkeypatch):
+    a, b = machine(env, "a"), machine(env, "b")
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg2/x.txt", "x1\n")
+    a.engine.run({"d": a.model("cfg2")})
+    a.write("cfg2/x.txt", "x2\n")
+    a.engine.run({"d": a.model("cfg2")})
+    d_before = {s.id for s in a.engine.store.snapshots("d", tag=SYNC_TAG)}
+    b.use(monkeypatch)
+    b.write("cfg/y.txt", "y\n")
+    b.engine.run({"c": b.model("cfg")})
+    assert {s.id for s in b.engine.store.snapshots("d", tag=SYNC_TAG)} == d_before
+
+
+class _Counting(ResticStore):
+    prunes = 0
+    forgets: list[list[str]] = []
+    fail_forget = False
+    fail_prune = False
+
+    def forget_ids(self, ids):
+        type(self).forgets.append(list(ids))
+        if type(self).fail_forget and ids:
+            raise StoreError("restic forget failed")
+        super().forget_ids(ids)
+
+    def prune(self):
+        type(self).prunes += 1
+        if type(self).fail_prune:
+            raise StoreError("restic prune failed")
+        super().prune()
+
+
+@pytest.fixture
+def counting():
+    _Counting.prunes, _Counting.forgets = 0, []
+    _Counting.fail_forget = _Counting.fail_prune = False
+    return _Counting
+
+
+def test_prune_runs_at_most_once_a_week(env, monkeypatch, counting):
+    clock = Clock()
+    a = machine(env, "a", store_cls=counting, now=clock)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    a.engine.run({"c": a.model("cfg")})
+    assert counting.prunes == 1  # never pruned before
+    assert state_io.load(a.state_file).last_prune == T0
+    clock.t = T0 + 6 * DAY
+    a.write("cfg/f.txt", "2\n")
+    a.engine.run({"c": a.model("cfg")})
+    assert counting.prunes == 1
+    assert state_io.load(a.state_file).last_prune == T0
+    clock.t = T0 + 7 * DAY + 1
+    a.engine.run({"c": a.model("cfg")})
+    assert counting.prunes == 2
+    assert state_io.load(a.state_file).last_prune == T0 + 7 * DAY + 1
+
+
+def test_explicit_prune_forgets_and_prunes_regardless_of_the_clock(env, monkeypatch, counting):
+    clock = Clock()
+    a = machine(env, "a", store_cls=counting, now=clock)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    a.engine.run({"c": a.model("cfg")})
+    first = a.head()
+    a.write("cfg/f.txt", "2\n")
+    # Publish with housekeeping out of the way: make the forget in run a no-op by recording only.
+    a.engine.run({"c": a.model("cfg")})
+    # The run above already forgot `first`; plant a new orphan to find with prune().
+    store = a.engine.store
+    extra = store.backup(
+        lambda out: _empty_tar(out), "c", datetime.now(), None, extra_tags=[SYNC_TAG, f"{PARENT_TAG_PREFIX}none"]
+    )[0].id
+    assert first not in _ids(a)
+    before = counting.prunes
+    clock.t = T0 + 60  # well inside the week
+    forgotten = a.engine.prune({"c": a.model("cfg")})
+    assert extra in forgotten
+    assert extra not in _ids(a)
+    assert counting.prunes == before + 1
+    assert state_io.load(a.state_file).last_prune == T0 + 60
+
+
+def _empty_tar(out):
+    from config_saver.lib.tar_compressor.tar_compressor import CompressResult
+
+    with tarfile.open(fileobj=out, mode="w|") as tar:
+        info = tarfile.TarInfo(MANIFEST_MEMBER)
+        data = Manifest("c", [], {}).to_json()
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return CompressResult("")
+
+
+def test_forget_failure_after_publish_keeps_the_publish_and_the_state(env, monkeypatch, counting):
+    a = machine(env, "a", store_cls=counting)
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    a.engine.run({"c": a.model("cfg")})
+    a.write("cfg/f.txt", "2\n")
+    counting.fail_forget = True
+    with pytest.raises(SyncTransportError, match="forget"):
+        a.engine.run({"c": a.model("cfg")})
+    assert state_io.load(a.state_file).heads["c"] == a.head()  # the publish was not lost
+    counting.fail_forget = False
+    a.engine.run({"c": a.model("cfg")})  # nothing to republish: housekeeping catches up
+    assert (a.home / "cfg" / "f.txt").read_text() == "2\n"
+
+
+def test_prune_failure_after_publish_keeps_state_and_retries_next_run(env, monkeypatch, counting):
+    a = machine(env, "a", store_cls=counting, now=Clock())
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/f.txt", "1\n")
+    counting.fail_prune = True
+    with pytest.raises(SyncTransportError, match="prune"):
+        a.engine.run({"c": a.model("cfg")})
+    saved = state_io.load(a.state_file)
+    assert saved.heads["c"] == a.head()
+    assert saved.last_prune is None  # not recorded: the next run tries again
+    counting.fail_prune = False
+    a.engine.run({"c": a.model("cfg")})
+    assert state_io.load(a.state_file).last_prune == T0
+
+
+def test_a_publish_built_on_a_snapshot_forgotten_meanwhile_retries(env, monkeypatch):
+    """B's manifest would carry a file from P; A forgets P while B uploads. B must not publish that."""
+    fired: list[int] = []
+
+    class Slow(ResticStore):
+        def backup(self, write, cfg, when, description, extra_tags: Sequence[str] = ()):
+            if not fired:
+                fired.append(1)
+                a.use(monkeypatch)
+                a.write("cfg/app.conf", "from a\n")  # P's only file is replaced: P is unreferenced
+                a.engine.run({"c": a.model("cfg")})
+                b.use(monkeypatch)
+            return super().backup(write, cfg, when, description, extra_tags)
+
+    a, b, c = machine(env, "a"), machine(env, "b", store_cls=Slow), machine(env, "c")
+    a.use(monkeypatch)
+    a.engine.init()
+    a.write("cfg/app.conf", "v1\n")
+    a.engine.run({"c": a.model("cfg")})
+    b.use(monkeypatch)
+    b.engine.run({"c": b.model("cfg")})
+    b.write("cfg/b_new.txt", "b\n")
+    b.engine.run({"c": b.model("cfg")})
+    assert _referenced(b) <= _ids(b)  # the head names nothing that is gone
+    c.use(monkeypatch)
+    c.engine.run({"c": c.model("cfg")})
+    assert (c.home / "cfg" / "app.conf").read_text() == "from a\n"
+    assert (c.home / "cfg" / "b_new.txt").read_text() == "b\n"

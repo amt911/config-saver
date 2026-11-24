@@ -16,6 +16,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,7 +40,7 @@ from config_saver.lib.restic_store import (
 )
 from config_saver.lib.sync import state as state_file_io
 from config_saver.lib.sync.classify import Side, classify
-from config_saver.lib.sync.manifest import MANIFEST_MEMBER, SELF, Manifest, SnapRef, losers, select_head
+from config_saver.lib.sync.manifest import MANIFEST_MEMBER, SELF, Manifest, SnapRef, losers, select_head, unreferenced
 from config_saver.lib.sync.remote import SyncRemote
 from config_saver.lib.sync.scan import LocalScope, scan
 from config_saver.lib.sync.state import SyncState
@@ -50,6 +51,7 @@ MAX_ATTEMPTS = 3
 _NO_PARENT = "none"
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _STAGING = ".staging"
+PRUNE_INTERVAL = 7 * 24 * 3600.0
 
 
 @dataclass
@@ -62,10 +64,20 @@ class SyncReport:
 
 
 @dataclass
+class _Published:
+    """A won publish: the new snapshot per config, their manifests, and the listing that confirmed the win."""
+
+    ids: dict[str, str]
+    manifests: dict[str, Manifest]
+    by_cfg: dict[str, list[SnapRef]]
+
+
+@dataclass
 class _Cfg:
     """Everything known about one sync config after listing and scanning."""
 
     name: str
+    snaps: list[SnapRef]  # this config's listing when it was analysed
     model: Model
     scope: LocalScope
     local: Side
@@ -114,7 +126,9 @@ class SyncEngine:
         lock_file: str,
         host: str,
         store: ResticStore | None = None,
+        now: Callable[[], float] = time.time,
     ):
+        self.now = now
         self.remote = remote
         self.state_file = state_file
         self.lock_file = lock_file
@@ -146,6 +160,21 @@ class SyncEngine:
     def run(self, configs: Mapping[str, Model]) -> SyncReport:
         with self._locked():
             return _transport(lambda: self._run(configs, state_file_io.load(self.state_file)))
+
+    def prune(self, configs: Mapping[str, Model]) -> list[str]:
+        """Forget what no head needs, then reclaim the space whatever the clock says. Returns forgotten ids."""
+        with self._locked():
+            return _transport(lambda: self._prune(configs))
+
+    def _prune(self, configs: Mapping[str, Model]) -> list[str]:
+        state = state_file_io.load(self.state_file)
+        with self._workspace():
+            cfgs, _ = self._analyse(configs, state)
+            forgotten = self._forget(cfgs, None, {c.name: c.snaps for c in cfgs.values()})
+        self.store.prune()
+        state.last_prune = self.now()
+        state_file_io.save(self.state_file, state)
+        return forgotten
 
     def resolve(
         self, configs: Mapping[str, Model], side: Literal["local", "remote"], paths: list[str] | None
@@ -199,9 +228,10 @@ class SyncEngine:
                     _extend(total.applied, c.name, c.take_remote)
                     _extend(total.deleted, c.name, c.delete_local)
                 merged = {c.name: self._merge(c) for c in cfgs.values()}
-                new_ids = self._publish(cfgs, merged)
-                if new_ids is None:  # lost the race to another machine: start again from the listing
+                published = self._publish(cfgs, merged)
+                if published is None:  # lost the race to another machine: start again from the listing
                     continue
+                new_ids = published.ids
                 for c in cfgs.values():
                     side, publish = merged[c.name]
                     state.base[c.name] = side
@@ -212,12 +242,42 @@ class SyncEngine:
                     if c.name in new_ids:
                         _extend(total.published, c.name, sorted(publish))
                 state_file_io.save(self.state_file, state)
+                # Housekeeping only after the publish is durable: a failure here loses nothing.
+                self._forget(cfgs, published, published.by_cfg)
+                if state.last_prune is None or self.now() - state.last_prune >= PRUNE_INTERVAL:
+                    self.store.prune()
+                    state.last_prune = self.now()
+                    state_file_io.save(self.state_file, state)
                 return total
         raise SyncTransportError("another machine kept publishing; try again")
 
-    def _publish(self, cfgs: dict[str, _Cfg], merged: dict[str, tuple[Side, set[str]]]) -> dict[str, str] | None:
-        """Upload what only this machine has; ``{}`` if nothing, ``None`` if another machine's publish won."""
+    def _forget(
+        self, cfgs: dict[str, _Cfg], published: _Published | None, listing: dict[str, list[SnapRef]]
+    ) -> list[str]:
+        """Forget snapshots no head needs, among the configs this run read, per the confirming listing.
+
+        A config whose head in that listing is not the one this run holds a manifest for (another
+        machine built on it since the analysis) is left alone: that head's manifest was never read,
+        so nothing could safely be called unreferenced.
+        """
+        doomed: set[str] = set()
+        for c in cfgs.values():
+            snaps = listing.get(c.name, c.snaps)
+            head, manifest = c.head, c.remote
+            if published and c.name in published.ids:
+                head, manifest = published.ids[c.name], published.manifests[c.name]
+            if select_head(snaps) != head:
+                continue
+            known = {head: manifest} if head and manifest else {}
+            doomed |= unreferenced(snaps, known) | losers(snaps)
+        ids = sorted(doomed)
+        self.store.forget_ids(ids)
+        return ids
+
+    def _publish(self, cfgs: dict[str, _Cfg], merged: dict[str, tuple[Side, set[str]]]) -> _Published | None:
+        """Upload what only this machine has; empty ids if nothing, ``None`` if another machine's publish won."""
         created: dict[str, str] = {}
+        manifests: dict[str, Manifest] = {}
         for c in cfgs.values():
             side, publish = merged[c.name]
             if not publish:
@@ -230,12 +290,24 @@ class SyncEngine:
                 self._writer(compressor, only, manifest), c.name, datetime.now(), None, extra_tags=tags
             )
             created[c.name] = snapshot.id
+            manifests[c.name] = manifest
         if not created:
-            return created
+            return _Published({}, {}, {})
         by_cfg = self._by_cfg(self.store.snapshots(tag=SYNC_TAG))
+        listed = {s.id for snaps in by_cfg.values() for s in snaps}
+        # A manifest naming a snapshot that is gone (another machine's housekeeping forgot it while we
+        # uploaded) cannot be restored: treat it like a lost race, never publish it.
+        dangling = [
+            name
+            for name, snap_id in created.items()
+            if any(ref not in listed for _, ref in manifests[name].resolve(snap_id).entries.values())
+        ]
+        if dangling:
+            self.store.forget_ids([created[n] for n in dangling])
+            return None
         # Ours won when it is on the winning chain: another machine may already have built on top of it.
         if all(snap_id not in losers(by_cfg.get(name, [])) for name, snap_id in created.items()):
-            return created
+            return _Published(created, manifests, by_cfg)
         # Only the losers: a snapshot of another cfg that won may already have another machine on top of it.
         self.store.forget_ids([i for name, i in created.items() if i in losers(by_cfg.get(name, []))])
         return None
@@ -300,7 +372,7 @@ class SyncEngine:
         local_scope = {p for p in set(base) | set(local) | set(remote_side) if scope.contains(p)}
         plan = classify(base, local, remote_side, local_scope, set(remote.scope) if remote else set())
         return _Cfg(
-            name, model, scope, local, local_scope, head, head_parent, remote, base,
+            name, snaps, model, scope, local, local_scope, head, head_parent, remote, base,
             plan.take_remote, plan.delete_local, plan.publish, plan.conflicts,
         )  # fmt: skip
 
