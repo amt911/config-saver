@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from config_saver.lib.errors import ArchiveError, StoreError
@@ -119,3 +121,59 @@ def find_head(snaps: list[tuple[str, str | None]], cfg: str) -> str | None:
     if len(heads) != 1:
         raise StoreError(f"sync history of {cfg} forked")
     return heads[0]
+
+
+@dataclass(frozen=True)
+class SnapRef:
+    """One sync snapshot of a single config: its id, the parent it names, its time."""
+
+    id: str
+    parent: str | None
+    time: datetime
+
+
+def _winning_chain(snaps: list[SnapRef]) -> list[str]:
+    """Root-to-head ids; at every fork the earliest `(time, id)` child wins.
+
+    A snapshot whose parent is not listed is a root; several roots compete like
+    siblings. Every machine holding the same snapshots computes the same chain.
+    """
+    ids = {s.id for s in snaps}
+    children: dict[str | None, list[SnapRef]] = {}
+    for snap in snaps:
+        key = snap.parent if snap.parent in ids else None
+        children.setdefault(key, []).append(snap)
+    chain: list[str] = []
+    seen: set[str] = set()
+    level = children.get(None, [])
+    while level:
+        winner = min(level, key=lambda s: (s.time, s.id))
+        if winner.id in seen:  # restic cannot make a cycle; never loop on one
+            break
+        seen.add(winner.id)
+        chain.append(winner.id)
+        level = children.get(winner.id, [])
+    return chain
+
+
+def select_head(snaps: list[SnapRef]) -> str | None:
+    """Head of one config's snapshot chain, or None when there are none."""
+    chain = _winning_chain(snaps)
+    return chain[-1] if chain else None
+
+
+def losers(snaps: list[SnapRef]) -> set[str]:
+    """Ids of snapshots that are not on the winning chain."""
+    return {s.id for s in snaps} - set(_winning_chain(snaps))
+
+
+def unreferenced(snaps: list[SnapRef], heads: Mapping[str, Manifest]) -> set[str]:
+    """Snapshot ids that are neither a head nor referenced by any head manifest.
+
+    `heads` maps each head snapshot id to its manifest; the self marker in a
+    manifest resolves to that head's own id.
+    """
+    keep = set(heads)
+    for head_id, manifest in heads.items():
+        keep.update(snap for _, snap in manifest.resolve(head_id).entries.values())
+    return {s.id for s in snaps} - keep

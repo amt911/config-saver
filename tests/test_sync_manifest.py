@@ -1,10 +1,22 @@
 import json
+import random
+from datetime import datetime, timedelta, timezone
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from config_saver.lib.errors import ArchiveError, StoreError
 from config_saver.lib.sync.classify import Fingerprint
-from config_saver.lib.sync.manifest import SELF, Manifest, find_head
+from config_saver.lib.sync.manifest import (
+    SELF,
+    Manifest,
+    SnapRef,
+    find_head,
+    losers,
+    select_head,
+    unreferenced,
+)
 
 H = "a" * 64
 SNAP = "b" * 64
@@ -162,3 +174,137 @@ def test_from_json_rejection_messages(data, message):
 def test_mode_bounds_are_inclusive(mode):
     parsed = Manifest.from_json(_entry(mode=mode))
     assert parsed.entries["a/f"][0].mode == mode
+
+
+T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _t(n: int) -> datetime:
+    return T0 + timedelta(seconds=n)
+
+
+def _ref(i: str, parent: str | None, n: int) -> SnapRef:
+    return SnapRef(i, parent, _t(n))
+
+
+def test_select_head_empty() -> None:
+    assert select_head([]) is None
+    assert losers([]) == set()
+
+
+def test_select_head_linear_chain_any_order() -> None:
+    snaps = [_ref("c", "b", 3), _ref("a", None, 1), _ref("b", "a", 2)]
+    assert select_head(snaps) == "c"
+    assert losers(snaps) == set()
+
+
+def test_fork_earliest_wins_regardless_of_order() -> None:
+    a = _ref("a", None, 1)
+    x = _ref("x", "a", 5)
+    y = _ref("y", "a", 4)
+    assert select_head([a, x, y]) == "y"
+    assert select_head([y, x, a]) == "y"
+    assert losers([a, x, y]) == {"x"}
+
+
+def test_fork_time_tie_smaller_id_wins() -> None:
+    a = _ref("a", None, 1)
+    assert select_head([a, _ref("q", "a", 4), _ref("p", "a", 4)]) == "p"
+
+
+def test_losers_descendants_are_losers() -> None:
+    snaps = [
+        _ref("a", None, 1),
+        _ref("w", "a", 2),
+        _ref("l", "a", 3),
+        _ref("l2", "l", 4),
+        _ref("l3", "l2", 5),
+        _ref("w2", "w", 9),
+    ]
+    assert select_head(snaps) == "w2"
+    assert losers(snaps) == {"l", "l2", "l3"}
+
+
+def test_fork_picks_by_time_not_by_descendant_depth() -> None:
+    snaps = [_ref("a", None, 1), _ref("w", "a", 2), _ref("l", "a", 3), _ref("l2", "l", 4)]
+    assert select_head(snaps) == "w"
+
+
+def test_unknown_parent_counts_as_root() -> None:
+    assert select_head([_ref("b", "gone", 2)]) == "b"
+
+
+def test_several_roots_earliest_wins() -> None:
+    snaps = [_ref("r2", None, 2), _ref("r1", None, 1), _ref("c1", "r1", 3), _ref("c2", "r2", 4)]
+    assert select_head(snaps) == "c1"
+    assert losers(snaps) == {"r2", "c2"}
+
+
+def test_cycle_terminates() -> None:
+    snaps = [_ref("a", "b", 1), _ref("b", "a", 2)]
+    assert select_head(snaps) is None
+    assert losers(snaps) == {"a", "b"}
+
+
+def test_cycle_hanging_off_chain_terminates() -> None:
+    snaps = [_ref("r", None, 1), _ref("a", "r", 2), _ref("b", "a", 3)]
+    assert select_head(snaps) == "b"
+
+
+def _m(entries: dict[str, str]) -> Manifest:
+    return Manifest("c", ["s"], {p: (Fingerprint(H, 0o644), s) for p, s in entries.items()})
+
+
+def test_unreferenced_exact() -> None:
+    snaps = [_ref(i, None, n) for n, i in enumerate(["h", "r1", "r2", "old", "other"])]
+    heads = {"h": _m({"s/a": SELF, "s/b": "r1", "s/c": "r2"})}
+    assert unreferenced(snaps, heads) == {"old", "other"}
+
+
+def test_unreferenced_self_resolves_per_head_across_configs() -> None:
+    snaps = [_ref(i, None, n) for n, i in enumerate(["h1", "h2", "x", "y"])]
+    heads = {"h1": _m({"s/a": "y"}), "h2": _m({"s/a": SELF})}
+    # keys are head snapshot ids: SELF means h2 itself, never some other head
+    assert unreferenced(snaps, heads) == {"x"}
+
+
+def test_unreferenced_without_heads_is_everything() -> None:
+    snaps = [_ref("a", None, 1), _ref("b", "a", 2)]
+    assert unreferenced(snaps, {}) == {"a", "b"}
+
+
+@st.composite
+def _forests(draw: st.DrawFn) -> list[SnapRef]:
+    n = draw(st.integers(0, 10))
+    refs: list[SnapRef] = []
+    for i in range(n):
+        parent = draw(st.one_of(st.none(), st.integers(0, max(i - 1, 0)))) if i else None
+        refs.append(SnapRef(f"{i:02d}", None if parent is None else f"{parent:02d}", _t(draw(st.integers(0, 3)))))
+    return refs
+
+
+@given(_forests(), st.randoms())
+def test_select_head_invariant_under_permutation(snaps: list[SnapRef], rnd: random.Random) -> None:
+    shuffled = list(snaps)
+    rnd.shuffle(shuffled)
+    assert select_head(shuffled) == select_head(snaps)
+    assert losers(shuffled) == losers(snaps)
+
+
+@given(_forests(), st.randoms())
+def test_head_is_never_a_loser(snaps: list[SnapRef], rnd: random.Random) -> None:
+    head = select_head(snaps)
+    assert (head is None) == (not snaps)
+    if head is not None:
+        assert head not in losers(snaps)
+        assert head in {s.id for s in snaps}
+
+
+@given(_forests(), st.lists(st.integers(0, 12), max_size=6))
+def test_unreferenced_disjoint_from_heads_and_referenced(snaps: list[SnapRef], refs: list[int]) -> None:
+    head = select_head(snaps)
+    manifest = _m({f"s/{k}": f"{r:02d}" for k, r in enumerate(refs)})
+    result = unreferenced(snaps, {} if head is None else {head: manifest})
+    assert result.isdisjoint({f"{r:02d}" for r in refs})
+    assert head not in result
+    assert result == {s.id for s in snaps} - {head} - {f"{r:02d}" for r in refs}
