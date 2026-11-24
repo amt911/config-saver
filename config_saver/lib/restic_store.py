@@ -188,9 +188,10 @@ class ResticStore:
 
     # ----------------------------------------------------------------- plumbing
 
-    def _argv(self, args: Sequence[str]) -> list[str]:
+    def _argv(self, args: Sequence[str], options: Sequence[str] | None = None) -> list[str]:
         """The restic command line: every configured option becomes a global ``-o`` pair."""
-        options = [part for option in self._options for part in ("-o", option)]
+        chosen = self._options if options is None else options
+        options = [part for option in chosen for part in ("-o", option)]
         return ["restic", *options, *args]
 
     def _check_paths(self) -> None:
@@ -219,16 +220,23 @@ class ResticStore:
             return StoreError(f"cannot decrypt the store password with {self.identity}")
         return StoreError(f"restic failed: {text or f'exit status {returncode}'}")
 
-    def _exec(self, args: Sequence[str], extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
+    def _exec(
+        self,
+        args: Sequence[str],
+        extra_env: dict[str, str] | None = None,
+        options: Sequence[str] | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
         try:
             return subprocess.run(
-                self._argv(args), env={**self._env(), **(extra_env or {})}, capture_output=True, check=False
+                self._argv(args, options), env={**self._env(), **(extra_env or {})}, capture_output=True, check=False
             )
         except OSError as exc:
             raise StoreError(f"could not run restic: {exc}") from exc
 
-    def _run(self, args: Sequence[str], extra_env: dict[str, str] | None = None) -> bytes:
-        done = self._exec(args, extra_env)
+    def _run(
+        self, args: Sequence[str], extra_env: dict[str, str] | None = None, options: Sequence[str] | None = None
+    ) -> bytes:
+        done = self._exec(args, extra_env, options)
         if done.returncode != 0:
             raise self._explain(done.stderr, done.returncode)
         return bytes(done.stdout)
@@ -304,12 +312,20 @@ class ResticStore:
 
     def copy_from(self, src: ResticStore, ids: list[str]) -> None:
         """Copy snapshots ``ids`` from ``src`` into this repository; the source credentials travel in the environment."""
+        if not ids:
+            raise StoreError("refusing to copy with no snapshot ids: restic would copy every snapshot")
+        # -o options are process-global: the one restic process needs both repositories' options.
+        merged: dict[str, str] = {}
+        for option in (*self._options, *src._options):
+            key = option.partition("=")[0]
+            if merged.setdefault(key, option) != option:
+                raise StoreError(f"conflicting restic options for {key!r}: {merged[key]!r} vs {option!r}")
         extra = {"RESTIC_FROM_REPOSITORY": src.repo}
         if src._password is not None:
             extra["RESTIC_FROM_PASSWORD"] = src._password
         else:
             extra["RESTIC_FROM_PASSWORD_COMMAND"] = src._env()["RESTIC_PASSWORD_COMMAND"]
-        self._run(["copy", *ids], extra)
+        self._run(["copy", *ids], extra, list(merged.values()))
 
     def backup(
         self,

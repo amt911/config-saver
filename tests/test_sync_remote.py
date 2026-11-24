@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -37,8 +38,6 @@ def test_derive_password_differs_per_key(tmp_path: Path) -> None:
 
 
 def test_derive_password_is_the_documented_sha256(tmp_path: Path) -> None:
-    import hashlib
-
     expected = hashlib.sha256(b"config-saver-sync-v1\0" + KEY.encode()).hexdigest()
     assert derive_password(_identity(tmp_path, f"# c\n{KEY}\n")) == expected
 

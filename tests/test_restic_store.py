@@ -701,3 +701,34 @@ def test_copy_from_age_store_uses_password_command(tmp_path: Path, monkeypatch: 
     assert env["RESTIC_FROM_REPOSITORY"] == str(tmp_path / "restic")
     assert env["RESTIC_FROM_PASSWORD_COMMAND"].startswith("age -d -i ")
     assert "RESTIC_FROM_PASSWORD" not in env
+
+
+def _copy_argv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dst: list[str], src: list[str]) -> list[str]:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    ResticStore.for_repository("/dst", "p", dst).copy_from(ResticStore.for_repository("/src", "q", src), [SID])
+    return rec.calls[0]["argv"]
+
+
+def test_copy_from_applies_source_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _copy_argv(tmp_path, monkeypatch, [], ["rclone.args=serve"]) == [
+        "restic", "-o", "rclone.args=serve", "copy", SID,
+    ]  # fmt: skip
+
+
+def test_copy_from_dedupes_identical_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    argv = _copy_argv(tmp_path, monkeypatch, ["a=b", "c=d"], ["a=b", "e=f"])
+    assert argv == ["restic", "-o", "a=b", "-o", "c=d", "-o", "e=f", "copy", SID]
+
+
+def test_copy_from_conflicting_options_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(StoreError, match="conflicting"):
+        _copy_argv(tmp_path, monkeypatch, ["a=b"], ["a=c"])
+
+
+def test_copy_from_without_ids_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    with pytest.raises(StoreError, match="no snapshot ids"):
+        ResticStore.for_repository("/dst", "p").copy_from(ResticStore.for_repository("/src", "q"), [])
+    assert rec.calls == []
