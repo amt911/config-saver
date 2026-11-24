@@ -227,11 +227,11 @@ itself.
 | `3` | Configuration failed validation (malformed YAML, bad shape, unknown key) |
 | `4` | Permission denied, including `only_root_user: true` run as non-root |
 | `5` | Archive error: corrupt archive, or a member refused as unsafe; an unusable restic store; a failed prune (after a complete batch report); a failed migration (`--migrate`, including an archive that could not be decrypted) |
-| `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`, `--encrypt-to` with the restic store) |
+| `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`, `--encrypt-to` with the restic store; sync usage errors: `--sync-init` against a different URL than the one set up, `--sync-move` to the URL already in use, a malformed `--sync-option` or one without `--sync-init`/`--sync-move`, `--path` without `--sync-resolve`, `--encrypt-to`/`--encrypt-method` with a `--sync*` flag, more than one sync verb or a sync verb combined with another action) |
 | `7` | `--export-config NAME` matched no saved configuration |
 | `8` | `--strict` and at least one configured path was missing |
 | `9` | Encryption or decryption failed (backend missing, wrong key, bad recipient) |
-| `10` | I/O error, including an unreachable sync remote or a sync already set up |
+| `10` | I/O error, including an unreachable sync remote |
 | `11` | `--sync` or `--sync-status` found paths changed on both machines since the last sync (nothing was written); see [Sync between machines](#sync-between-machines) |
 
 argparse itself exits with `2` for usage errors such as a missing action flag. Sync needing a tool
@@ -867,7 +867,8 @@ options are stored in `~/.config/config-saver/sync.json` (mode `0600`). The comm
 config-saver --sync-init "rclone:Google Drive:config-saver-sync"
 
 # Proton Drive: an rclone remote of type protondrive, here named "Proton".
-# --sync-option rclone.args passes extra arguments to rclone, e.g. a transaction rate limit:
+# --sync-option rclone.args replaces restic's default rclone arguments, so it must start with
+# `serve restic --stdio`; the rest is up to you, e.g. a transaction rate limit:
 config-saver --sync-init "rclone:Proton:config-saver-sync" \
     --sync-option rclone.args="serve restic --stdio --tpslimit 5"
 
@@ -916,9 +917,21 @@ state survive the move.
 superseded snapshot is kept for 24 hours (a slower machine never builds on a forgotten one).
 `restic prune` runs at most once every 7 days from a sync run; `--sync-prune` forces it now.
 
-**Rotating the age key.** The password follows the age identity. After rotating the key, run
-`restic key passwd` on the sync repository (with the old derived password), or the new key cannot
-open it.
+**Rotating the age key.** The password follows the age identity, so after rotating the key the
+repository must be re-keyed. Keep the old identity file and compute the old and the new derived
+password from their files (the password is the hex sha256 of `config-saver-sync-v1`, a NUL byte and
+the `AGE-SECRET-KEY-` line):
+
+```bash
+derive() { printf 'config-saver-sync-v1\0%s' "$(grep -m1 '^AGE-SECRET-KEY-' "$1" | tr -d '\r')" | sha256sum | cut -d' ' -f1; }
+derive new-key.txt > /tmp/new-pw   # use a private directory on a real machine
+RESTIC_PASSWORD="$(derive old-key.txt)" restic -r <sync repository URL> key passwd --new-password-file /tmp/new-pw
+shred -u /tmp/new-pw
+```
+
+(`restic key add` followed by `restic key remove` does the same in two steps.) Pass the repository
+options you gave `--sync-init` with `-o` (for example `-o rclone.args=...`). Do this once, then
+put the new identity on every other machine.
 
 **Limits.**
 
