@@ -6,20 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [3.6.0] - 2026-11-23
+## [3.7.0] - 2026-11-24
 
 ### Added
 
 - **Multi-machine sync** (`--sync`): the files of every configuration marked `sync: true` are kept
-  identical across machines through a dedicated restic repository (encrypted, password wrapped with
-  age) stored in a git working tree pushed to a private remote. The remote only ever sees
-  ciphertext and fixed commit metadata (`sync` / `config-saver`).
+  identical across machines through a dedicated restic repository on any restic remote (rclone,
+  SFTP, local path). The remote only ever sees ciphertext. The password is derived from the shared
+  age identity, so nothing else is copied between machines; rotating the age key needs
+  `restic key passwd` on the sync repository.
   - Per-file three-way comparison against the last sync: remote-only changes are applied, local-only
     changes are published, deletions propagate. A file changed on two machines is a **conflict**:
     the run writes nothing and exits `11`.
-  - `--sync-init <git-url> --encrypt-to <age recipient>` sets up the first machine; the same command
-    clones on the next ones. `--sync-status` shows what a run would do; `--sync-resolve local|remote
-    [--path P]` settles conflicts.
+  - `--sync-init <restic-url> [--sync-option K=V]` sets sync up (prints `created` or `joined`) and
+    stores the URL in `~/.config/config-saver/sync.json` (`0600`); `--sync-status` shows what a run
+    would do; `--sync-resolve local|remote [--path P]` settles conflicts. `rclone` is needed only
+    for `rclone:` URLs.
+  - Two machines publishing at once: the earliest wins, the other retries (at most 3, then exit
+    `10`).
+  - `--sync-move NEWURL` copies every sync snapshot to another repository, verifies, then switches;
+    run it on every machine. History and recorded state survive the move.
+  - Pruning: snapshots no head needs are forgotten after a successful sync (a superseded one is kept
+    24 h); `restic prune` runs at most every 7 days; `--sync-prune` forces it.
+  - `sync_max_mb` per configuration (default 50, minimum 1) replaces the fixed 50 MiB limit. A hash
+    cache in the state file skips unchanged files.
   - Definitions stay per machine: each machine syncs only what its own YAML declares, and never
     deletes or overwrites paths it does not declare.
   - Restored bytes go through the same extraction guard as `--decompress`; every snapshot is

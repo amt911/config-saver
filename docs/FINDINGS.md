@@ -129,3 +129,28 @@ banner was seen; look at the screen once.
 `TarDecompressor` opens archives with `r:*` (the sync engine reads the manifest of restic dumps that
 way), so `--decompress` now also accepts uncompressed and other-compression tars, not only `.tar.gz`.
 It is a side effect of sync, not a feature to rely on; the extraction guard applies to all of them.
+
+## `restic copy` gives copied snapshots new ids
+
+`--sync-move` uses `restic copy`, which assigns the copies new snapshot ids. Anything keyed on the id
+(each machine's recorded state, the fork ordering) would break across a move, so config-saver
+identifies a sync snapshot by restic's `original` field (the id it had where it was first created)
+and falls back to `id` when there is none. Keying on `id` looked right and lost history on the first
+move test.
+
+## main is PR-only: releases go through a PR
+
+Pushing to `main` fails with GH013 ("Changes must be made through a pull request"). A release (version
+bump, changelog) is a branch plus a PR, never a direct push or tag-from-main shortcut.
+
+## Long pre-push hooks outlive an idle SSH connection
+
+The pre-push hook (pytest, then the mutation gate) runs for minutes with the SSH connection to GitHub
+idle; the server closes it (rc=141, "Connection to github.com closed by remote host"). Push with
+`GIT_SSH_COMMAND="ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20" git push ...`.
+
+## `restic prune` can fail after a successful sync publish
+
+`restic prune` needs an exclusive repository lock. If another machine is mid-backup it fails, and the
+sync run exits `10` even though the publish already succeeded. Nothing is lost; the next run retries
+(the 7-day throttle is only recorded after a prune succeeds, and `--sync-prune` forces it).

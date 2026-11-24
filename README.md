@@ -200,7 +200,7 @@ config-saver --compress
 - `--encrypt-to RECIPIENT`: Encrypt the archive for this age public key or gpg key id (repeatable)
 - `--encrypt-method {age,gpg}`: Backend for `--encrypt-to` (default `age`)
 - `--identity FILE`: Key file used to decrypt an encrypted archive (required for `age`)
-- `--sync`: Sync the configurations marked `sync: true` with your other machines; `--sync-init URL [--encrypt-to RECIPIENT]`: set sync up; `--sync-status`: show what `--sync` would do (exit `11` on conflicts); `--sync-resolve local|remote [--path P]`: settle conflicts (`--path` is repeatable). See [Sync between machines](#sync-between-machines)
+- `--sync`: Sync the configurations marked `sync: true` with your other machines; `--sync-init URL [--sync-option K=V]`: set sync up against a restic repository URL (`--sync-option` is repeatable); `--sync-move URL [--sync-option K=V]`: move the sync repository to another URL; `--sync-prune`: forget unneeded sync snapshots and reclaim their space now; `--sync-status`: show what `--sync` would do (exit `11` on conflicts); `--sync-resolve local|remote [--path P]`: settle conflicts (`--path` is repeatable). See [Sync between machines](#sync-between-machines)
 - `--version`/`-v`: Show program version and exit
 
 With a restic store, `--compress` snapshots into it, then prunes by each configuration's
@@ -235,7 +235,7 @@ itself.
 | `11` | `--sync` or `--sync-status` found paths changed on both machines since the last sync (nothing was written); see [Sync between machines](#sync-between-machines) |
 
 argparse itself exits with `2` for usage errors such as a missing action flag. Sync needing a tool
-or a set-up that is absent exits `2`; a too-large sync config (over 50 MiB) or an unreadable sync
+or a set-up that is absent exits `2`; a too-large sync config (over its `sync_max_mb`, 50 MiB by default) or an unreadable sync
 state file exits `3`; an unknown `--path` for `--sync-resolve` exits `6`.
 
 ## Deduplicated storage (restic)
@@ -715,10 +715,12 @@ reported, because a backup must not skip anything in silence:
 ### Sync between machines (`sync: true`)
 
 ```yaml
-sync: true   # default false; cannot be combined with only_root_user
+sync: true          # default false; cannot be combined with only_root_user
+sync_max_mb: 4096   # default 50 (MiB), minimum 1: largest total size this configuration may have when synced
 ```
 
 Marks the configuration as shared by `--sync`; see [Sync between machines](#sync-between-machines).
+Session directories of agents (opencode, Codex) are big: give those YAMLs a high `sync_max_mb`.
 
 ### Root-only configurations (optional)
 
@@ -844,35 +846,79 @@ And when user `maria` decompresses it, it becomes:
 ## Sync between machines
 
 `--sync` keeps the files of configurations marked `sync: true` identical across your machines
-through a private git remote. The store is a separate encrypted restic repository, built the same way
-as the backup store (see [Deduplicated storage](#deduplicated-storage-restic)) but kept apart in
-`~/.local/share/config-saver/sync`; the backup store is not touched. Git only ever sees ciphertext. Needs `git`, `restic` and `age`.
+through a restic repository that you host anywhere restic can reach: an rclone remote (Google Drive,
+Proton Drive, ...), SFTP, or a plain path on a mounted disk. The store is a separate encrypted
+restic repository, built the same way as the backup store (see
+[Deduplicated storage](#deduplicated-storage-restic)); the backup store is not touched. The remote
+only ever sees ciphertext. Needs `restic` and `age`, plus `rclone` only for `rclone:` URLs.
 
-**First machine.** Create an empty **private** repository, then:
+**What syncs.** Only the YAMLs marked `sync: true`. KDE and other per-machine configurations stay
+local: leave them unmarked.
+
+**Password.** It is derived from the shared age identity (`~/.config/age/key.txt`; `--identity`
+overrides): there is nothing else to copy between machines.
+
+**First machine.** Create the remote, then point config-saver at it. The URL and the repository
+options are stored in `~/.config/config-saver/sync.json` (mode `0600`). The command prints `created`
+(new repository) or `joined` (it already existed).
 
 ```bash
-config-saver --sync-init git@github.com:you/my-configs.git --encrypt-to <age recipient>
+# Google Drive: first run `rclone config` and create a remote named "Google Drive"
+config-saver --sync-init "rclone:Google Drive:config-saver-sync"
+
+# Proton Drive: an rclone remote of type protondrive, here named "Proton".
+# --sync-option rclone.args passes extra arguments to rclone, e.g. a transaction rate limit:
+config-saver --sync-init "rclone:Proton:config-saver-sync" \
+    --sync-option rclone.args="serve restic --stdio --tpslimit 5"
+
+# Anything else restic understands: SFTP, or a local path / mounted disk
+config-saver --sync-init "sftp:user@host:/srv/config-saver-sync"
+config-saver --sync-init /mnt/disk/config-saver-sync
 ```
 
-Mark what to share in your configuration with `sync: true`, then run `config-saver --sync`.
+Re-running `--sync-init` with a different URL is refused (exit `6`): use `--sync-move`. Mark what to
+share in your configuration with `sync: true`, then run `config-saver --sync`.
 
-**Next machines.** Copy the same age private key to the machine (it decrypts the store) and run
-the same `--sync-init <url>`: when the remote already holds a store, it is cloned and no
-`--encrypt-to` is needed. Then mark the same configurations `sync: true` and run `--sync-status` and
-`--sync-resolve local|remote` **before** enabling the timer: files that already exist here and
-differ from the remote are conflicts on the first sync. Only then run `--sync` (or enable the timer).
+**Next machines.** Put the same age identity on the machine and run the same
+`--sync-init <url>` (it prints `joined`). Then mark the same configurations `sync: true` and run
+`--sync-status` and `--sync-resolve local|remote` **before** enabling the timer
+(`systemctl --user enable --now config-saver-sync.timer`): files that already exist here and differ
+from the remote are conflicts on the first sync.
 
 **What a run does.** Each `--sync` takes remote changes that this machine did not touch, publishes
 local changes that nobody else touched, and propagates deletions. Output is one line per
 configuration (`applied / deleted / published`), plus `skipped (no local config): ...` for remote
 configurations this machine does not define. `--sync-status` shows the same per path and changes
-nothing.
+nothing. Unchanged files are not hashed again: the state file keeps a cache keyed on size, mtime,
+ctime, inode and `normalize_content`, and a change of `HOME` drops it.
+
+**Two machines at once.** If two machines publish at the same time, the earliest wins and the other
+retries automatically (at most 3 times, then exit `10`). Nothing is lost; at worst a conflict
+(exit `11`) is reported.
 
 **Conflicts.** If the same path changed on two machines since the last sync, `--sync` exits `11`,
 writes nothing, and prints one `config: path` line per conflict followed by
 `Resolve with: config-saver --sync-resolve local|remote [--path P]`. Choose `local` (keep this
 machine's version) or `remote` (take the other's); without `--path` every conflict is settled the
 same way, and `--path ~/.zshrc` (repeatable) settles only those.
+
+**Before leaving home.** If the last session ended less than 15 minutes ago, run `config-saver --sync`
+by hand instead of waiting for the timer. Close agents first (opencode, Codex...): their SQLite
+databases would otherwise be copied mid-write.
+
+**Switching provider.** `config-saver --sync-move NEWURL [--sync-option K=V ...]` copies every sync
+snapshot to the new repository (created with the same chunker parameters if missing), verifies the
+heads and only then rewrites `sync.json`; an interrupted move leaves the old repository in use. Run
+it on **every** machine: snapshots already copied are skipped. History and each machine's recorded
+state survive the move.
+
+**Pruning.** After a successful sync, snapshots no head needs are forgotten, except that a
+superseded snapshot is kept for 24 hours (a slower machine never builds on a forgotten one).
+`restic prune` runs at most once every 7 days from a sync run; `--sync-prune` forces it now.
+
+**Rotating the age key.** The password follows the age identity. After rotating the key, run
+`restic key passwd` on the sync repository (with the old derived password), or the new key cannot
+open it.
 
 **Limits.**
 
@@ -886,9 +932,11 @@ same way, and `--path ~/.zshrc` (repeatable) settles only those.
 - A path that exists but cannot be read (permissions) or is root-owned and skipped makes the run
   fail (exit `10`) before anything is written: it is never published as a deletion.
 - A `sync: true` configuration cannot declare anything under `/etc/config-saver/configs` (exit `3`).
-- At most 50 MiB per configuration (exit `3` beyond that).
-- The git history only grows: old versions stay in it.
-- GitHub sees only ciphertext plus fixed commit metadata (`sync` / `config-saver`).
+- At most `sync_max_mb` MiB per configuration (default 50; exit `3` beyond that).
+- `restic prune` needs an exclusive repository lock: if another machine is mid-backup it fails, the
+  run exits `10` even though the publish already succeeded, and the next run retries.
+- The repository only grows between prunes: old versions stay until their snapshots are forgotten
+  and pruned.
 
 ## Systemd units and timers
 
@@ -969,7 +1017,7 @@ not need this — it runs from the system manager as `User=%i`.
 systemctl --user enable --now config-saver-sync.timer
 ```
 
-A failed run (conflict, exit 11; git/network failure, exit 10; not set up, exit 2) starts
+A failed run (conflict, exit 11; transport failure, exit 10; not set up, exit 2) starts
 `config-saver-notify@.service`, which raises a freedesktop desktop notification with `notify-send`
 (package `libnotify`; works on KDE, GNOME and others). The notifier is optional: if `notify-send`
 is missing nothing else fails, you just get no banner (see `journalctl --user -u config-saver-sync.service`
@@ -977,11 +1025,10 @@ and `config-saver --sync-status`). The notification needs `DBUS_SESSION_BUS_ADDR
 which a graphical login provides; on a session without one run
 `systemctl --user import-environment DBUS_SESSION_BUS_ADDRESS`.
 
-The timer has no SSH or credential environment: the sync service runs non-interactively
-(`BatchMode`, no prompts). Use a passphrase-less deploy key for the sync remote, or an https remote
-with a non-interactive credential helper, or run `systemctl --user import-environment SSH_AUTH_SOCK`
-from your session; otherwise every run fails with exit 10. An ssh command you configure yourself
-(`core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SSH`) is used as is.
+The timer has no interactive environment: the sync service runs non-interactively. An `sftp:` remote
+needs a passphrase-less key (or `systemctl --user import-environment SSH_AUTH_SOCK` from your
+session), and an rclone remote needs its token already in `~/.config/rclone/rclone.conf`; otherwise
+every run fails with exit 10.
 `scripts/check-sync-notify.sh` verifies the `OnFailure=` wiring against real systemd.
 
 ### Install (system-wide)

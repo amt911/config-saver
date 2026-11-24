@@ -1,7 +1,7 @@
 [Unit]
 Description=Config Saver: multi-machine sync (pull, merge, push)
 Documentation=man:systemd.service(5)
-# A failed run (conflict: exit 11, git/network: exit 10, not set up: exit 2)
+# A failed run (conflict: exit 11, transport: exit 10, not set up: exit 2)
 # raises a desktop notification through the freedesktop notification service.
 OnFailure=config-saver-notify@%n.service
 
