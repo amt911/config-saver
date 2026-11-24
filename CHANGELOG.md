@@ -6,6 +6,60 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.7.0] - 2026-11-24
+
+### Added
+
+- **Multi-machine sync** (`--sync`): the files of every configuration marked `sync: true` are kept
+  identical across machines through a dedicated restic repository on any restic remote (rclone,
+  SFTP, local path). The remote only ever sees ciphertext. The password is derived from the shared
+  age identity, so nothing else is copied between machines; rotating the age key needs
+  `restic key passwd` on the sync repository.
+  - Per-file three-way comparison against the last sync: remote-only changes are applied, local-only
+    changes are published, deletions propagate. A file changed on two machines is a **conflict**:
+    the run writes nothing and exits `11`.
+  - `--sync-init <restic-url> [--sync-option K=V]` sets sync up (prints `created` or `joined`) and
+    stores the URL in `~/.config/config-saver/sync.json` (`0600`); `--sync-status` shows what a run
+    would do; `--sync-resolve local|remote [--path P]` settles conflicts. `rclone` is needed only
+    for `rclone:` URLs.
+  - Two machines publishing at once: the earliest wins, the other retries (at most 3, then exit
+    `10`).
+  - `--sync-move NEWURL` copies every sync snapshot to another repository, verifies, then switches;
+    run it on every machine. History and recorded state survive the move.
+  - Pruning: snapshots no head needs are forgotten after a successful sync (a superseded one is kept
+    24 h); `restic prune` runs at most every 7 days; `--sync-prune` forces it.
+  - Every sync snapshot is tagged `gen:<n>` (root 0, else parent + 1) and the head is the highest
+    generation: forgetting snapshots from the middle of the history (carried files keep the first
+    snapshot alive) no longer makes a machine conflict with itself. A fork loser is kept 30 days with
+    the fork winner and its parent; a machine away up to 29 days merges cleanly, a longer absence may
+    conflict (exit `11`, nothing lost). Snapshots without a `gen:` tag are refused.
+  - A publish counts only when the head is the new snapshot or builds on it, and one whose upload
+    took more than 6 hours is dropped and redone, so a publisher stalled mid-run (a suspended laptop)
+    can never record a snapshot the other machines moved past.
+  - The head manifest is streamed from the first members of the tar (restic is stopped as soon as it
+    is read) and cached by snapshot id (`sync-manifests.json`, `0600`); an unchanged head costs no
+    download.
+  - A conflict run still saves the hash cache (only that), so the timer does not rehash everything
+    every 15 minutes while a conflict stands. After a failed `restic prune`, sync runs wait 24 h
+    before trying again. `--sync-move` switches `sync.json` inside the engine lock, and
+    `--sync-init` again on the same repository keeps the stored `--sync-option`s unless new ones are
+    given.
+  - `sync_max_mb` per configuration (default 50, minimum 1) replaces the fixed 50 MiB limit. A hash
+    cache in the state file skips unchanged files.
+  - Definitions stay per machine: each machine syncs only what its own YAML declares, and never
+    deletes or overwrites paths it does not declare.
+  - Restored bytes go through the same extraction guard as `--decompress`; every snapshot is
+    validated before the first write. Unreadable or root-owned files in scope stop the run (exit
+    `10`) instead of being read as deletions.
+- **systemd user units** `config-saver-sync.timer` (every 15 min, 2 min after boot) and
+  `config-saver-notify@.service`: a failed sync raises a desktop notification through `notify-send`
+  (libnotify, any freedesktop desktop).
+
+### Changed
+
+- `--decompress` now auto-detects the archive compression (`r:*`), so uncompressed tars are accepted
+  too.
+
 ## [3.5.0] - 2026-10-19
 
 ### Added

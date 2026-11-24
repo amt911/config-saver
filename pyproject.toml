@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 name = "config_saver"
 # Single source of truth for the version. The release process (docs/RELEASING.md)
 # keeps this value, the git tag and the AUR PKGBUILD in sync; CI enforces it on tags.
-version = "3.5.0"
+version = "3.7.0"
 description = "Python CLI tool for validating, converting, and managing YAML/JSON configs, with tar compression utilities"
 license = { file = "LICENSE" }
 readme = "README.md"
@@ -85,6 +85,10 @@ warn_unused_ignores = true
 # run is scoped by mutant name on the command line (see docs/TESTING.md).
 source_paths = ["config_saver/"]
 also_copy = ["configs/", "contrib/", "pyproject.toml", "README.md", "LICENSE"]
+# The scope is pure logic, so the pure tests are what must kill its mutants. The restic-backed engine tests
+# take ~20 min per pass, and mutmut runs the whole suite twice (clean + stats) before mutating anything:
+# with them the gate cannot finish inside its hour.
+pytest_add_cli_args_test_selection = ["-m", "not restic and not slow"]
 
 [tool.ruff]
 line-length = 120

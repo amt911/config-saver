@@ -1,0 +1,8 @@
+[Unit]
+Description=Config Saver: desktop notification that %i failed
+
+[Service]
+Type=oneshot
+UMask=0077
+# Leading "-": a missing notify-send (libnotify) must not fail this unit.
+ExecStart=-/usr/bin/notify-send -u critical -a config-saver "config-saver: sync failed" "%i failed. Run: config-saver --sync-status"

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run config-saver multi-machine sync periodically
+
+[Timer]
+Unit=config-saver-sync.service
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

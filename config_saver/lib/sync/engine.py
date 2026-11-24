@@ -1,0 +1,757 @@
+"""Sync engine: ties scan, classify, manifest and the restic store together.
+
+Rules that bind every path through here: classify every config before touching
+anything (a conflict anywhere means zero writes, zero snapshots, state untouched);
+only paths inside the local scope are ever written or deleted; every restored byte
+goes through TarDecompressor's member validation (this module only chooses which
+members it may restore); state is saved only after the publish won.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import os
+import re
+import shutil
+import tarfile
+import tempfile
+import time
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import IO, Literal, TypeVar
+
+from config_saver.lib.errors import (
+    ArchiveError,
+    StoreError,
+    SyncConflictError,
+    SyncStateError,
+    SyncTransportError,
+)
+from config_saver.lib.models.model import Model
+from config_saver.lib.restic_store import (
+    DEFAULT_IDENTITY,
+    GEN_TAG_PREFIX,
+    HOST_TAG_PREFIX,
+    PARENT_TAG_PREFIX,
+    SYNC_TAG,
+    ResticStore,
+    Snapshot,
+)
+from config_saver.lib.sync import manifest_cache
+from config_saver.lib.sync import state as state_file_io
+from config_saver.lib.sync.classify import Side, classify
+from config_saver.lib.sync.manifest import (
+    MANIFEST_MEMBER,
+    SELF,
+    Manifest,
+    SnapRef,
+    forgettable,
+    losers,
+    on_head_line,
+    select_head,
+)
+from config_saver.lib.sync.paths import manifest_cache_path
+from config_saver.lib.sync.remote import SyncRemote
+from config_saver.lib.sync.scan import LocalScope, scan
+from config_saver.lib.sync.state import SyncState
+from config_saver.lib.tar_compressor.tar_compressor import CompressResult, TarCompressor
+from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
+
+MAX_ATTEMPTS = 3
+_NO_PARENT = "none"
+_MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+_MANIFEST_SEARCH = 8  # the manifest is written right after the metadata: it is among the first members
+_STAGING = ".staging"
+PRUNE_INTERVAL = 7 * 24 * 3600.0
+PRUNE_BACKOFF = 24 * 3600.0  # after a failed prune, sync runs leave it alone this long (--sync-prune still tries)
+# A superseded snapshot is kept until its successor is this old: a slower machine that analysed before
+# the successor existed may still publish on top of it, and that publish would name the forgotten one.
+SUPERSEDE_GRACE = timedelta(hours=24)
+# A snapshot that lost a fork is kept this long (with the ancestors that lead back to the winning chain):
+# the machine that recorded it as its head may be away for weeks and still needs its base.
+LOSER_RETENTION = timedelta(days=30)
+# A recorded head missing from the listing is believed "superseded" (forgotten after its grace) for this
+# long after the machine last recorded it; a lost fork is retained for LOSER_RETENTION, so after
+# LOSER_RETENTION - SUPERSEDE_GRACE the absence can no longer be told apart from a forgotten fork.
+_RECORD_TRUST = LOSER_RETENTION - SUPERSEDE_GRACE
+# A snapshot is dated when its upload starts. One that took longer than this to land is forgotten and
+# redone, so every snapshot that stays is dated within this of when other machines could first see it:
+# the margins above (and fork order by date) assume that, with room for a few hours of clock skew.
+MAX_PUBLISH_AGE = 6 * 3600.0
+
+
+@dataclass
+class SyncReport:
+    applied: dict[str, list[str]] = field(default_factory=dict)
+    deleted: dict[str, list[str]] = field(default_factory=dict)
+    published: dict[str, list[str]] = field(default_factory=dict)
+    skipped_remote: list[str] = field(default_factory=list)
+    conflicts: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass
+class _Published:
+    """A won publish: the new snapshot per config, their manifests, and the listing that confirmed the win."""
+
+    ids: dict[str, str]
+    manifests: dict[str, Manifest]
+    by_cfg: dict[str, list[SnapRef]]
+
+
+@dataclass
+class _Cfg:
+    """Everything known about one sync config after listing and scanning."""
+
+    name: str
+    snaps: list[SnapRef]  # this config's listing when it was analysed
+    model: Model
+    scope: LocalScope
+    local: Side
+    local_scope: set[str]
+    head: str | None
+    head_parent: str | None
+    remote: Manifest | None
+    base: Side
+    take_remote: list[str]
+    delete_local: list[str]
+    publish: list[str]
+    conflicts: list[str]
+
+
+class _Listing:
+    """One repository's sync snapshots: canonical refs per config, and the restic ids behind each."""
+
+    def __init__(self, store: ResticStore, snapshots: list[Snapshot]):
+        self.store = store
+        self.snapshots = snapshots
+        self._ids: dict[str, list[str]] = {}
+        for s in snapshots:
+            self._ids.setdefault(s.canonical, []).append(s.id)
+
+    def refs(self, cfg: str) -> list[SnapRef]:
+        seen: set[str] = set()
+        out = []
+        for s in self.snapshots:
+            if s.cfg == cfg and s.canonical not in seen:
+                seen.add(s.canonical)
+                out.append(_ref_of(s))
+        _check_generations(out, cfg)
+        return out
+
+    def ids_of(self, canonical: str) -> list[str]:
+        return self._ids[canonical]
+
+
+def _extend(into: dict[str, list[str]], cfg: str, paths: list[str]) -> None:
+    if paths:
+        into.setdefault(cfg, []).extend(paths)
+
+
+def _parent_of(snapshot: Snapshot) -> str | None:
+    for tag in snapshot.tags:
+        if tag.startswith(PARENT_TAG_PREFIX):
+            value = tag[len(PARENT_TAG_PREFIX) :]
+            return None if value == _NO_PARENT else value
+    return None
+
+
+def _ref_of(snapshot: Snapshot) -> SnapRef:
+    """The sync view of a snapshot; one without a valid ``gen:`` tag is not something this version made."""
+    for tag in snapshot.tags:
+        if tag.startswith(GEN_TAG_PREFIX):
+            value = tag[len(GEN_TAG_PREFIX) :]
+            if value.isascii() and value.isdigit():
+                return SnapRef(snapshot.canonical, _parent_of(snapshot), snapshot.time, int(value))
+    raise SyncStateError(f"sync snapshot {snapshot.canonical} of {snapshot.cfg} has no valid {GEN_TAG_PREFIX} tag")
+
+
+def _check_generations(refs: list[SnapRef], cfg: str) -> None:
+    """A snapshot is always younger than its listed parent: anything else is a cycle or a forged history."""
+    by_id = {s.id: s for s in refs}
+    for snap in refs:
+        parent = by_id.get(snap.parent) if snap.parent else None
+        if parent is not None and parent.gen >= snap.gen:
+            raise SyncStateError(
+                f"the sync history of {cfg} is inconsistent (snapshot {snap.id} is not newer than its parent)"
+            )
+
+
+_T = TypeVar("_T")
+
+
+def _transport(call: Callable[[], _T]) -> _T:
+    """Run a sync verb; a restic failure inside it is a transport failure (exit 10)."""
+    try:
+        return call()
+    except StoreError as exc:
+        raise SyncTransportError(str(exc)) from exc
+
+
+class SyncEngine:
+    def __init__(
+        self,
+        remote: SyncRemote,
+        identity: str | None,
+        state_file: str,
+        staging_root: str,
+        lock_file: str,
+        host: str,
+        store: ResticStore | None = None,
+        now: Callable[[], float] = time.time,
+    ):
+        self.now = now
+        self.remote = remote
+        self.state_file = state_file
+        self.lock_file = lock_file
+        self.manifest_cache = manifest_cache_path(state_file)
+        self._manifests: dict[str, Manifest] | None = None  # canonical id -> resolved manifest; loaded lazily
+        self.host = re.sub(r"[\s,]+", "-", host) or "unknown"
+        self.identity = identity or DEFAULT_IDENTITY
+        self.store = store or remote.store(self.identity)
+        # canonical id -> the ids restic knows it by (a copied snapshot has a new id); refreshed on every listing
+        self._actual: dict[str, list[str]] = {}
+        self.staging_root = staging_root
+        self.staging = os.path.join(staging_root, _STAGING)
+
+    # ------------------------------------------------------------------- init
+
+    def init(self) -> Literal["created", "joined"]:
+        """Join the repository if it exists (nothing is written there), else create it."""
+
+        def go() -> Literal["created", "joined"]:
+            if self.store.exists():
+                return "joined"
+            self.store.init_plain()
+            return "created"
+
+        return _transport(go)
+
+    # ------------------------------------------------------------ public verbs
+
+    def status(self, configs: Mapping[str, Model]) -> SyncReport:
+        with self._locked(), self._workspace():
+            cfgs, skipped = _transport(lambda: self._analyse(configs, state_file_io.load(self.state_file)))
+            return self._report(cfgs, skipped)
+
+    def run(self, configs: Mapping[str, Model]) -> SyncReport:
+        with self._locked():
+            return _transport(lambda: self._run(configs, state_file_io.load(self.state_file)))
+
+    def move(self, new: SyncRemote, on_verified: Callable[[], None] | None = None) -> int:
+        """Copy the whole sync history to ``new`` and verify it, then call ``on_verified`` (switch ``sync.json``).
+
+        ``on_verified`` runs while the lock is still held, so no ``--sync`` can run on the old repository
+        between the verification and the switch. Returns the number of this repository's snapshots now
+        present in ``new``. Snapshots already copied (by another machine's move) are skipped by restic;
+        ones only the target has are left alone.
+        """
+        with self._locked():
+            copied = _transport(lambda: self._move(new))
+            if on_verified is not None:
+                on_verified()
+            return copied
+
+    def _move(self, new: SyncRemote) -> int:
+        target = new.store(self.identity)
+        if not target.exists():
+            target.init_from(self.store)
+        source_snaps = self.store.snapshots(tag=SYNC_TAG)
+        if source_snaps:  # restic copy with no ids would copy everything: nothing to copy here
+            target.copy_from(self.store, [s.id for s in source_snaps])
+        with self._workspace():
+            self._verify_copy(source_snaps, target, new.repository)
+        return len({s.canonical for s in source_snaps})
+
+    def _verify_copy(self, source_snaps: list[Snapshot], target: ResticStore, where: str) -> None:
+        """Every source snapshot is in the target, and each config's head there (among them) has the same manifest."""
+        wanted = {s.canonical for s in source_snaps}
+        mine = _Listing(self.store, source_snaps)
+        theirs = _Listing(target, [s for s in target.snapshots(tag=SYNC_TAG) if s.canonical in wanted])
+        missing = wanted - {s.canonical for s in theirs.snapshots}
+        if missing:
+            raise SyncTransportError(
+                f"move verification failed: {len(missing)} snapshot(s) did not arrive in {where}; "
+                "sync.json still points at the old repository"
+            )
+        for cfg in sorted({s.cfg for s in source_snaps}):
+            head = select_head(mine.refs(cfg))
+            if head is None or select_head(theirs.refs(cfg)) != head:
+                raise SyncTransportError(
+                    f"move verification failed: the head of {cfg} differs in {where}; "
+                    "sync.json still points at the old repository"
+                )
+            if self._manifest_in(mine, head, cfg) != self._manifest_in(theirs, head, cfg):
+                raise SyncTransportError(
+                    f"move verification failed: the manifest of {cfg} differs in {where}; "
+                    "sync.json still points at the old repository"
+                )
+
+    def _manifest_in(self, listing: _Listing, head: str, cfg: str) -> Manifest:
+        return self._read_manifest(head, cfg, listing.store, listing.ids_of(head))
+
+    def prune(self, configs: Mapping[str, Model]) -> list[str]:
+        """Forget what no head needs, then reclaim the space whatever the clock says. Returns forgotten ids."""
+        with self._locked():
+            return _transport(lambda: self._prune(configs))
+
+    def _prune(self, configs: Mapping[str, Model]) -> list[str]:
+        state = state_file_io.load(self.state_file)
+        with self._workspace():
+            cfgs, _ = self._analyse(configs, state)
+            forgotten = self._forget(cfgs, None, {c.name: c.snaps for c in cfgs.values()})
+        self.store.prune()
+        state.last_prune = self.now()
+        state.last_prune_attempt = None
+        state_file_io.save(self.state_file, state)
+        return forgotten
+
+    def resolve(
+        self, configs: Mapping[str, Model], side: Literal["local", "remote"], paths: list[str] | None
+    ) -> SyncReport:
+        with self._locked():
+            return _transport(lambda: self._resolve(configs, side, paths))
+
+    def _resolve(
+        self, configs: Mapping[str, Model], side: Literal["local", "remote"], paths: list[str] | None
+    ) -> SyncReport:
+        state = state_file_io.load(self.state_file)
+        with self._workspace():
+            cfgs, _ = self._analyse(configs, state)
+        current = {p for c in cfgs.values() for p in c.conflicts}
+        for path in paths or []:
+            if path not in current:
+                raise ValueError(f"not a current conflict: {path}")
+        chosen = current if paths is None else set(paths)
+        for c in cfgs.values():
+            base = dict(c.base)  # the effective base: after a fork it is not the recorded one
+            other = (c.remote.side() if c.remote else {}) if side == "local" else c.local
+            for path in c.conflicts:
+                if path in chosen:
+                    if path in other:
+                        base[path] = other[path]
+                    else:
+                        base.pop(path, None)
+            state.base[c.name] = base
+            if c.head is None:
+                state.heads.pop(c.name, None)
+                state.parents.pop(c.name, None)
+            else:  # the base now describes this head: later analyses must not re-derive it from the fork
+                state.heads[c.name] = c.head
+                state.recorded_at[c.name] = self.now()
+                state.gens[c.name] = self._head_gen(c)
+                state.parents[c.name] = c.head_parent or ""
+        return self._run(configs, state)  # in memory only: saved if the run succeeds
+
+    # --------------------------------------------------------------- the run
+
+    def _run(self, configs: Mapping[str, Model], state: SyncState) -> SyncReport:
+        total = SyncReport()
+        with self._workspace():
+            for _attempt in range(MAX_ATTEMPTS):
+                cfgs, skipped = self._analyse(configs, state)
+                conflicts = {c.name: c.conflicts for c in cfgs.values() if c.conflicts}
+                if conflicts:
+                    self._save_hash_cache_only(state)
+                    raise SyncConflictError(conflicts)
+                total.skipped_remote = skipped
+                staged = [(c, self._stage(c)) for c in cfgs.values()]  # dump + vet everything first
+                for c, groups in staged:
+                    self._apply(c, groups)
+                    _extend(total.applied, c.name, c.take_remote)
+                    _extend(total.deleted, c.name, c.delete_local)
+                merged = {c.name: self._merge(c) for c in cfgs.values()}
+                published = self._publish(cfgs, merged)
+                if published is None:  # lost the race to another machine: start again from the listing
+                    continue
+                new_ids = published.ids
+                for c in cfgs.values():
+                    side, publish = merged[c.name]
+                    state.base[c.name] = side
+                    head = new_ids.get(c.name, c.head)
+                    if head is not None:
+                        state.heads[c.name] = head
+                        state.recorded_at[c.name] = self.now()
+                        state.gens[c.name] = self._head_gen(c) + (1 if c.name in new_ids else 0)
+                        state.parents[c.name] = (c.head if c.name in new_ids else c.head_parent) or ""
+                    if c.name in new_ids:
+                        _extend(total.published, c.name, sorted(publish))
+                state_file_io.save(self.state_file, state)
+                # Housekeeping only after the publish is durable: a failure here loses nothing.
+                self._forget(cfgs, published, published.by_cfg)
+                if self._prune_due(state.last_prune) and not self._prune_backed_off(state.last_prune_attempt):
+                    try:
+                        self.store.prune()
+                    except StoreError:
+                        state.last_prune_attempt = self.now()
+                        state_file_io.save(self.state_file, state)
+                        raise
+                    state.last_prune = self.now()
+                    state.last_prune_attempt = None
+                    state_file_io.save(self.state_file, state)
+                return total
+        raise SyncTransportError("another machine kept publishing, or every upload took too long to count; try again")
+
+    def _save_hash_cache_only(self, state: SyncState) -> None:
+        """A conflict stops the run with the sync state untouched, except the hashes it already paid for.
+
+        Without this, the timer would rehash every file again on each run for as long as the conflict stands.
+        """
+        saved = state_file_io.load(self.state_file)
+        saved.hash_cache, saved.hash_cache_home = state.hash_cache, state.hash_cache_home
+        state_file_io.save(self.state_file, saved)
+
+    def _prune_backed_off(self, attempt: float | None) -> bool:
+        """A prune failed less than a day ago (a clock that went backwards does not extend the wait)."""
+        return attempt is not None and 0 <= self.now() - attempt < PRUNE_BACKOFF
+
+    def _prune_due(self, last: float | None) -> bool:
+        """Never pruned, a week ago, or a clock that went backwards (``now < last``) all mean due."""
+        if last is None:
+            return True
+        elapsed = self.now() - last
+        return elapsed < 0 or elapsed >= PRUNE_INTERVAL
+
+    def _forget(
+        self, cfgs: dict[str, _Cfg], published: _Published | None, listing: dict[str, list[SnapRef]]
+    ) -> list[str]:
+        """Forget snapshots no head needs, among the configs this run read, per the confirming listing.
+
+        A config whose head in that listing is not the one this run holds a manifest for (another
+        machine built on it since the analysis) is left alone: that head's manifest was never read,
+        so nothing could safely be called unreferenced.
+        """
+        doomed: set[str] = set()
+        for c in cfgs.values():
+            snaps = listing.get(c.name, c.snaps)
+            head, manifest = c.head, c.remote
+            if published and c.name in published.ids:
+                head, manifest = published.ids[c.name], published.manifests[c.name]
+            if select_head(snaps) != head:
+                continue
+            known = {head: manifest} if head and manifest else {}
+            doomed |= forgettable(snaps, known, datetime.fromtimestamp(self.now()), SUPERSEDE_GRACE, LOSER_RETENTION)
+        ids = sorted(doomed)
+        self.store.forget_ids([actual for i in ids for actual in self._restic_ids(i)])
+        for i in ids:
+            self._cached_manifests().pop(i, None)
+            self._actual.pop(i, None)
+        self._save_manifests()
+        return ids
+
+    def _publish(self, cfgs: dict[str, _Cfg], merged: dict[str, tuple[Side, set[str]]]) -> _Published | None:
+        """Upload what only this machine has; empty ids if nothing, ``None`` if another machine's publish won."""
+        created: dict[str, str] = {}
+        manifests: dict[str, Manifest] = {}
+        stale: list[str] = []
+        for c in cfgs.values():
+            side, publish = merged[c.name]
+            if not publish:
+                continue
+            manifest = self._manifest(c, side, publish)
+            only = set(publish)
+            compressor = TarCompressor(c.model)
+            tags = [
+                SYNC_TAG,
+                f"{PARENT_TAG_PREFIX}{c.head or _NO_PARENT}",
+                f"{GEN_TAG_PREFIX}{self._head_gen(c) + 1}",
+                f"{HOST_TAG_PREFIX}{self.host}",
+            ]
+            started = self.now()
+            snapshot, _, _ = self.store.backup(
+                self._writer(compressor, only, manifest), c.name, datetime.now(), None, extra_tags=tags
+            )
+            if self.now() - started > MAX_PUBLISH_AGE:
+                stale.append(snapshot.id)
+                continue
+            created[c.name] = snapshot.id
+            manifests[c.name] = manifest
+        if stale:
+            self.store.forget_ids(stale)  # dated too early to be ordered fairly: redo it now
+            return None
+        if not created:
+            return _Published({}, {}, {})
+        by_cfg = self._by_cfg(self.store.snapshots(tag=SYNC_TAG))
+        for name, snap_id in created.items():  # a snapshot is its own cache seed: nobody needs to dump it again
+            self._cached_manifests()[snap_id] = manifests[name].resolve(snap_id)
+        self._save_manifests()
+        listed = {s.id for snaps in by_cfg.values() for s in snaps}
+        # A manifest naming a snapshot that is gone (another machine's housekeeping forgot it while we
+        # uploaded) cannot be restored: treat it like a lost race, never publish it.
+        dangling = [
+            name
+            for name, snap_id in created.items()
+            if any(ref not in listed for _, ref in manifests[name].resolve(snap_id).entries.values())
+        ]
+        if dangling:
+            self.store.forget_ids([created[n] for n in dangling])
+            return None
+        # Ours won when it is the head or the head descends from it (another machine may already have built
+        # on top of it). Not losing a fork is not enough: see on_head_line.
+        off = [i for name, i in created.items() if not on_head_line(by_cfg.get(name, []), i)]
+        if not off:
+            return _Published(created, manifests, by_cfg)
+        # Only those off the head line (nobody builds on them); one of another cfg that won may already have
+        # another machine on top of it.
+        self.store.forget_ids(off)
+        return None
+
+    @staticmethod
+    def _head_gen(c: _Cfg) -> int:
+        """Generation of the head this run built on; -1 when there is none (the next snapshot is a root: 0)."""
+        return next((s.gen for s in c.snaps if s.id == c.head), -1)
+
+    @staticmethod
+    def _writer(compressor: TarCompressor, only: set[str], manifest: Manifest) -> Callable[[IO[bytes]], CompressResult]:
+        def write(out: IO[bytes]) -> CompressResult:
+            return compressor.compress_to_stream(out, only=only, extra_members={MANIFEST_MEMBER: manifest.to_json()})
+
+        return write
+
+    # ------------------------------------------------------------- analysis
+
+    def _analyse(self, configs: Mapping[str, Model], state: SyncState) -> tuple[dict[str, _Cfg], list[str]]:
+        all_snaps = self.store.snapshots(tag=SYNC_TAG)
+        by_cfg = self._by_cfg(all_snaps)
+        cfgs: dict[str, _Cfg] = {}
+        home = os.path.expanduser("~")
+        if state.hash_cache_home != home:  # content normalization depends on it: start the cache over
+            state.hash_cache = {}
+            state.hash_cache_home = home
+        seen: set[str] = set()
+        for name in sorted(n for n, m in configs.items() if m.sync):
+            cfgs[name] = self._analyse_one(name, configs[name], state, by_cfg.get(name, []), seen)
+        for stale in set(state.hash_cache) - seen:
+            del state.hash_cache[stale]
+        self._save_manifests()
+        return cfgs, sorted(set(by_cfg) - set(cfgs))
+
+    def _by_cfg(self, snapshots: list[Snapshot]) -> dict[str, list[SnapRef]]:
+        """Per-config refs keyed by canonical id; also learns which restic ids stand behind each."""
+        by_cfg: dict[str, list[SnapRef]] = {}
+        seen: set[str] = set()
+        actual: dict[str, list[str]] = {}
+        for s in snapshots:
+            actual.setdefault(s.canonical, []).append(s.id)
+            if s.canonical in seen:  # the same snapshot copied twice into one repository
+                continue
+            seen.add(s.canonical)
+            by_cfg.setdefault(s.cfg, []).append(_ref_of(s))
+        for name, refs in by_cfg.items():
+            _check_generations(refs, name)
+        self._actual = actual
+        return by_cfg
+
+    def _restic_ids(self, canonical: str) -> list[str]:
+        return self._actual.get(canonical, [canonical])
+
+    def _effective_base(self, name: str, state: SyncState, snaps: list[SnapRef]) -> Side:
+        """The recorded base, unless the head it was recorded at is no longer on the winning chain.
+
+        Another machine's earlier-dated publish can flip the fork winner after we finished. Our
+        recorded base describes a head that lost (or was pruned), so comparing against it would let
+        the winner overwrite our edits. Then the base is the manifest of the nearest ancestor of
+        the recorded head that is on the winning chain, or empty when the fork reaches the root.
+        """
+        recorded = state.base.get(name, {})
+        rec = state.heads.get(name)
+        if rec is None:
+            return recorded
+        lost = losers(snaps)
+        listed = {s.id: s for s in snaps}
+        on_chain = set(listed) - lost
+        if rec in on_chain:
+            return recorded
+        if rec not in listed and self._superseded(name, state, snaps):
+            return recorded
+        ancestor: str | None = state.parents.get(name) or None
+        visited: set[str] = set()
+        while ancestor is not None and ancestor not in on_chain and ancestor not in visited:
+            visited.add(ancestor)
+            ancestor = listed[ancestor].parent if ancestor in listed else None
+        return self._read_manifest(ancestor, name).side() if ancestor in on_chain else {}
+
+    def _superseded(self, name: str, state: SyncState, snaps: list[SnapRef]) -> bool:
+        """Is the recorded head, gone from the listing, certainly an old head that was forgotten after being replaced?
+
+        Only if the head now is of a higher generation (the history moved on past it) and the record is
+        recent enough that a fork the head lost would still be listed (see ``LOSER_RETENTION``).
+        """
+        head = select_head(snaps)
+        gen, at = state.gens.get(name), state.recorded_at.get(name)
+        if head is None or gen is None or at is None:
+            return False
+        head_gen = next(s.gen for s in snaps if s.id == head)
+        return head_gen > gen and self.now() - at < _RECORD_TRUST.total_seconds()
+
+    def _analyse_one(self, name: str, model: Model, state: SyncState, snaps: list[SnapRef], seen: set[str]) -> _Cfg:
+        scope, local, _total = scan(model, state.hash_cache, seen)
+        head = select_head(snaps)
+        base = self._effective_base(name, state, snaps)
+        head_parent = next((s.parent for s in snaps if s.id == head), None)
+        remote = self._read_manifest(head, name) if head else None
+        remote_side = remote.side() if remote else {}
+        local_scope = {p for p in set(base) | set(local) | set(remote_side) if scope.contains(p)}
+        plan = classify(base, local, remote_side, local_scope, set(remote.scope) if remote else set())
+        return _Cfg(
+            name, snaps, model, scope, local, local_scope, head, head_parent, remote, base,
+            plan.take_remote, plan.delete_local, plan.publish, plan.conflicts,
+        )  # fmt: skip
+
+    def _cached_manifests(self) -> dict[str, Manifest]:
+        if self._manifests is None:
+            self._manifests = manifest_cache.load(self.manifest_cache)
+        return self._manifests
+
+    def _save_manifests(self) -> None:
+        """Persist the cache, forgetting entries whose snapshot is no longer in the last listing."""
+        manifest_cache.save(self.manifest_cache, self._cached_manifests(), set(self._actual))
+
+    def _read_manifest(
+        self, snapshot_id: str, cfg: str, store: ResticStore | None = None, restic_ids: list[str] | None = None
+    ) -> Manifest:
+        """The resolved manifest of a snapshot: from the cache, else streamed from the first members of its tar.
+
+        Snapshots are immutable, so a cached manifest needs no other check. Reading from another
+        repository (``store`` given: the move verification) never touches the cache.
+        """
+        cache = self._cached_manifests() if store is None else {}
+        hit = cache.get(snapshot_id)
+        if hit is not None and hit.cfg == cfg:
+            return hit
+        target = store or self.store
+        ids = restic_ids or self._restic_ids(snapshot_id)
+        with target.open_dump(ids[0], cfg) as stream:
+            data = self._manifest_bytes(stream, snapshot_id, cfg)
+        manifest = Manifest.from_json(data)
+        if manifest.cfg != cfg:
+            raise ArchiveError(f"sync snapshot {snapshot_id} claims to be config {manifest.cfg!r}, not {cfg!r}")
+        resolved = manifest.resolve(snapshot_id)
+        if store is None:
+            cache[snapshot_id] = resolved
+        return resolved
+
+    @staticmethod
+    def _manifest_bytes(stream: IO[bytes], snapshot_id: str, cfg: str) -> bytes:
+        """Read the manifest member out of a tar stream, looking at no more than the first few members.
+
+        Member names are untrusted: they are only compared, never used as a path.
+        """
+        try:
+            with tarfile.open(fileobj=stream, mode="r|*") as tar:
+                for _, member in zip(range(_MANIFEST_SEARCH), tar, strict=False):
+                    if member.name != MANIFEST_MEMBER:
+                        continue
+                    if member.size > _MAX_MANIFEST_BYTES:
+                        raise ArchiveError(f"sync manifest of {cfg} is implausibly large")
+                    handle = tar.extractfile(member)
+                    return handle.read() if handle else b""
+        except tarfile.TarError as exc:
+            raise ArchiveError(f"sync snapshot {snapshot_id} of {cfg} is unreadable: {exc}") from exc
+        raise ArchiveError(f"sync snapshot {snapshot_id} of {cfg} has no manifest")
+
+    @staticmethod
+    def _report(cfgs: dict[str, _Cfg], skipped: list[str]) -> SyncReport:
+        report = SyncReport(skipped_remote=skipped)
+        for c in cfgs.values():
+            _extend(report.applied, c.name, c.take_remote)
+            _extend(report.deleted, c.name, c.delete_local)
+            _extend(report.published, c.name, c.publish)
+            _extend(report.conflicts, c.name, c.conflicts)
+        return report
+
+    # ---------------------------------------------------------------- writes
+
+    def _stage(self, c: _Cfg) -> list[tuple[str, list[str]]]:
+        """Dump every snapshot this config restores from and vet all of it; writes nothing.
+
+        Each group is ``(tar path, member names)``. A hostile member anywhere, a missing
+        or duplicated wanted member: all stop the run here, before any user file changes.
+        """
+        if c.remote is None:
+            return []
+        by_snapshot: dict[str, list[str]] = {}
+        for path in c.take_remote:
+            by_snapshot.setdefault(c.remote.entries[path][1], []).append(path)
+        groups = []
+        for snapshot_id, names in by_snapshot.items():
+            tar_path = self._dump_file(snapshot_id, c.name)
+            counts = TarDecompressor(tar_path, members=names, staging_dir=self.staging).check_members()
+            bad = sorted(n for n, k in counts.items() if k != 1)
+            if bad:
+                raise ArchiveError(f"snapshot {snapshot_id} of {c.name} must hold each of these exactly once: {bad}")
+            groups.append((tar_path, names))
+        return groups
+
+    def _apply(self, c: _Cfg, groups: list[tuple[str, list[str]]]) -> None:
+        """Restore what the remote changed. Only members chosen here are written."""
+        for tar_path, names in groups:
+            TarDecompressor(tar_path, members=names, staging_dir=self.staging).decompress()
+        locate = TarDecompressor("")
+        for path in c.delete_local:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(locate._denormalize_path(path))
+
+    @staticmethod
+    def _merge(c: _Cfg) -> tuple[Side, set[str]]:
+        """The side after this run, and the paths this machine must publish."""
+        side = {p: fp for p, fp in c.local.items() if p in c.local_scope}
+        remote_side = c.remote.side() if c.remote else {}
+        for path in c.take_remote:
+            side[path] = remote_side[path]
+        for path in c.delete_local:
+            side.pop(path, None)
+        publish = set(c.publish)
+        # Content no remote snapshot holds (the remote narrowed its scope) must travel too.
+        publish |= {p for p, fp in side.items() if p not in publish and remote_side.get(p) != fp}
+        return side, publish
+
+    @staticmethod
+    def _manifest(c: _Cfg, side: Side, publish: set[str]) -> Manifest:
+        entries = {p: e for p, e in (c.remote.entries if c.remote else {}).items() if p not in c.local_scope}
+        for path, fingerprint in side.items():
+            entries[path] = (fingerprint, SELF if path in publish else c.remote.entries[path][1])  # type: ignore[union-attr]
+        scope = sorted(c.local_scope | set(c.remote.scope if c.remote else []))
+        manifest = Manifest(c.name, scope, entries)
+        Manifest.from_json(manifest.to_json())  # never publish what no machine could read back
+        return manifest
+
+    # ------------------------------------------------------------- plumbing
+
+    @contextlib.contextmanager
+    def _workspace(self) -> Iterator[None]:
+        """A fresh private staging area (it holds plaintext), removed on every path."""
+        shutil.rmtree(self.staging, ignore_errors=True)
+        os.makedirs(self.staging_root, mode=0o700, exist_ok=True)
+        os.makedirs(self.staging, mode=0o700)
+        try:
+            yield
+        finally:
+            shutil.rmtree(self.staging, ignore_errors=True)
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """One sync at a time per machine (timer vs manual run): non-blocking, fail fast."""
+        os.makedirs(os.path.dirname(self.lock_file), mode=0o700, exist_ok=True)
+        fd = os.open(self.lock_file, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise SyncTransportError("another sync is running") from exc
+            yield
+        finally:
+            os.close(fd)  # closing releases the lock
+
+    def _dump_file(
+        self, snapshot_id: str, cfg: str, store: ResticStore | None = None, restic_ids: list[str] | None = None
+    ) -> str:
+        """Dump a snapshot's tar to a private file in the staging area (removed with it).
+
+        ``snapshot_id`` is canonical; restic is asked by the id it knows the snapshot by.
+        """
+        fd, path = tempfile.mkstemp(dir=self.staging, prefix="dump.", suffix=".tar")  # 0600
+        with os.fdopen(fd, "wb") as out:
+            (store or self.store).dump((restic_ids or self._restic_ids(snapshot_id))[0], cfg, out)
+        return path

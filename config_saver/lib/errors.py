@@ -49,3 +49,36 @@ class IncompleteBackupError(ConfigSaverError):
 
 class StoreError(RuntimeError, ConfigSaverError):
     """The restic-backed snapshot store is unusable, or restic/age refused to run."""
+
+
+class SyncTooLargeError(ValueError, ConfigSaverError):
+    """A sync-enabled configuration covers more data than a snapshot should carry."""
+
+
+class SyncUnreadableError(OSError, ConfigSaverError):
+    """A path in a sync scope cannot be read: syncing would publish it as deleted."""
+
+
+class SyncSystemConfigError(ValueError, ConfigSaverError):
+    """A sync configuration declares a path under the system policy directory."""
+
+
+class SyncTransportError(OSError, ConfigSaverError):
+    """the sync remote (restic repository) could not be reached, read or published to."""
+
+
+class SyncNotSetUpError(FileNotFoundError, ConfigSaverError):
+    """Sync was not initialised on this machine, or a required tool is missing."""
+
+
+class SyncConflictError(ConfigSaverError):
+    """Local and remote changed the same paths since the last sync."""
+
+    def __init__(self, conflicts: dict[str, list[str]]):
+        self.conflicts = conflicts
+        total = sum(len(paths) for paths in conflicts.values())
+        super().__init__(f"{total} path(s) changed on both sides since the last sync")
+
+
+class SyncStateError(ValueError, ConfigSaverError):
+    """The per-machine sync state file is unreadable."""

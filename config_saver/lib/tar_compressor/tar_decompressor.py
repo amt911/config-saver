@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import secrets
+import shutil
 import tarfile
 import tempfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 
 from config_saver.lib import crypto, paths
@@ -52,6 +55,8 @@ class TarDecompressor:
         show_progress: bool = False,
         identity: str | None = None,
         restore_system_configs: bool = False,
+        members: Collection[str] | None = None,
+        staging_dir: str | None = None,
     ):
         self.tar_path = tar_path
         self.output_dir = output_dir
@@ -62,6 +67,13 @@ class TarDecompressor:
         # declarative installer: restoring over it would make the machine
         # diverge from what that installer declares, so it is opt-in.
         self.restore_system_configs = restore_system_configs
+        # When set, only these member names are written. Every member is still
+        # validated first: a hostile member must raise even if it would be skipped.
+        self.members = members
+        # When set, files are written here first and then moved onto their
+        # destination (atomic replace), so a failure never leaves a half-written
+        # file at the destination. Validation is identical to the in-place mode.
+        self.staging_dir = staging_dir
         # Get current user's home directory for path denormalization
         self.user_home = os.path.expanduser("~")
 
@@ -224,14 +236,58 @@ class TarDecompressor:
         if denormalize:
             content = self._denormalize_file_content(content)
 
-        os.makedirs(os.path.dirname(destination) or os.sep, exist_ok=True)
-        if os.path.islink(destination):
+        self._make_parents(os.path.dirname(destination) or os.sep)
+        # Staged writes swap the destination itself with os.replace and never follow a link there.
+        if self.staging_dir is None and os.path.islink(destination):
             raise UnsafeArchiveError(member.name, "destination already exists as a symlink")
         mode = member.mode & ~_FORBIDDEN_MODE_BITS
+        if self.staging_dir is not None:
+            fd, staged = tempfile.mkstemp(dir=self.staging_dir, prefix="file.")  # 0600
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(content)
+            os.chmod(staged, mode)
+            self._move_into_place(staged, destination)
+            return
         fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
         with os.fdopen(fd, "wb") as fh:
             fh.write(content)
         os.chmod(destination, mode)
+
+    def _make_parents(self, directory: str) -> None:
+        """Create ``directory``; in staged mode every directory made is private (0700)."""
+        if self.staging_dir is None:
+            os.makedirs(directory, exist_ok=True)
+            return
+        missing = []
+        while directory and not os.path.lexists(directory) and directory != os.path.dirname(directory):
+            missing.append(directory)
+            directory = os.path.dirname(directory)
+        for path in reversed(missing):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+
+    @staticmethod
+    def _move_into_place(source: str, destination: str) -> None:
+        """Atomically replace ``destination`` with ``source``, across filesystems if need be."""
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+        # The staging area is on another filesystem: copy next to the destination, then swap.
+        fd, partial = tempfile.mkstemp(dir=os.path.dirname(destination), prefix=".config-saver-")
+        try:
+            with os.fdopen(fd, "wb") as out, open(source, "rb") as src:
+                shutil.copyfileobj(src, out)
+                out.flush()
+                os.fsync(out.fileno())
+            shutil.copymode(source, partial)
+            os.replace(partial, destination)
+        except BaseException:
+            if os.path.lexists(partial):
+                os.unlink(partial)
+            raise
+        os.unlink(source)
 
     def _write_other(self, member: tarfile.TarInfo, destination: str) -> None:
         if member.isdir():
@@ -239,7 +295,17 @@ class TarDecompressor:
             os.chmod(destination, member.mode & ~_FORBIDDEN_MODE_BITS)
             return
 
-        os.makedirs(os.path.dirname(destination) or os.sep, exist_ok=True)
+        self._make_parents(os.path.dirname(destination) or os.sep)
+        if member.issym() and self.staging_dir is not None:
+            # Created under a temporary name beside the destination, then swapped in atomically.
+            temp = os.path.join(os.path.dirname(destination), f".config-saver-{secrets.token_hex(6)}")
+            os.symlink(member.linkname, temp)
+            try:
+                os.replace(temp, destination)
+            except BaseException:
+                os.unlink(temp)
+                raise
+            return
         if member.issym():
             if os.path.lexists(destination):
                 os.unlink(destination)
@@ -250,6 +316,25 @@ class TarDecompressor:
             if os.path.lexists(destination):
                 os.unlink(destination)
             os.link(source, destination)
+
+    def check_members(self) -> dict[str, int]:
+        """Validate every member without writing; count how often each wanted name occurs.
+
+        Raises like ``decompress`` for any hostile member, so a caller can vet several
+        archives before it writes from any of them.
+        """
+        counts = dict.fromkeys(self.members or (), 0)
+        try:
+            with tarfile.open(self.tar_path, "r:*") as tar:
+                for member in tar.getmembers():
+                    if member.name == METADATA_MEMBER:
+                        continue
+                    self._validate_member(member)
+                    if member.name in counts:
+                        counts[member.name] += 1
+        except tarfile.TarError as e:
+            raise ArchiveError(f"Could not read archive '{self.tar_path}': {e}") from e
+        return counts
 
     def decompress(self) -> DecompressResult:
         """Extract every archive member to its destination.
@@ -294,7 +379,7 @@ class TarDecompressor:
 
         emit: Callable[[str], None] = _no_emit
         try:
-            with tarfile.open(archive_path, "r:gz") as tar:
+            with tarfile.open(archive_path, "r:*") as tar:
                 metadata = self._read_metadata(tar)
                 # Archives written before the metadata member existed are assumed
                 # to have been normalized, which is the historical behaviour.
@@ -311,8 +396,15 @@ class TarDecompressor:
                     iterator = tqdm(members, desc="Extracting files", unit="file")
                     emit = tqdm.write
 
+                if self.staging_dir is not None:
+                    # Validate everything before writing anything: a hostile member
+                    # anywhere in the archive must stop the run with zero writes.
+                    for member in members:
+                        self._validate_member(member)
                 for member in iterator:
                     destination = self._validate_member(member)
+                    if self.members is not None and member.name not in self.members:
+                        continue
                     if self._is_system_config(destination):
                         result.skipped_system_configs += 1
                         continue

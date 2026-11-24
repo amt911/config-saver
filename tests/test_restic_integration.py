@@ -14,7 +14,7 @@ import pytest
 
 from config_saver.lib.errors import StoreError
 from config_saver.lib.models.retention_model import RetentionModel
-from config_saver.lib.restic_store import ResticStore
+from config_saver.lib.restic_store import PARENT_TAG_PREFIX, SYNC_TAG, ResticStore
 from config_saver.lib.tar_compressor.tar_compressor import TarCompressor
 from config_saver.lib.tar_compressor.tar_decompressor import TarDecompressor
 from tests.conftest import make_model
@@ -266,3 +266,38 @@ def test_cli_migrate_real_age_archives_then_delete_and_roundtrip(
     # ... and the real prune removes exactly that one.
     assert CLI(["--prune", "-i", str(prune_cfgs), "--identity", key]).run() == EXIT_OK
     assert [s.id for s in store.snapshots("my-cfg")] == [before[1].id]
+
+
+def test_real_restic_sync_tags_roundtrip(tmp_path: Path, sample_tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESTIC_CACHE_DIR", str(tmp_path / "cache"))
+    key, recipient = _identity(tmp_path)
+    store = ResticStore(str(tmp_path / "saves"), identity=key)
+    store.init(recipient)
+    compressor = TarCompressor(make_model([str(sample_tree)]), "")
+    when = datetime(2026, 10, 1, 3, 0, 0)
+    plain, _, _ = store.backup(compressor.compress_to_stream, "my-cfg", when, None)
+    tagged, _, _ = store.backup(
+        compressor.compress_to_stream,
+        "my-cfg",
+        when + timedelta(days=1),
+        None,
+        extra_tags=[SYNC_TAG, f"{PARENT_TAG_PREFIX}none"],
+    )
+    found = store.snapshots(tag=SYNC_TAG)
+    assert [s.id for s in found] == [tagged.id]
+    assert {SYNC_TAG, f"{PARENT_TAG_PREFIX}none"} <= set(found[0].tags)
+    assert len(store.snapshots("my-cfg")) == 2 and plain.id != tagged.id
+
+
+def test_plain_repository_init_exists_and_wrong_password(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESTIC_CACHE_DIR", str(tmp_path / "cache"))
+    repo = str(tmp_path / "plain-repo")
+    store = ResticStore.for_repository(repo, "pw-one")
+    assert store.exists() is False
+    store.init_plain()
+    assert store.exists() is True
+    assert store.snapshots() == []
+    with pytest.raises(StoreError):
+        ResticStore.for_repository(repo, "pw-two").exists()
+    with pytest.raises(StoreError):
+        ResticStore.for_repository(repo, "pw-two").snapshots()

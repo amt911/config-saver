@@ -6,9 +6,10 @@ import fnmatch
 import io
 import json
 import os
+import stat
 import tarfile
 import tempfile
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import IO
 
@@ -40,6 +41,13 @@ def _no_emit(_message: str) -> None:
     """Discard progress messages when no progress bar is attached."""
 
 
+def _ancestors(arcname: str) -> Iterator[str]:
+    """Every parent directory name of an archive member, outermost first."""
+    parts = arcname.split("/")
+    for i in range(1, len(parts)):
+        yield "/".join(parts[:i])
+
+
 @dataclass
 class CompressResult:
     """Structured outcome of a compression run.
@@ -54,6 +62,11 @@ class CompressResult:
     # for, so they stay out of ``missing_inputs`` and out of ``complete``.
     excluded: int = 0
     skipped_root_owned: list[str] = field(default_factory=list)
+    # Directories the walk could not list (permissions, I/O): their content is not seen at all.
+    unreadable_dirs: list[str] = field(default_factory=list)
+    # Declared paths whose existence could not be established (lstat failed with something
+    # other than "no such file"), e.g. behind a parent directory without search permission.
+    unreadable_entries: list[str] = field(default_factory=list)
     missing_inputs: list[str] = field(default_factory=list)
     encryption: crypto.EncryptionInfo | None = None
 
@@ -292,10 +305,23 @@ class TarCompressor:
         that fails.
         """
 
+        def lexists(path: str) -> bool:
+            """Like os.path.lexists, but an lstat failure that is not "absent" is recorded."""
+            try:
+                os.lstat(path)
+            except (FileNotFoundError, NotADirectoryError):
+                return False
+            except OSError as exc:
+                result.unreadable_entries.append(f"{path} ({exc.strerror or exc})")
+                return False
+            return True
+
         def walk(root: str) -> Iterator[tuple[str, bool]]:
             # The directory itself is archived so empty directories survive a round-trip.
             yield root, True
-            for dirpath, dirnames, filenames in os.walk(root):
+            for dirpath, dirnames, filenames in os.walk(
+                root, onerror=lambda exc: result.unreadable_dirs.append(str(exc.filename or root))
+            ):
                 dirnames.sort()
                 filenames.sort()
                 kept: list[str] = []
@@ -321,7 +347,7 @@ class TarCompressor:
                 if self._is_excluded(entry):
                     result.excluded += 1
                     continue
-                if "${" in entry or not os.path.lexists(entry):
+                if "${" in entry or not lexists(entry):
                     result.missing_inputs.append(entry)
                     continue
                 if os.path.isdir(entry) and not os.path.islink(entry):
@@ -334,7 +360,7 @@ class TarCompressor:
             if self._is_excluded(source):
                 result.excluded += 1
                 continue
-            if "${" in source or not os.path.isdir(source):
+            if "${" in source or not lexists(source) or not os.path.isdir(source):
                 result.missing_inputs.append(source)
                 continue
             for file in entry.files:
@@ -342,7 +368,7 @@ class TarCompressor:
                 if self._is_excluded(file_path):
                     result.excluded += 1
                     continue
-                if not os.path.lexists(file_path):
+                if not lexists(file_path):
                     result.missing_inputs.append(file_path)
                     continue
                 if os.path.isdir(file_path) and not os.path.islink(file_path):
@@ -359,6 +385,71 @@ class TarCompressor:
                 continue
             seen.add(arcname)
             yield path, arcname, is_dir
+
+    def is_excluded(self, path: str) -> bool:
+        """Public form of the ``exclude`` matching, for callers that scope by it."""
+        return self._is_excluded(path)
+
+    def declared_paths(self) -> Iterator[tuple[str, str]]:
+        """Yield ``(path, arcname)`` for every declared entry, existing or not.
+
+        Plain string entries, and ``source/file`` for each file of a
+        ``{source, files}`` entry. Entries with an unexpanded ``${`` placeholder
+        are not real paths, and entries whose ``source`` is excluded are dropped whole;
+        both are left out.
+        """
+        for entry in self.yaml_data.directories:
+            if isinstance(entry, str):
+                paths = [entry]
+            else:
+                # Like _iter_entries: an excluded source drops the whole entry.
+                skipped = "${" in entry.source or self._is_excluded(entry.source)
+                paths = [] if skipped else [os.path.join(entry.source, file) for file in entry.files]
+            for path in paths:
+                if "${" not in path:
+                    yield path, self._normalize_path(path)
+
+    def iter_files(self, problems: list[str] | None = None) -> Iterator[tuple[str, str]]:
+        """Yield ``(path, arcname)`` of regular files and symlinks, as ``_collect`` orders them.
+
+        Root-owned skips are left out, exactly like in the archive. When ``problems`` is
+        given, every path that is left out for any reason other than "it does not exist"
+        (root-owned skip, unreadable directory, failed lstat) is appended to it, so a caller
+        that must not mistake "cannot see" for "gone" can tell the two apart.
+        """
+        result = CompressResult(output_path="")
+        for path, arcname, is_dir in self._collect(result):
+            if is_dir:
+                continue
+            if self._skips_root_owned(path):
+                if problems is not None:
+                    problems.append(f"{path} (owned by root)")
+                continue
+            try:
+                mode = os.lstat(path).st_mode
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                if problems is not None:
+                    problems.append(f"{path} ({exc.strerror or exc})")
+                continue
+            if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                yield path, arcname
+        if problems is not None:
+            problems.extend(f"{d} (directory cannot be listed)" for d in result.unreadable_dirs)
+            problems.extend(result.unreadable_entries)
+
+    def content_stream(self, path: str) -> IO[bytes]:
+        """The bytes that would be archived for a regular file; the caller closes it."""
+        if self.yaml_data.normalize_content:
+            normalized = self._normalized_stream(path)
+            if normalized is not None:
+                return normalized[0]
+        return open(path, "rb")  # noqa: SIM115 - the caller owns and closes it
+
+    def _skips_root_owned(self, path: str) -> bool:
+        """True when ``path`` is dropped because it is root-owned (``only_root_user: false``)."""
+        return not self.yaml_data.only_root_user and self.current_uid != 0 and self._is_root_owned(path)
 
     def _write_metadata(self, tar: tarfile.TarFile) -> None:
         """Store how the archive was produced, so restore does not have to guess."""
@@ -397,7 +488,7 @@ class TarCompressor:
         """Add every collected entry to ``tar`` (shared by file and stream output)."""
         for path, arcname, is_dir in items:
             # Skip root-owned files if only_root_user is false and current user is not root
-            if not self.yaml_data.only_root_user and self.current_uid != 0 and self._is_root_owned(path):
+            if self._skips_root_owned(path):
                 emit(f"Skipping root-owned file (only_root_user=false): {path}")
                 result.skipped_root_owned.append(path)
                 continue
@@ -423,18 +514,49 @@ class TarCompressor:
                 tar.add(path, arcname=arcname)
             result.added += 1
 
-    def compress_to_stream(self, fileobj: IO[bytes]) -> CompressResult:
+    @staticmethod
+    def _filter_only(items: Iterable[tuple[str, str, bool]], only: Collection[str]) -> list[tuple[str, str, bool]]:
+        """Keep the files named in ``only`` and the directories that hold them."""
+        listed = list(items)
+        kept_files = {arcname for _p, arcname, is_dir in listed if not is_dir and arcname in only}
+        parents = {parent for name in kept_files for parent in _ancestors(name)}
+        return [
+            item for item in listed if (item[1] in kept_files if not item[2] else item[1] in only or item[1] in parents)
+        ]
+
+    def _write_extra_members(self, tar: tarfile.TarFile, extra_members: Mapping[str, bytes]) -> None:
+        """Add in-memory members (the sync manifest) as plain ``0600`` files."""
+        for name, payload in extra_members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            info.mode = ARCHIVE_MODE
+            tar.addfile(info, io.BytesIO(payload))
+
+    def compress_to_stream(
+        self,
+        fileobj: IO[bytes],
+        only: Collection[str] | None = None,
+        extra_members: Mapping[str, bytes] | None = None,
+    ) -> CompressResult:
         """Write an uncompressed tar to ``fileobj``, which may be a pipe.
 
         Same members, normalisation and skipping as ``compress()``, but nothing
         touches the disk and ``encrypt:`` is ignored: the consumer (restic) does
         its own compression and encryption. ``w|`` is tar's streaming mode, it
         never seeks. ``output_path`` is left empty for the caller to fill in.
+
+        ``only`` keeps just those arcnames (plus the directories above them);
+        ``extra_members`` are written as ``0600`` files after the metadata.
         """
         result = CompressResult(output_path="")
-        items, emit = self._with_progress(self._collect(result))
+        collected: Iterable[tuple[str, str, bool]] = self._collect(result)
+        if only is not None:
+            collected = self._filter_only(collected, only)
+        items, emit = self._with_progress(collected)
         with tarfile.open(fileobj=fileobj, mode="w|") as tar:
             self._write_metadata(tar)
+            if extra_members:
+                self._write_extra_members(tar, extra_members)
             self._write_members(tar, items, result, emit)
         return result
 

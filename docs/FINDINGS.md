@@ -113,3 +113,75 @@ runs. Forcing `spawn` would make it uniform but costs an interpreter startup per
 worker, and measured *slower than sequential* for many small configurations
 (×0.44 on the 12-config corpus in `docs/BENCHMARKS.md`), so the interpreter
 default stays. Tests that move `$HOME` run batch mode with `--jobs 1`.
+
+## 2026-11-23 — The sync failure notification needed no `import-environment` here
+
+`config-saver-notify@.service` runs `notify-send` from the user manager. Measured with
+`scripts/check-sync-notify.sh` on this machine (Arch, graphical session): the user manager already
+had `DBUS_SESSION_BUS_ADDRESS` (`systemctl --user show-environment`), the notify unit ran and exited
+0 with no `systemctl --user import-environment`. A user manager started without a graphical
+session (e.g. linger-only, no login) will not have it: `notify-send` then fails and, because of the
+leading `-` in `ExecStart=`, silently. The check script proves the `OnFailure=` wiring, not that a
+banner was seen; look at the screen once.
+
+## `--decompress` accepts any tar compression since sync
+
+`TarDecompressor` opens archives with `r:*` (the sync engine reads the manifest of restic dumps that
+way), so `--decompress` now also accepts uncompressed and other-compression tars, not only `.tar.gz`.
+It is a side effect of sync, not a feature to rely on; the extraction guard applies to all of them.
+
+## `restic copy` gives copied snapshots new ids
+
+`--sync-move` uses `restic copy`, which assigns the copies new snapshot ids. Anything keyed on the id
+(each machine's recorded state, the fork ordering) would break across a move, so config-saver
+identifies a sync snapshot by restic's `original` field (the id it had where it was first created)
+and falls back to `id` when there is none. Keying on `id` looked right and lost history on the first
+move test.
+
+## main is PR-only: releases go through a PR
+
+Pushing to `main` fails with GH013 ("Changes must be made through a pull request"). A release (version
+bump, changelog) is a branch plus a PR, never a direct push or tag-from-main shortcut.
+
+## Long pre-push hooks outlive an idle SSH connection
+
+The pre-push hook (pytest, then the mutation gate) runs for minutes with the SSH connection to GitHub
+idle; the server closes it (rc=141, "Connection to github.com closed by remote host"). Push with
+`GIT_SSH_COMMAND="ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20" git push ...`.
+
+## `restic prune` can fail after a successful sync publish
+
+`restic prune` needs an exclusive repository lock. If another machine is mid-backup it fails, and the
+sync run exits `10` even though the publish already succeeded. Nothing is lost; sync runs retry after a
+24 h back-off (`last_prune_attempt`; the 7-day throttle is only recorded after a prune succeeds, and
+`--sync-prune` always tries).
+
+## Forgotten ancestors: why heads use generations, and why a record expires
+
+Two traps, one cause: forgetting a snapshot removes a link from the middle of the history.
+
+- A parent-link walk from the roots picked the **oldest referenced root** as head once the snapshots
+  after it were forgotten (carried files keep the first snapshot alive, its successors are
+  unreferenced and go after 24 h). One machine alone then conflicted with itself on its fifth run.
+  Fix: every sync snapshot has a `gen:` tag; the head is the candidate of the highest generation;
+  forks are siblings that share a `parent:` tag, listed or not.
+- An idle machine (laptop away for days) records a head that was superseded and forgotten meanwhile.
+  "Head absent" is then safe to treat as superseded only if the current head has a higher generation
+  than the recorded one **and** the record is younger than `LOSER_RETENTION - SUPERSEDE_GRACE` (29 d):
+  a fork loser is kept 30 d, so a recent record whose head is gone cannot be a forgotten loser. Past
+  that the run falls back to the ancestor walk or an empty base: a conflict, never a loss.
+
+The pure retention rules live in `manifest.forgettable`; `tests/test_sync_manifest.py` checks them
+against the full history with Hypothesis (the head never changes however much is forgotten).
+
+Two more consequences, found in review:
+
+- **Not losing a fork is not winning.** A publisher that stalls past the 24 h grace finds its parent
+  forgotten: its snapshot is alone in its sibling group (no fork loser) while the head is a higher
+  generation on another line. Counting it as won made the next run treat it as the base and take the
+  remote over its edits. A publish wins only when the head is it or descends from it
+  (`manifest.on_head_line`); otherwise it is forgotten and the run retried.
+- **A snapshot's date is when its upload started.** One that lands days later can win a fork by that
+  early date after the other side recorded its own snapshot, and the 30 d / 29 d margins above assume
+  date ≈ appearance. A publish whose upload took more than `MAX_PUBLISH_AGE` (6 h) is forgotten at
+  once and redone.

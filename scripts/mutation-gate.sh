@@ -25,6 +25,8 @@ SCOPE=(
   'config_saver.lib.tar_compressor.tar_compressor.xǁTarCompressorǁ_normalize_path*'
   'config_saver.lib.tar_compressor.tar_decompressor.xǁTarDecompressorǁ_validate*'
   'config_saver.lib.retention.*'
+  'config_saver.lib.sync.classify.*'
+  'config_saver.lib.sync.manifest.*'
 )
 
 # Sin cgroup, una corrida dimensionó su pool por el número de cores y tumbó la

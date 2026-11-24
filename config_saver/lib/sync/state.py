@@ -1,0 +1,186 @@
+"""Per-machine sync state: last synced head and file fingerprints per config."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+
+from config_saver.lib.errors import SyncStateError
+from config_saver.lib.sync.classify import CacheEntry, Fingerprint, HashCache, Side
+
+
+@dataclass
+class SyncState:
+    heads: dict[str, str] = field(default_factory=dict)
+    base: dict[str, Side] = field(default_factory=dict)
+    # cfg -> parent id of the recorded head ("" = none): lets a later run find the recorded head's
+    # nearest surviving ancestor when that head lost a fork or was pruned. Absent in old files.
+    parents: dict[str, str] = field(default_factory=dict)
+    # Epoch seconds of the last successful ``restic prune`` from this machine; None = never (or old file).
+    last_prune: float | None = None
+    # Epoch seconds of the last failed ``restic prune`` attempt from a sync run: no retry for a day.
+    last_prune_attempt: float | None = None
+    # cfg -> epoch seconds when this machine last recorded a head for it. A recorded head that has
+    # vanished from the listing is "superseded" (safe) while this is recent, "unknown" once it is old.
+    recorded_at: dict[str, float] = field(default_factory=dict)
+    # cfg -> generation of the recorded head: a head gone from the listing is "superseded" only when the
+    # current head's generation is higher. Absent in old files.
+    gens: dict[str, int] = field(default_factory=dict)
+    # Hash cache (an optimisation, never trusted blindly): local path -> stat tuple + fingerprint,
+    # and the home directory content normalization used when it was filled. Absent in old files.
+    hash_cache: HashCache = field(default_factory=dict)
+    hash_cache_home: str | None = None
+
+
+def _corrupt(path: str, why: str) -> SyncStateError:
+    return SyncStateError(
+        f"Sync state file '{path}' is unreadable ({why}). Delete it to start over: "
+        "the next sync then treats every differing file as a conflict."
+    )
+
+
+def _number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _load_cache(raw: object) -> HashCache:
+    """Strictly validated; anything off about it means an empty cache, never an error."""
+    if not isinstance(raw, dict):
+        return {}
+    cache: HashCache = {}
+    try:
+        for key, e in raw.items():
+            link = e.get("link")
+            ok = (
+                isinstance(key, str)
+                and all(_is_int(e[k]) for k in ("size", "mtime_ns", "ctime_ns", "inode", "mode"))
+                and isinstance(e["normalize_content"], bool)
+                and isinstance(e["sha256"], str)
+                and (link is None or isinstance(link, str))
+            )
+            if not ok:
+                return {}
+            cache[key] = CacheEntry(
+                e["size"], e["mtime_ns"], e["ctime_ns"], e["inode"], e["normalize_content"],
+                Fingerprint(e["sha256"], e["mode"], link),
+            )  # fmt: skip
+    except (KeyError, TypeError, AttributeError):
+        return {}
+    return cache
+
+
+def load(path: str) -> SyncState:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return SyncState()
+    except UnicodeDecodeError as exc:
+        raise _corrupt(path, f"not valid UTF-8: {exc}") from exc
+    if not text.strip():
+        return SyncState()
+    try:
+        data = json.loads(text)
+        heads = data["heads"]
+        base = data["base"]
+        if not isinstance(heads, dict) or not isinstance(base, dict):
+            raise TypeError("heads and base must be objects")
+        parents = data.get("parents", {})
+        if not isinstance(parents, dict):
+            raise TypeError("parents must be an object")
+        last_prune = data.get("last_prune")
+        if last_prune is not None and (isinstance(last_prune, bool) or not isinstance(last_prune, int | float)):
+            raise TypeError("last_prune must be a number")
+        last_attempt = data.get("last_prune_attempt")
+        if last_attempt is not None and not _number(last_attempt):
+            raise TypeError("last_prune_attempt must be a number")
+        recorded_at = data.get("recorded_at", {})
+        if not isinstance(recorded_at, dict) or not all(_number(v) for v in recorded_at.values()):
+            raise TypeError("recorded_at must map configs to numbers")
+        gens = data.get("gens", {})
+        if not isinstance(gens, dict) or not all(_is_int(v) for v in gens.values()):
+            raise TypeError("gens must map configs to integers")
+        cache_home = data.get("hash_cache_home")
+        cache = _load_cache(data.get("hash_cache", {}))
+        if not isinstance(cache_home, str):
+            cache_home, cache = None, {}
+        return SyncState(
+            hash_cache=cache,
+            hash_cache_home=cache_home,
+            last_prune=None if last_prune is None else float(last_prune),
+            last_prune_attempt=None if last_attempt is None else float(last_attempt),
+            recorded_at={str(k): float(v) for k, v in recorded_at.items()},
+            gens={str(k): int(v) for k, v in gens.items()},
+            parents={str(k): str(v) for k, v in parents.items()},
+            heads={str(k): str(v) for k, v in heads.items()},
+            base={
+                cfg: {p: Fingerprint(fp["sha256"], int(fp["mode"]), fp.get("link")) for p, fp in side.items()}
+                for cfg, side in base.items()
+            },
+        )
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise _corrupt(path, f"{type(exc).__name__}: {exc}") from exc
+
+
+def _fsync_dir(directory: str) -> None:
+    """Make the rename durable; best effort, some filesystems refuse to open a directory."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def save(path: str, state: SyncState) -> None:
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    payload = {
+        "heads": state.heads,
+        "parents": state.parents,
+        "last_prune": state.last_prune,
+        "last_prune_attempt": state.last_prune_attempt,
+        "recorded_at": state.recorded_at,
+        "gens": state.gens,
+        "hash_cache_home": state.hash_cache_home,
+        "hash_cache": {
+            p: {
+                "size": e.size,
+                "mtime_ns": e.mtime_ns,
+                "ctime_ns": e.ctime_ns,
+                "inode": e.inode,
+                "normalize_content": e.normalize_content,
+                "sha256": e.fingerprint.sha256,
+                "mode": e.fingerprint.mode,
+                "link": e.fingerprint.link,
+            }
+            for p, e in state.hash_cache.items()
+        },
+        "base": {
+            cfg: {p: {"sha256": fp.sha256, "mode": fp.mode, "link": fp.link} for p, fp in side.items()}
+            for cfg, side in state.base.items()
+        },
+    }
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".sync-state.")  # mkstemp creates 0600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())  # the rename must not outlive the data it points at
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        _fsync_dir(parent)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise

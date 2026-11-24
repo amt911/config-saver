@@ -150,6 +150,7 @@ numbers you'd trust by mistake.
 - `config_saver/lib/parser/` — YAML/JSON parser.
 - `config_saver/lib/tar_compressor/` — compress / decompress.
 - `config_saver/lib/backup_manager/` — backup orchestration (renamed from the `backup_mapager` typo).
+- `config_saver/lib/sync/` — multi-machine sync over a restic remote (`--sync*`): `classify.py` / `manifest.py` (pure), `scan.py`, `paths.py`, `state.py`, `remote.py` (restic remote + derived password), `engine.py` (orchestration).
 - `config_saver/lib/errors.py` — typed exceptions; control flow keys off types, never off messages.
 - `configs/*.yaml` — example config files (also installed to `<prefix>/share/config-saver/configs`).
 - `tests/` — pytest suite, one file per concern (round-trip, extraction security, CLI exit codes…).
@@ -250,7 +251,8 @@ which cost milliseconds and touch no real filesystem outside `tmp_path`.
 | `tar_compressor/tar_compressor.py` | path normalization (including sibling home dirs), text/binary classification, content normalization, root-owned skip |
 | `tar_compressor/tar_decompressor.py` | round-trip, **and one regression per malicious-archive vector**: `../` member, absolute member name, symlink escaping the root, hardlink, device node |
 | `backup_manager/backup_manager.py` | archive listing, per-config timestamp dirs, description round-trip, XDG fallback on `PermissionError` |
-| `cli/cli.py` | every flag, `--version`, and the documented exit codes (2, 3, 4, 5, 6, 7, 10) |
+| `sync/` | `classify`/`manifest` pure (one test per classification branch, manifest round-trip and rejection of hostile entries); `scan`/`state`/`engine` against real trees and a local-path restic repository in `tmp_path`; lock, vet-all-before-write, symlink swaps; one subprocess e2e (`tests/test_sync_e2e.py`); mutation gate covers `classify` and `manifest` |
+| `cli/cli.py` | every flag, `--version`, and the documented exit codes (2, 3, 4, 5, 6, 7, 10, 11) |
 
 ### TDD — required for new logic
 

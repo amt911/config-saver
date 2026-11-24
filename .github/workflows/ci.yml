@@ -40,6 +40,16 @@ jobs:
       # The encryption round-trip tests drive the real binaries; without them
       # those tests skip and the feature is untested.
       - run: sudo apt-get update && sudo apt-get install -y age gnupg
+      # The sync engine and the restic store tests drive a real restic (marked `restic`); without it
+      # they skip and coverage drops under the gate. The distro restic is too old (sync needs >= 0.17,
+      # exit code 10 for a missing repository), so a pinned release is fetched and checksummed.
+      - name: restic 0.19.1
+        run: |
+          curl -fsSLo /tmp/restic.bz2 https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
+          echo "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c  /tmp/restic.bz2" | sha256sum -c -
+          bunzip2 -c /tmp/restic.bz2 > /tmp/restic
+          sudo install -m 0755 /tmp/restic /usr/local/bin/restic
+          restic version
       - run: pip install '.[dev]'
       - run: mypy config_saver
       # The gate is the behavioural suite; ratchet --cov-fail-under as coverage grows.
@@ -128,7 +138,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          # Pinned: on the 3.15 runner semgrep-core dies with -11 before scanning (main has failed
+          # this job since 2026-10-20 for that reason, not for a finding).
+          python-version: '3.13'
       - run: pip install semgrep
       # Verified clean locally (0 findings) at the time this landed.
       - run: >-

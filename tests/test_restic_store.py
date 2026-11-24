@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ from config_saver.lib.errors import StoreError
 from config_saver.lib.models.retention_model import RetentionModel
 from config_saver.lib.restic_store import (
     NOTICES,
+    PARENT_TAG_PREFIX,
+    SYNC_TAG,
     ResticStore,
     StorageMode,
     decode_description,
@@ -353,6 +356,25 @@ def test_backup_rejects_comma_in_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyP
         _store(tmp_path).backup(_writer(), "a,b", WHEN, None)
 
 
+def test_backup_extra_tags_are_appended_to_argv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cls = _popen(monkeypatch, out=SUMMARY)
+    snap, _, _ = _store(tmp_path).backup(_writer(), "c", WHEN, None, extra_tags=[SYNC_TAG, f"{PARENT_TAG_PREFIX}none"])
+    argv = cls.last.argv
+    tags = [argv[i + 1] for i, a in enumerate(argv) if a == "--tag"]
+    assert tags == ["config-saver", "cfg:c", "sync", "parent:none"]
+    assert snap.tags == ()
+
+
+@pytest.mark.parametrize("bad", ["a,b", "", "has space", "tab\tx"])
+def test_backup_rejects_bad_extra_tag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("restic must not be started for an invalid tag")
+
+    monkeypatch.setattr(rs.subprocess, "Popen", forbidden)
+    with pytest.raises(StoreError, match="tag"):
+        _store(tmp_path).backup(_writer(), "c", WHEN, None, extra_tags=[bad])
+
+
 def test_backup_writer_failure_kills_restic_and_reraises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cls = _popen(monkeypatch, out=SUMMARY)
 
@@ -578,3 +600,154 @@ def test_forget_also_keep_protects_a_snapshot_the_policy_would_drop(
     removed = _store(tmp_path).forget("c", zero, dry_run=False, also_keep=[protect])
     assert [s.short_id for s in removed] == ["a" * 8, "c" * 8]
     assert rec.calls[-1]["argv"] == ["restic", "forget", "a" * 64, "c" * 64]
+
+
+def test_snapshots_fill_tags_and_and_the_extra_tag_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    entry = _entry("a", "2026-10-18T12:00:00Z")
+    entry["tags"] += ["sync", "parent:none"]
+    rec.stdout = json.dumps([entry]).encode()
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    snaps = _store(tmp_path).snapshots("c", tag=SYNC_TAG)
+    assert snaps[0].tags == ("config-saver", "cfg:c", "sync", "parent:none")
+    argv = rec.calls[0]["argv"]
+    assert argv[argv.index("--tag") + 1] == "config-saver,cfg:c,sync"
+    _store(tmp_path).snapshots(tag=SYNC_TAG)
+    argv = rec.calls[1]["argv"]
+    assert argv[argv.index("--tag") + 1] == "config-saver,sync"
+
+
+def test_snapshots_rejects_bad_tag_filter(tmp_path: Path) -> None:
+    with pytest.raises(StoreError, match="tag"):
+        _store(tmp_path).snapshots(tag="a,b")
+
+
+# ------------------------------------------------------------ for_repository
+
+
+def test_for_repository_env_has_password_and_nothing_inherited(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESTIC_PASSWORD_COMMAND", "leak")
+    monkeypatch.setenv("RESTIC_PASSWORD_FILE", "/leak")
+    env = ResticStore.for_repository("/srv/r", "s3cret")._env()
+    assert env["RESTIC_REPOSITORY"] == "/srv/r"
+    assert env["RESTIC_PASSWORD"] == "s3cret"
+    assert "RESTIC_PASSWORD_COMMAND" not in env and "RESTIC_PASSWORD_FILE" not in env
+
+
+def test_for_repository_options_become_o_pairs_and_password_not_on_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    store = ResticStore.for_repository("/srv/r", "s3cret", ["a=b", "c=d e"])
+    store.init_plain()
+    argv = rec.calls[0]["argv"]
+    assert argv == ["restic", "-o", "a=b", "-o", "c=d e", "init"]
+    assert "s3cret" not in " ".join(argv)
+    assert rec.calls[0]["env"]["RESTIC_PASSWORD"] == "s3cret"
+
+
+def test_for_repository_options_reach_backup_and_dump(monkeypatch: pytest.MonkeyPatch) -> None:
+    cls = _popen(monkeypatch, out=SUMMARY)
+    store = ResticStore.for_repository("/srv/r", "p", ["a=b"])
+    store.backup(_writer(), "cfg", WHEN, None)
+    assert cls.last.argv[:4] == ["restic", "-o", "a=b", "backup"]
+    store.dump(SID, "cfg", io.BytesIO())
+    assert cls.last.argv[:5] == ["restic", "-o", "a=b", "dump", SID]
+
+
+def test_default_constructor_is_unchanged(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    assert store._argv(["snapshots"]) == ["restic", "snapshots"]
+    assert "RESTIC_PASSWORD" not in store._env()
+
+
+def test_for_repository_store_is_picklable() -> None:
+    store = ResticStore.for_repository("/srv/r", "p", ["a=b"])
+    again = pickle.loads(pickle.dumps(store))
+    assert (again.repo, again._password, again._options) == ("/srv/r", "p", ("a=b",))
+
+
+def test_exists_distinguishes_missing_from_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = ResticStore.for_repository("/srv/r", "p")
+    for rc, expected in ((0, True), (10, False)):
+        rec = Recorder(tmp_path)
+        rec.returncode = rc
+        monkeypatch.setattr(rs.subprocess, "run", rec.run)
+        assert store.exists() is expected
+        assert rec.calls[0]["argv"] == ["restic", "cat", "config"]
+    rec.returncode = 12
+    with pytest.raises(StoreError):
+        store.exists()
+
+
+def test_copy_from_passes_source_credentials_by_env_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    dst = ResticStore.for_repository("/dst", "dstpw")
+    dst.copy_from(ResticStore.for_repository("/src", "srcpw"), [SID])
+    call = rec.calls[0]
+    assert call["argv"] == ["restic", "copy", SID]
+    assert call["env"]["RESTIC_FROM_REPOSITORY"] == "/src"
+    assert call["env"]["RESTIC_FROM_PASSWORD"] == "srcpw"
+    assert call["env"]["RESTIC_PASSWORD"] == "dstpw" and call["env"]["RESTIC_REPOSITORY"] == "/dst"
+    assert "srcpw" not in " ".join(call["argv"])
+
+
+def test_copy_from_age_store_uses_password_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    ResticStore.for_repository("/dst", "p").copy_from(_store(tmp_path), [SID])
+    env = rec.calls[0]["env"]
+    assert env["RESTIC_FROM_REPOSITORY"] == str(tmp_path / "restic")
+    assert env["RESTIC_FROM_PASSWORD_COMMAND"].startswith("age -d -i ")
+    assert "RESTIC_FROM_PASSWORD" not in env
+
+
+def _copy_argv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dst: list[str], src: list[str]) -> list[str]:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    ResticStore.for_repository("/dst", "p", dst).copy_from(ResticStore.for_repository("/src", "q", src), [SID])
+    return rec.calls[0]["argv"]
+
+
+def test_copy_from_applies_source_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _copy_argv(tmp_path, monkeypatch, [], ["rclone.args=serve"]) == [
+        "restic", "-o", "rclone.args=serve", "copy", SID,
+    ]  # fmt: skip
+
+
+def test_copy_from_dedupes_identical_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    argv = _copy_argv(tmp_path, monkeypatch, ["a=b", "c=d"], ["a=b", "e=f"])
+    assert argv == ["restic", "-o", "a=b", "-o", "c=d", "-o", "e=f", "copy", SID]
+
+
+def test_copy_from_conflicting_options_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(StoreError, match="conflicting"):
+        _copy_argv(tmp_path, monkeypatch, ["a=b"], ["a=c"])
+
+
+def test_copy_from_without_ids_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(tmp_path)
+    monkeypatch.setattr(rs.subprocess, "run", rec.run)
+    with pytest.raises(StoreError, match="no snapshot ids"):
+        ResticStore.for_repository("/dst", "p").copy_from(ResticStore.for_repository("/src", "q"), [])
+    assert rec.calls == []
+
+
+def test_open_dump_never_waits_on_a_child_that_keeps_stderr_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """restic killed after its grace can leave an rclone child holding stderr open: reaping must not wait on it."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "restic"
+    fake.write_text("#!/bin/sh\ntrap '' TERM\nsleep 6 &\nprintf x\nsleep 6\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(rs, "_STOP_GRACE", 0.3)
+    store = ResticStore.for_repository(str(tmp_path / "repo"), "pw")
+    start = time.monotonic()
+    with store.open_dump("a" * 64, "c") as stream:
+        assert stream.read(1) == b"x"
+    assert time.monotonic() - start < 3

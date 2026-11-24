@@ -261,3 +261,31 @@ def test_home_lookalike_member_is_refused_in_restore_in_place_mode(tmp_path: Pat
         TarDecompressor(str(archive)).decompress()
     assert excinfo.value.member_name == "home/userland/evil.txt"
     assert not Path("/home/userland/evil.txt").exists()
+
+
+def test_members_filter_restores_only_listed_member(tmp_path: Path, fake_home: Path) -> None:
+    def build(tar: tarfile.TarFile) -> None:
+        _add_file(tar, "a/one.txt", b"1")
+        _add_file(tar, "a/two.txt", b"2")
+
+    archive = _archive(tmp_path, build)
+    out = tmp_path / "out"
+    result = TarDecompressor(str(archive), output_dir=str(out), members={"a/one.txt"}).decompress()
+
+    assert (out / "a" / "one.txt").read_bytes() == b"1"
+    assert not (out / "a" / "two.txt").exists()
+    assert result.extracted == 1
+
+
+def test_members_filter_still_validates_skipped_members(tmp_path: Path, fake_home: Path) -> None:
+    def build(tar: tarfile.TarFile) -> None:
+        _add_file(tar, "a/one.txt", b"1")
+        _add_file(tar, "../../escaped.txt")
+
+    archive = _archive(tmp_path, build)
+    out = tmp_path / "out" / "x" / "y"
+    out.mkdir(parents=True)
+
+    with pytest.raises(UnsafeArchiveError, match="traversal"):
+        TarDecompressor(str(archive), output_dir=str(out), members={"a/one.txt"}).decompress()
+    assert not (tmp_path / "out" / "escaped.txt").exists()

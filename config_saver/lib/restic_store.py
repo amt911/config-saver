@@ -12,6 +12,7 @@ Instances hold plain attributes only, so they can be pickled to worker processes
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -20,7 +21,7 @@ import shlex
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -38,9 +39,16 @@ DEFAULT_IDENTITY = "~/.config/age/key.txt"
 BASE_TAG = "config-saver"
 CFG_TAG_PREFIX = "cfg:"
 DESC_TAG_PREFIX = "desc:"
+SYNC_TAG = "sync"
+PARENT_TAG_PREFIX = "parent:"
+GEN_TAG_PREFIX = "gen:"
+HOST_TAG_PREFIX = "host:"
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 _PRIVATE_FILE = 0o600
 _PRIVATE_DIR = 0o700
+_EXIT_WAIT = 1.0  # seconds to learn whether restic ended by itself after the reader gave up
+_STOP_GRACE = 10.0  # seconds restic gets to leave cleanly after SIGTERM
+_RESTIC_NO_REPOSITORY = 10  # restic exit status: the repository does not exist
 
 
 @dataclass(frozen=True)
@@ -52,6 +60,17 @@ class Snapshot:
     time: datetime
     cfg: str
     description: str | None
+    tags: tuple[str, ...] = ()
+    original: str | None = None
+
+    @property
+    def canonical(self) -> str:
+        """The identity sync reasons about: the id this snapshot had where it was first created.
+
+        ``restic copy`` gives a copied snapshot a new id and records the source's in ``original``, so
+        manifests and ``parent:`` tags (which name ids) stay valid in the copy.
+        """
+        return self.original or self.id
 
 
 class StorageMode(Enum):
@@ -154,6 +173,24 @@ class ResticStore:
         # Absolute, so a store set up from one directory still works from the timer's.
         chosen = identity or self._recorded_identity() or DEFAULT_IDENTITY
         self.identity = os.path.abspath(os.path.expanduser(chosen))
+        self._password: str | None = None
+        self._options: tuple[str, ...] = ()
+
+    @classmethod
+    def for_repository(cls, repository: str, password: str, options: Sequence[str] = ()) -> ResticStore:
+        """A store on an arbitrary restic repository with an explicit password (no saves_dir, no age file).
+
+        The password reaches restic through ``RESTIC_PASSWORD`` in the environment, never on argv.
+        """
+        store = cls.__new__(cls)
+        store.saves_dir = ""
+        store.repo = repository
+        store.password_file = ""
+        store.settings_file = ""
+        store.identity = ""
+        store._password = password
+        store._options = tuple(options)
+        return store
 
     def _recorded_identity(self) -> str | None:
         try:
@@ -165,6 +202,12 @@ class ResticStore:
 
     # ----------------------------------------------------------------- plumbing
 
+    def _argv(self, args: Sequence[str], options: Sequence[str] | None = None) -> list[str]:
+        """The restic command line: every configured option becomes a global ``-o`` pair."""
+        chosen = self._options if options is None else options
+        options = [part for option in chosen for part in ("-o", option)]
+        return ["restic", *options, *args]
+
     def _check_paths(self) -> None:
         """restic splits the password command on quotes itself; refuse what it cannot carry."""
         for path in (self.identity, self.password_file):
@@ -174,10 +217,13 @@ class ResticStore:
                 )
 
     def _env(self) -> dict[str, str]:
-        self._check_paths()
         # Inherited RESTIC_* settings (repository file, key hint, ...) would fight ours.
         env = {k: v for k, v in os.environ.items() if not k.startswith("RESTIC_") or k == "RESTIC_CACHE_DIR"}
         env["RESTIC_REPOSITORY"] = self.repo
+        if self._password is not None:
+            env["RESTIC_PASSWORD"] = self._password
+            return env
+        self._check_paths()
         env["RESTIC_PASSWORD_COMMAND"] = f"age -d -i {shlex.quote(self.identity)} {shlex.quote(self.password_file)}"
         return env
 
@@ -188,11 +234,23 @@ class ResticStore:
             return StoreError(f"cannot decrypt the store password with {self.identity}")
         return StoreError(f"restic failed: {text or f'exit status {returncode}'}")
 
-    def _run(self, args: list[str]) -> bytes:
+    def _exec(
+        self,
+        args: Sequence[str],
+        extra_env: dict[str, str] | None = None,
+        options: Sequence[str] | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
         try:
-            done = subprocess.run(["restic", *args], env=self._env(), capture_output=True, check=False)
+            return subprocess.run(
+                self._argv(args, options), env={**self._env(), **(extra_env or {})}, capture_output=True, check=False
+            )
         except OSError as exc:
             raise StoreError(f"could not run restic: {exc}") from exc
+
+    def _run(
+        self, args: Sequence[str], extra_env: dict[str, str] | None = None, options: Sequence[str] | None = None
+    ) -> bytes:
+        done = self._exec(args, extra_env, options)
         if done.returncode != 0:
             raise self._explain(done.stderr, done.returncode)
         return bytes(done.stdout)
@@ -201,6 +259,12 @@ class ResticStore:
     def _check_cfg(cfg: str) -> None:
         if "," in cfg:
             raise StoreError(f"config name '{cfg}' contains a comma, which restic tags cannot carry")
+
+    @staticmethod
+    def _check_tag(tag: str) -> None:
+        """An extra tag must be non-empty, comma-free and whitespace-free."""
+        if not tag or "," in tag or any(ch.isspace() for ch in tag):
+            raise StoreError(f"invalid tag {tag!r}: it must be non-empty with no comma or whitespace")
 
     # ------------------------------------------------------------------- verbs
 
@@ -247,17 +311,61 @@ class ResticStore:
                     pass
             raise
 
+    def init_plain(self) -> None:
+        """Create the repository with this store's explicit password (``for_repository`` stores)."""
+        self._run(["init"])
+
+    def exists(self) -> bool:
+        """True when the repository exists and opens; False only when restic says it does not exist (exit 10)."""
+        done = self._exec(["cat", "config"])
+        if done.returncode == 0:
+            return True
+        if done.returncode == _RESTIC_NO_REPOSITORY:
+            return False
+        raise self._explain(done.stderr, done.returncode)
+
+    def _from_args(self, src: ResticStore) -> tuple[dict[str, str], list[str]]:
+        """The environment and ``-o`` options a process needs to read ``src`` while working on this repository.
+
+        -o options are process-global: the one restic process needs both repositories' options.
+        """
+        merged: dict[str, str] = {}
+        for option in (*self._options, *src._options):
+            key = option.partition("=")[0]
+            if merged.setdefault(key, option) != option:
+                raise StoreError(f"conflicting restic options for {key!r}: {merged[key]!r} vs {option!r}")
+        extra = {"RESTIC_FROM_REPOSITORY": src.repo}
+        if src._password is not None:
+            extra["RESTIC_FROM_PASSWORD"] = src._password
+        else:
+            extra["RESTIC_FROM_PASSWORD_COMMAND"] = src._env()["RESTIC_PASSWORD_COMMAND"]
+        return extra, list(merged.values())
+
+    def init_from(self, src: ResticStore) -> None:
+        """Create this repository with ``src``'s chunker parameters, so copied data deduplicates against it."""
+        extra, options = self._from_args(src)
+        self._run(["init", "--copy-chunker-params"], extra, options)
+
+    def copy_from(self, src: ResticStore, ids: list[str]) -> None:
+        """Copy snapshots ``ids`` from ``src`` into this repository; the source credentials travel in the environment."""
+        if not ids:
+            raise StoreError("refusing to copy with no snapshot ids: restic would copy every snapshot")
+        extra, options = self._from_args(src)
+        self._run(["copy", *ids], extra, options)
+
     def backup(
         self,
         write: Callable[[IO[bytes]], CompressResult],
         cfg: str,
         when: datetime,
         description: str | None,
+        extra_tags: Sequence[str] = (),
     ) -> tuple[Snapshot, CompressResult, int]:
         """Stream ``write``'s tar into restic; return (snapshot, result, data_added)."""
         self._check_cfg(cfg)
+        for tag in extra_tags:
+            self._check_tag(tag)
         argv = [
-            "restic",
             "backup",
             "--stdin",
             "--stdin-filename",
@@ -269,10 +377,12 @@ class ResticStore:
         ]
         if description:
             argv += ["--tag", encode_description(description)]
+        for tag in extra_tags:
+            argv += ["--tag", tag]
         argv += ["--time", when.strftime(_TIME_FORMAT), "--json"]
         try:
             proc = subprocess.Popen(
-                argv,
+                self._argv(argv),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -338,12 +448,15 @@ class ResticStore:
                 return data
         raise StoreError("restic finished without reporting a snapshot id")
 
-    def snapshots(self, cfg: str | None = None) -> list[Snapshot]:
-        """Snapshots of this tool, oldest first, optionally of one config."""
+    def snapshots(self, cfg: str | None = None, tag: str | None = None) -> list[Snapshot]:
+        """Snapshots of this tool, oldest first, optionally of one config and/or carrying ``tag``."""
         tags = BASE_TAG
         if cfg is not None:
             self._check_cfg(cfg)
             tags += f",{CFG_TAG_PREFIX}{cfg}"
+        if tag is not None:
+            self._check_tag(tag)
+            tags += f",{tag}"
         raw = self._run(["snapshots", "--json", "--tag", tags])
         try:
             entries = json.loads(raw or b"[]")
@@ -363,6 +476,8 @@ class ResticStore:
                     time=parse_restic_time(entry["time"]),
                     cfg=name,
                     description=decode_description(desc_tag) if desc_tag else None,
+                    tags=tuple(tag_list),
+                    original=entry.get("original") or None,
                 )
             )
         return sorted(found, key=lambda s: (s.time, s.id))
@@ -371,7 +486,7 @@ class ResticStore:
         """Write snapshot ``snapshot_id``'s tar of ``cfg`` to ``out``."""
         try:
             proc = subprocess.Popen(
-                ["restic", "dump", snapshot_id, f"/{cfg}.tar"],
+                self._argv(["dump", snapshot_id, f"/{cfg}.tar"]),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=self._env(),
@@ -390,6 +505,60 @@ class ResticStore:
         err_thread.join()
         if returncode != 0:
             raise self._explain(b"".join(err_chunks), returncode)
+
+    @contextlib.contextmanager
+    def open_dump(self, snapshot_id: str, cfg: str) -> Iterator[IO[bytes]]:
+        """Stream snapshot ``snapshot_id``'s tar of ``cfg``; leaving the block early stops restic and reaps it.
+
+        For reading only the start of a tar (the sync manifest) without pulling all of it. restic is asked
+        to stop (SIGTERM, so it releases its repository lock and ends an rclone child), then killed if it
+        lingers. A restic that failed on its own before the reader finished surfaces as a StoreError.
+        """
+        try:
+            proc = subprocess.Popen(
+                self._argv(["dump", snapshot_id, f"/{cfg}.tar"]),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self._env(),
+            )
+        except OSError as exc:
+            raise StoreError(f"could not run restic: {exc}") from exc
+        assert proc.stdout is not None and proc.stderr is not None
+        err_thread, err_chunks = drain(proc.stderr)
+        try:
+            yield proc.stdout
+        except BaseException as exc:
+            early = self._exited(proc)
+            self._stop(proc, err_thread)
+            if early is not None and early != 0:
+                raise self._explain(b"".join(err_chunks), early) from exc
+            raise
+        else:
+            self._stop(proc, err_thread)
+
+    @staticmethod
+    def _exited(proc: subprocess.Popen[bytes]) -> int | None:
+        """restic's own exit status if it ends within a moment (it closed the pipe because it failed), else None."""
+        try:
+            return proc.wait(timeout=_EXIT_WAIT)
+        except subprocess.TimeoutExpired:
+            return None
+
+    @staticmethod
+    def _stop(proc: subprocess.Popen[bytes], err_thread: threading.Thread) -> None:
+        """Ask a restic child to stop, kill it if it does not, and reap it; no zombie, no stray output."""
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=_STOP_GRACE)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        proc.wait()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        # A killed restic can leave an rclone child holding stderr open; the drain is a daemon thread, so
+        # giving up on it after the grace leaks nothing past the process.
+        err_thread.join(timeout=_STOP_GRACE)
 
     def forget(
         self, cfg: str, policy: RetentionModel, dry_run: bool, also_keep: Iterable[datetime] = ()

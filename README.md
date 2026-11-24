@@ -200,6 +200,7 @@ config-saver --compress
 - `--encrypt-to RECIPIENT`: Encrypt the archive for this age public key or gpg key id (repeatable)
 - `--encrypt-method {age,gpg}`: Backend for `--encrypt-to` (default `age`)
 - `--identity FILE`: Key file used to decrypt an encrypted archive (required for `age`)
+- `--sync`: Sync the configurations marked `sync: true` with your other machines; `--sync-init URL [--sync-option K=V]`: set sync up against a restic repository URL (`--sync-option` is repeatable); `--sync-move URL [--sync-option K=V]`: move the sync repository to another URL; `--sync-prune`: forget unneeded sync snapshots and reclaim their space now; `--sync-status`: show what `--sync` would do (exit `11` on conflicts); `--sync-resolve local|remote [--path P]`: settle conflicts (`--path` is repeatable). See [Sync between machines](#sync-between-machines)
 - `--version`/`-v`: Show program version and exit
 
 With a restic store, `--compress` snapshots into it, then prunes by each configuration's
@@ -226,13 +227,16 @@ itself.
 | `3` | Configuration failed validation (malformed YAML, bad shape, unknown key) |
 | `4` | Permission denied, including `only_root_user: true` run as non-root |
 | `5` | Archive error: corrupt archive, or a member refused as unsafe; an unusable restic store; a failed prune (after a complete batch report); a failed migration (`--migrate`, including an archive that could not be decrypted) |
-| `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`, `--encrypt-to` with the restic store) |
+| `6` | Invalid option combination (e.g. `--output` in directory mode, bad `--jobs`, `--encrypt-to` with the restic store; sync usage errors: `--sync-init` against a different URL than the one set up, `--sync-move` to the URL already in use, a malformed `--sync-option` or one without `--sync-init`/`--sync-move`, `--path` without `--sync-resolve`, `--encrypt-to`/`--encrypt-method` with a `--sync*` flag, more than one sync verb or a sync verb combined with another action) |
 | `7` | `--export-config NAME` matched no saved configuration |
 | `8` | `--strict` and at least one configured path was missing |
 | `9` | Encryption or decryption failed (backend missing, wrong key, bad recipient) |
-| `10` | I/O error |
+| `10` | I/O error, including an unreachable sync remote |
+| `11` | `--sync` or `--sync-status` found paths changed on both machines since the last sync (nothing was written); see [Sync between machines](#sync-between-machines) |
 
-argparse itself exits with `2` for usage errors such as a missing action flag.
+argparse itself exits with `2` for usage errors such as a missing action flag. Sync needing a tool
+or a set-up that is absent exits `2`; a too-large sync config (over its `sync_max_mb`, 50 MiB by default) or an unreadable sync
+state file exits `3`; an unknown `--path` for `--sync-resolve` exits `6`.
 
 ## Deduplicated storage (restic)
 
@@ -708,6 +712,16 @@ reported, because a backup must not skip anything in silence:
 3 path(s) excluded by pattern.
 ```
 
+### Sync between machines (`sync: true`)
+
+```yaml
+sync: true          # default false; cannot be combined with only_root_user
+sync_max_mb: 4096   # default 50 (MiB), minimum 1: largest total size this configuration may have when synced
+```
+
+Marks the configuration as shared by `--sync`; see [Sync between machines](#sync-between-machines).
+Session directories of agents (opencode, Codex) are big: give those YAMLs a high `sync_max_mb`.
+
 ### Root-only configurations (optional)
 
 Some configurations may require root privileges to read system files (e.g., `/etc`, `/var/log`, system service configurations). You can restrict a YAML configuration to only run as root by adding the `only_root_user: true` option:
@@ -829,6 +843,159 @@ And when user `maria` decompresses it, it becomes:
 - Only UTF-8 and Latin-1 encoded text files are processed
 - This option is **disabled by default** for safety
 
+## Sync between machines
+
+`--sync` keeps the files of configurations marked `sync: true` identical across your machines
+through a restic repository that you host anywhere restic can reach: an rclone remote (Google Drive,
+Proton Drive, ...), SFTP, or a plain path on a mounted disk. The store is a separate encrypted
+restic repository, built the same way as the backup store (see
+[Deduplicated storage](#deduplicated-storage-restic)); the backup store is not touched. The remote
+only ever sees ciphertext. Needs `restic` 0.17 or newer (it tells a missing repository apart by its
+exit code 10) and `age`, plus `rclone` only for `rclone:` URLs.
+
+**What syncs.** Only the YAMLs marked `sync: true`. KDE and other per-machine configurations stay
+local: leave them unmarked.
+
+**Password.** It is derived from the shared age identity (`~/.config/age/key.txt`; `--identity`
+overrides): there is nothing else to copy between machines.
+
+**First machine.** Create the remote, then point config-saver at it. The URL and the repository
+options are stored in `~/.config/config-saver/sync.json` (mode `0600`). The command prints `created`
+(new repository) or `joined` (it already existed).
+
+```bash
+# Google Drive: first run `rclone config` and create a remote named "Google Drive"
+config-saver --sync-init "rclone:Google Drive:config-saver-sync"
+
+# Proton Drive: an rclone remote of type protondrive, here named "Proton".
+# --sync-option rclone.args replaces restic's default rclone arguments, so it must start with
+# `serve restic --stdio`; the rest is up to you, e.g. a transaction rate limit:
+config-saver --sync-init "rclone:Proton:config-saver-sync" \
+    --sync-option rclone.args="serve restic --stdio --tpslimit 5"
+
+# Anything else restic understands: SFTP, or a local path / mounted disk
+config-saver --sync-init "sftp:user@host:/srv/config-saver-sync"
+config-saver --sync-init /mnt/disk/config-saver-sync
+```
+
+Re-running `--sync-init` with a different URL is refused (exit `6`): use `--sync-move`. Re-running it
+with the same URL and no `--sync-option` keeps the stored options; with options given it replaces them.
+Mark what to share in your configuration with `sync: true`, then run `config-saver --sync`.
+
+Session directories of agents (opencode, Codex) are big: give those YAMLs a higher `sync_max_mb`
+(for example `4096`; the default is 50) **before** the first sync, or it exits `3` on the size limit.
+
+**Next machines.** Put the same age identity on the machine and run the same
+`--sync-init <url>` (it prints `joined`). Then mark the same configurations `sync: true` and run
+`--sync-status` and `--sync-resolve local|remote` **before** enabling the timer
+(`systemctl --user enable --now config-saver-sync.timer`): files that already exist here and differ
+from the remote are conflicts on the first sync.
+
+**What a run does.** Each `--sync` takes remote changes that this machine did not touch, publishes
+local changes that nobody else touched, and propagates deletions. Output is one line per
+configuration (`applied / deleted / published`), plus `skipped (no local config): ...` for remote
+configurations this machine does not define. `--sync-status` shows the same per path and changes
+nothing. Unchanged files are not hashed again: the state file keeps a cache keyed on size, mtime,
+ctime, inode and `normalize_content`, and a change of `HOME` drops it.
+
+**Two machines at once.** If two machines publish at the same time, the earliest wins and the other
+retries automatically (at most 3 times, then exit `10`). Nothing is lost; at worst a conflict
+(exit `11`) is reported.
+
+**Conflicts.** If the same path changed on two machines since the last sync, `--sync` exits `11`,
+writes nothing, and prints one `config: path` line per conflict followed by
+`Resolve with: config-saver --sync-resolve local|remote [--path P]`. Choose `local` (keep this
+machine's version) or `remote` (take the other's); without `--path` every conflict is settled the
+same way, and `--path ~/.zshrc` (repeatable) settles only those.
+
+**Before leaving home.** If the last session ended less than 15 minutes ago, run `config-saver --sync`
+by hand instead of waiting for the timer. Close agents first (opencode, Codex...): their SQLite
+databases would otherwise be copied mid-write.
+
+**Switching provider.** `config-saver --sync-move NEWURL [--sync-option K=V ...]` copies every sync
+snapshot to the new repository (created with the same chunker parameters if missing), verifies the
+heads and only then rewrites `sync.json`; an interrupted move leaves the old repository in use. Run
+it on **every** machine: snapshots already copied are skipped. History and each machine's recorded
+state survive the move.
+
+**Pruning.** After a successful sync, snapshots no head needs are forgotten, except that a
+superseded snapshot is kept for 24 hours (a slower machine never builds on a forgotten one).
+`restic prune` runs at most once every 7 days from a sync run; `--sync-prune` forces it now. After a
+failed `restic prune` a sync run does not try again for 24 hours (it still exits `10` on the failing
+run); `--sync-prune` always tries.
+
+Every sync snapshot carries a generation (`gen:` tag): the head is the one of the highest generation,
+so forgetting snapshots from the middle of the history never changes which snapshot is the head. A
+snapshot that lost a fork (two machines published on the same parent; the earliest wins) is kept for
+30 days together with the fork winner and the snapshot it forked from, so a machine that was away
+can still find where it stood. A publish counts only when the head is the new snapshot or builds on
+it; otherwise (for example a laptop suspended mid-upload while the other machine moved on) it is
+dropped and the run starts again. A snapshot is dated when its upload starts, so one whose upload
+took more than 6 hours is dropped and redone too (restic already holds the data, so the redo is
+quick): every snapshot that stays is dated close to when the other machines could first see it.
+
+**Manifest cache.** Each run needs the head's manifest (the file list). It is streamed out of the first
+members of the snapshot's tar rather than downloading the whole snapshot, and cached by snapshot id
+in `sync-manifests.json` next to the sync state (`0600`; a malformed file is ignored). A run whose head
+did not change touches the repository only to list it.
+
+**Rotating the age key.** The password follows the age identity, so after rotating the key the
+repository must be re-keyed. Keep the old identity file and compute the old and the new derived
+password from their files (the password is the hex sha256 of `config-saver-sync-v1`, a NUL byte and
+the `AGE-SECRET-KEY-` line):
+
+```bash
+# strips leading/trailing whitespace (including a Windows \r) exactly like the tool does
+derive() { printf 'config-saver-sync-v1\0%s' "$(sed -n 's/^[[:space:]]*\(AGE-SECRET-KEY-.*[^[:space:]]\)[[:space:]]*$/\1/p' "$1" | head -n 1)" | sha256sum | cut -d' ' -f1; }
+umask 077; d=$(mktemp -d)                       # a private directory: the file holds the new password
+derive new-key.txt > "$d/new-pw"
+RESTIC_PASSWORD="$(derive old-key.txt)" restic -r <sync repository URL> key passwd --new-password-file "$d/new-pw"
+rm -rf "$d"
+```
+
+`key passwd` adds the new key and removes the old one in one step. Done by hand it is
+`restic key list` with the old password (note the ID of the key you are replacing: the one marked `*`,
+the key in use), `restic key add --new-password-file`, then `restic key remove <old key ID>` run **with
+the new password** (restic refuses to remove the key it is using):
+
+```bash
+RESTIC_PASSWORD="$(derive old-key.txt)" restic -r <sync repository URL> key list   # old key: marked *
+umask 077; d=$(mktemp -d)
+derive new-key.txt > "$d/new-pw"
+RESTIC_PASSWORD="$(derive old-key.txt)" restic -r <sync repository URL> key add --new-password-file "$d/new-pw"
+rm -rf "$d"
+RESTIC_PASSWORD="$(derive new-key.txt)" restic -r <sync repository URL> key remove <old key ID>
+```
+
+Pass the repository options you gave `--sync-init` with `-o` (for example `-o rclone.args=...`). Do
+this once, then put the new identity on every other machine. (The shell `derive` above was checked
+against the tool's own derivation in bash and zsh, for plain, CRLF and padded key files.)
+
+**Limits.**
+
+- Definitions stay per machine: a file added to one machine's YAML is not picked up by the others
+  until it is added there too.
+- Empty directories are not synced.
+- Symlink targets are synced verbatim: an absolute link into another user's home will dangle on a
+  machine with a different home.
+- Set `normalize_content` the same way on every machine for a synced configuration; otherwise the
+  same file hashes differently and shows up as a change on every run.
+- A path that exists but cannot be read (permissions) or is root-owned and skipped makes the run
+  fail (exit `10`) before anything is written: it is never published as a deletion.
+- A `sync: true` configuration cannot declare anything under `/etc/config-saver/configs` (exit `3`).
+- At most `sync_max_mb` MiB per configuration (default 50; exit `3` beyond that).
+- A machine that has been away for more than about 4 weeks may see a conflict (exit `11`, nothing
+  written) instead of a clean merge: it remembers when it last synced (`recorded_at`), and past 29 days
+  it can no longer tell a head that was replaced from one that lost a fork whose snapshot was already
+  forgotten (the fork losers are kept 30 days). Resolve with `--sync-resolve`; nothing is ever lost
+  silently.
+- A sync snapshot made without a `gen:` tag (a development repository from before 3.7.0) is refused
+  (exit `3`).
+- `restic prune` needs an exclusive repository lock: if another machine is mid-backup it fails, the
+  run exits `10` even though the publish already succeeded, and the next run retries.
+- The repository only grows between prunes: old versions stay until their snapshots are forgotten
+  and pruned.
+
 ## Systemd units and timers
 
 This repository contains example systemd unit and timer files to run `config-saver` periodically.
@@ -898,6 +1065,29 @@ not need this — it runs from the system manager as `User=%i`.
      systemctl --user list-timers --all
      journalctl --user -u config-saver.service --since "1 hour ago"
    ```
+
+### Multi-machine sync timer
+
+`contrib/systemd/user/` also ships `config-saver-sync.timer` / `.service`, which run
+`config-saver --sync` 2 minutes after boot and every 15 minutes after that:
+
+```bash
+systemctl --user enable --now config-saver-sync.timer
+```
+
+A failed run (conflict, exit 11; transport failure, exit 10; not set up, exit 2) starts
+`config-saver-notify@.service`, which raises a freedesktop desktop notification with `notify-send`
+(package `libnotify`; works on KDE, GNOME and others). The notifier is optional: if `notify-send`
+is missing nothing else fails, you just get no banner (see `journalctl --user -u config-saver-sync.service`
+and `config-saver --sync-status`). The notification needs `DBUS_SESSION_BUS_ADDRESS` in the user manager,
+which a graphical login provides; on a session without one run
+`systemctl --user import-environment DBUS_SESSION_BUS_ADDRESS`.
+
+The timer has no interactive environment: the sync service runs non-interactively. An `sftp:` remote
+needs a passphrase-less key (or `systemctl --user import-environment SSH_AUTH_SOCK` from your
+session), and an rclone remote needs its token already in `~/.config/rclone/rclone.conf`; otherwise
+every run fails with exit 10.
+`scripts/check-sync-notify.sh` verifies the `OnFailure=` wiring against real systemd.
 
 ### Install (system-wide)
 
