@@ -391,7 +391,7 @@ class SyncEngine:
                     state.last_prune_attempt = None
                     state_file_io.save(self.state_file, state)
                 return total
-        raise SyncTransportError("another machine kept publishing; try again")
+        raise SyncTransportError("another machine kept publishing, or every upload took too long to count; try again")
 
     def _save_hash_cache_only(self, state: SyncState) -> None:
         """A conflict stops the run with the sync state untouched, except the hashes it already paid for.

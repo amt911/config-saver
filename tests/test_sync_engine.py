@@ -1141,7 +1141,7 @@ def test_a_publish_whose_upload_outlasted_the_bound_is_dropped_and_retried(env, 
             snap = super().backup(write, cfg, when, description, extra_tags)
             created.append(snap[0].id)
             if len(created) == 1:
-                clock.t += 7 * 3600  # the first upload took seven hours
+                clock.t += 6 * 3600 + 60  # the first upload took just over six hours
             return snap
 
     a = machine(env, "a", store_cls=Slow, now=clock)
