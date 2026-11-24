@@ -1,7 +1,7 @@
 """SyncEngine end to end: two fake machines (own HOME, state, sync dir) and one bare remote.
 
-Real restic, age and git are used on purpose: the engine's job is the interplay of
-those with the real filesystem, and mocking them would prove nothing.
+Real restic and age are used on purpose (the repository is a local path in tmp_path): the
+engine's job is the interplay of those with the real filesystem, and mocking them proves nothing.
 """
 
 from __future__ import annotations
@@ -11,7 +11,8 @@ import os
 import shutil
 import subprocess
 import tarfile
-from datetime import datetime
+from collections.abc import Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -19,43 +20,45 @@ import pytest
 from config_saver.lib.errors import (
     ArchiveError,
     SyncConflictError,
-    SyncNotSetUpError,
+    SyncStateError,
     SyncTransportError,
     UnsafeArchiveError,
 )
-from config_saver.lib.restic_store import HOST_TAG_PREFIX, PARENT_TAG_PREFIX, SYNC_TAG, ResticStore
+from config_saver.lib.restic_store import HOST_TAG_PREFIX, PARENT_TAG_PREFIX, SYNC_TAG, ResticStore, Snapshot
 from config_saver.lib.sync import state as state_io
 from config_saver.lib.sync.classify import Fingerprint
 from config_saver.lib.sync.engine import SyncEngine
-from config_saver.lib.sync.git_repo import GitRepo
-from config_saver.lib.sync.manifest import MANIFEST_MEMBER, SELF, Manifest
+from config_saver.lib.sync.manifest import MANIFEST_MEMBER, SELF, Manifest, SnapRef, losers, select_head
+from config_saver.lib.sync.remote import SyncRemote, derive_password
 from tests.conftest import make_model
 
 pytestmark = [
     pytest.mark.restic,
     pytest.mark.skipif(
-        any(shutil.which(b) is None for b in ("restic", "age", "age-keygen", "git")),
-        reason="needs restic, age, age-keygen and git on PATH",
+        any(shutil.which(b) is None for b in ("restic", "age", "age-keygen")),
+        reason="needs restic, age and age-keygen on PATH",
     ),
 ]
 
 SECRET = "TOP-SECRET-MARKER-9f3a"
 
 
-def git(path: str, *args: str) -> str:
-    return subprocess.run(["git", "-C", path, *args], check=True, capture_output=True, text=True).stdout
-
-
 class Machine:
-    """One fake machine: HOME, sync dir, state file, and an engine bound to them."""
+    """One fake machine: HOME, state, staging and lock paths, an engine on the shared repository."""
 
-    def __init__(self, root: Path, name: str, user: str, key: str, git_cls: type[GitRepo] = GitRepo):
+    def __init__(
+        self, root: Path, name: str, user: str, key: str, repo: str, store_cls: type[ResticStore] | None = None
+    ):
         self.home = root / name / "homes" / user
         self.home.mkdir(parents=True)
         self.sync_dir = str(root / name / "sync")
         self.state_file = str(root / name / "state.json")
-        self.git = git_cls(self.sync_dir)
-        self.engine = SyncEngine(self.sync_dir, self.state_file, key, name, git=self.git)
+        self.lock_file = str(root / name / "state" / "sync.lock")
+        remote = SyncRemote(repo)
+        store = None
+        if store_cls is not None:
+            store = store_cls.for_repository(repo, derive_password(key), ())
+        self.engine = SyncEngine(remote, key, self.state_file, self.sync_dir, self.lock_file, name, store=store)
 
     def model(self, *dirs: str, **kwargs):
         return make_model([str(self.home / d) for d in dirs], sync=True, **kwargs)
@@ -72,37 +75,40 @@ class Machine:
         return path
 
     def head(self) -> str:
-        return subprocess.run(
-            ["git", "-C", self.sync_dir, "rev-parse", "HEAD"], check=True, capture_output=True, text=True
-        ).stdout.strip()
+        """The winning head of cfg ``c`` in the shared repository."""
+        snaps = self.engine.store.snapshots("c", tag=SYNC_TAG)
+        return select_head([SnapRef(x.id, _parent(x), x.time) for x in snaps]) or ""
+
+
+def _parent(snap) -> str | None:
+    for tag in snap.tags:
+        if tag.startswith(PARENT_TAG_PREFIX):
+            value = tag[len(PARENT_TAG_PREFIX) :]
+            return None if value == "none" else value
+    return None
 
 
 @pytest.fixture
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("RESTIC_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     key = tmp_path / "key.txt"
     subprocess.run(["age-keygen", "-o", str(key)], check=True, capture_output=True)
-    public = subprocess.run(["age-keygen", "-y", str(key)], check=True, capture_output=True, text=True)
-    remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, capture_output=True)
-    return {"key": str(key), "recipient": public.stdout.strip(), "remote": str(remote), "root": tmp_path}
+    return {"key": str(key), "repo": str(tmp_path / "repo"), "root": tmp_path}
 
 
-def machine(env, name: str, user: str = "tester", git_cls: type[GitRepo] = GitRepo) -> Machine:
-    return Machine(env["root"], name, user, env["key"], git_cls)
+def machine(env, name: str, user: str = "tester", store_cls: type[ResticStore] | None = None) -> Machine:
+    return Machine(env["root"], name, user, env["key"], env["repo"], store_cls)
 
 
 @pytest.fixture
 def pair(env, monkeypatch):
-    """Machine A creates the remote, machine B clones it; HOME is A's."""
+    """Machine A creates the repository, machine B joins it; HOME is A's."""
     a, b = machine(env, "a"), machine(env, "b")
     a.use(monkeypatch)
-    a.engine.init(env["remote"], env["recipient"])
+    assert a.engine.init() == "created"
     b.use(monkeypatch)
-    b.engine.init(env["remote"], None)
+    assert b.engine.init() == "joined"
     a.use(monkeypatch)
     return a, b
 
@@ -159,9 +165,7 @@ def test_conflict_aborts_without_writes(pair, monkeypatch):
     assert exc.value.conflicts == {"c": ["home/user/cfg/app.conf"]}
     assert (b.home / "cfg" / "app.conf").read_text() == "from b\n"
     assert Path(b.state_file).read_bytes() == before_state
-    # The pull that makes classification possible may fast-forward; nothing of ours is committed.
-    assert git(b.sync_dir, "rev-list", "@{u}..HEAD") == ""
-    assert git(b.sync_dir, "status", "--porcelain") == ""
+    assert len(b.engine.store.snapshots("c", tag=SYNC_TAG)) == 2  # nothing of ours was published
 
 
 def test_status_reports_without_writing(pair, monkeypatch):
@@ -243,9 +247,9 @@ def test_narrower_yaml_does_not_delete_wider_files(pair, monkeypatch):
 def test_different_usernames_no_conflict(env, monkeypatch):
     a, b = machine(env, "a", "tester"), machine(env, "b", "amt")
     a.use(monkeypatch)
-    a.engine.init(env["remote"], env["recipient"])
+    a.engine.init()
     b.use(monkeypatch)
-    b.engine.init(env["remote"], None)
+    b.engine.init()
     a.use(monkeypatch)
     a.write("cfg/paths.conf", f"home={a.home}/cfg\n")
     a.engine.run({"c": a.model("cfg", normalize_content=True)})
@@ -271,10 +275,9 @@ def _craft_snapshot(m: Machine, cfg: str, members: dict[str, bytes], manifest: M
                 tar.addfile(info, io.BytesIO(payload))
         return None
 
-    store = ResticStore(m.sync_dir, m.engine.store.identity)
+    store = m.engine.store
     tags = [SYNC_TAG, PARENT_TAG_PREFIX + parent, HOST_TAG_PREFIX + "evil"]
     snap, _, _ = store.backup(write, cfg, datetime.now(), None, extra_tags=tags)  # type: ignore[arg-type]
-    assert m.git.commit_all() and m.git.push()
     return snap
 
 
@@ -339,26 +342,26 @@ def test_rerun_after_push_before_state_save(pair, monkeypatch):
     assert state_io.load(a.state_file).base["c"]
 
 
-def test_concurrent_push_retries(env, monkeypatch):
+def test_fork_race_one_winner_loser_retries(env, monkeypatch):
     log: list[str] = []
 
-    class Racing(GitRepo):
-        """Lets machine A publish between B's pull and B's first push."""
+    class Racing(ResticStore):
+        """Machine A publishes (two roots race) just before B's first backup lands; B's clock is ahead, so B loses."""
 
-        def push(self) -> bool:
+        def backup(self, write, cfg, when, description, extra_tags: Sequence[str] = ()):
             if not log:
                 log.append("raced")
                 a.use(monkeypatch)
                 a.write("cfg/from_a.txt", "a\n")
                 a.engine.run({"c": a.model("cfg")})
                 b.use(monkeypatch)
-            return super().push()
+                when = when + timedelta(hours=1)
+            return super().backup(write, cfg, when, description, extra_tags)
 
-    a, b = machine(env, "a"), machine(env, "b", git_cls=Racing)
+    a, b = machine(env, "a"), machine(env, "b", store_cls=Racing)
     a.use(monkeypatch)
-    a.engine.init(env["remote"], env["recipient"])
+    a.engine.init()
     b.use(monkeypatch)
-    b.engine.init(env["remote"], None)
     b.write("cfg/from_b.txt", "b\n")
     b.engine.run({"c": b.model("cfg")})
     assert log == ["raced"]
@@ -366,10 +369,96 @@ def test_concurrent_push_retries(env, monkeypatch):
     a.use(monkeypatch)
     a.engine.run({"c": a.model("cfg")})
     assert (a.home / "cfg" / "from_b.txt").read_text() == "b\n"
-    # one linear chain of sync snapshots: exactly one head, every other is somebody's parent
+    # B's losing first snapshot was forgotten: one linear chain of two snapshots
     snaps = b.engine.store.snapshots("c", tag=SYNC_TAG)
-    parents = {t for s in snaps for t in s.tags if t.startswith(PARENT_TAG_PREFIX)}
-    assert len(snaps) == 2 and len(parents) == 2
+    assert len(snaps) == 2
+    assert losers([SnapRef(x.id, _parent(x), x.time) for x in snaps]) == set()
+
+
+def test_a_snapshot_another_machine_built_on_is_not_forgotten(env, monkeypatch):
+    log: list[str] = []
+
+    class Overtaken(ResticStore):
+        """Machine A analyses right after B's backup lands, so A's snapshot is B's child."""
+
+        def backup(self, write, cfg, when, description, extra_tags: Sequence[str] = ()):
+            snap = super().backup(write, cfg, when, description, extra_tags)
+            if not log:
+                log.append("built-on")
+                a.use(monkeypatch)
+                a.write("cfg/from_a.txt", "a\n")
+                a.engine.run({"c": a.model("cfg")})
+                b.use(monkeypatch)
+            return snap
+
+    a, b = machine(env, "a"), machine(env, "b", store_cls=Overtaken)
+    a.use(monkeypatch)
+    a.engine.init()
+    b.use(monkeypatch)
+    b.write("cfg/from_b.txt", "b\n")
+    b.engine.run({"c": b.model("cfg")})
+    assert len(b.engine.store.snapshots("c", tag=SYNC_TAG)) == 2  # B's was not forgotten under A's feet
+    b.engine.run({"c": b.model("cfg")})
+    assert (b.home / "cfg" / "from_a.txt").read_text() == "a\n"
+    a.use(monkeypatch)
+    a.engine.run({"c": a.model("cfg")})
+    assert (a.home / "cfg" / "from_b.txt").read_text() == "b\n"
+
+
+def test_join_existing_repo(pair, env):
+    a, _b = pair
+    a.write("cfg/app.conf", "x\n")
+    a.engine.run({"c": a.model("cfg")})
+    before = [s.id for s in a.engine.store.snapshots()]
+    c = machine(env, "c")
+    assert c.engine.init() == "joined"
+    assert [s.id for s in c.engine.store.snapshots()] == before  # nothing was written
+
+
+def test_create_new_repo(env):
+    assert not os.path.exists(env["repo"])
+    a = machine(env, "a")
+    assert a.engine.init() == "created"
+    assert os.path.exists(os.path.join(env["repo"], "config"))
+    assert a.engine.init() == "joined"
+
+
+def test_restic_failure_is_transport_error(pair, env):
+    a, _b = pair
+    a.write("cfg/app.conf", "x\n")
+    other_key = env["root"] / "other-key.txt"
+    subprocess.run(["age-keygen", "-o", str(other_key)], check=True, capture_output=True)
+    wrong = SyncEngine(SyncRemote(env["repo"]), str(other_key), a.state_file, a.sync_dir, a.lock_file, "x")
+    with pytest.raises(SyncTransportError):  # a wrong password is not "no repository"
+        wrong.init()
+    shutil.rmtree(env["repo"])
+    for verb in (
+        lambda: a.engine.run({"c": a.model("cfg")}),
+        lambda: a.engine.status({"c": a.model("cfg")}),
+        lambda: a.engine.resolve({"c": a.model("cfg")}, "local", None),
+    ):
+        with pytest.raises(SyncTransportError, match="restic"):
+            verb()
+    assert not os.path.exists(a.state_file)
+
+
+def test_all_cycle_history_is_a_state_error_not_a_fresh_root(pair):
+    a, _b = pair
+
+    class Cyclic(ResticStore):
+        """A listing in which two sync snapshots name each other: no root, no head."""
+
+        def snapshots(self, cfg=None, tag=None):
+            when = datetime(2026, 1, 1)
+            return [
+                Snapshot("id1", "id1", when, "c", None, (SYNC_TAG, PARENT_TAG_PREFIX + "id2")),
+                Snapshot("id2", "id2", when, "c", None, (SYNC_TAG, PARENT_TAG_PREFIX + "id1")),
+            ]
+
+    a.engine.store = Cyclic.for_repository(a.engine.store.repo, a.engine.store._password or "", ())
+    a.write("cfg/app.conf", "x\n")
+    with pytest.raises(SyncStateError):
+        a.engine.run({"c": a.model("cfg")})
 
 
 def _all_bytes(*roots: str) -> bytes:
@@ -399,27 +488,8 @@ def test_remote_has_no_plaintext(pair, env):
     a, _b = pair
     a.write("cfg/app.conf", f"token={SECRET}\n")
     a.engine.run({"c": a.model("cfg")})
-    assert SECRET.encode() not in _all_bytes(env["remote"])
-    assert b"app.conf" not in _all_bytes(env["remote"])  # the manifest (paths) is encrypted too
-
-
-def test_not_set_up(env, monkeypatch):
-    a = machine(env, "a")
-    a.use(monkeypatch)
-    with pytest.raises(SyncNotSetUpError):
-        a.engine.run({"c": a.model("cfg")})
-
-
-def test_init_needs_recipient_on_empty_remote_and_refuses_twice(env, monkeypatch):
-    a = machine(env, "a")
-    a.use(monkeypatch)
-    with pytest.raises(SyncNotSetUpError, match="--encrypt-to"):
-        a.engine.init(env["remote"], None)
-    assert not os.path.exists(a.sync_dir)
-    a.engine.init(env["remote"], env["recipient"])
-    assert os.stat(a.sync_dir).st_mode & 0o777 == 0o700
-    with pytest.raises(FileExistsError):
-        a.engine.init(env["remote"], env["recipient"])
+    assert SECRET.encode() not in _all_bytes(env["repo"])
+    assert b"app.conf" not in _all_bytes(env["repo"])  # the manifest (paths) is encrypted too
 
 
 def test_skipped_remote_lists_unknown_configs(pair, monkeypatch):
@@ -495,7 +565,8 @@ def test_second_sync_at_the_same_time_fails_fast(pair):
 
     a, _b = pair
     a.write("cfg/app.conf", "x\n")
-    fd = os.open(os.path.join(a.sync_dir, ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    os.makedirs(os.path.dirname(a.lock_file))
+    fd = os.open(a.lock_file, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for verb in (
@@ -505,40 +576,34 @@ def test_second_sync_at_the_same_time_fails_fast(pair):
         ):
             with pytest.raises(SyncTransportError, match="another sync is running"):
                 verb()
-        assert not subprocess.run(
-            ["git", "-C", a.sync_dir, "status", "--porcelain"], capture_output=True, text=True
-        ).stdout
+        assert not a.engine.store.snapshots("c")  # the refused verbs published nothing
     finally:
         os.close(fd)
     a.engine.run({"c": a.model("cfg")})  # the lock is released: it works again
 
 
-def test_git_metadata_names_nothing(pair, env):
-    a, _b = pair
-    a.write("cfg/app.conf", "x\n")
-    a.engine.run({"c": a.model("cfg")})
-    log = git(env["remote"], "log", "--all", "--format=%an|%ae|%cn|%ce|%s|%b")
-    assert log.strip()
-    for line in log.splitlines():
-        assert line == "config-saver|config-saver@localhost|config-saver|config-saver@localhost|sync|"
-    for secret in ("cfg", "app.conf", "homes", env["root"].name):
-        assert secret not in log
+def test_publish_race_lost_every_time_gives_up(env, monkeypatch):
+    class AlwaysLosing(ResticStore):
+        """B's clock runs ahead and machine A publishes something new just before every backup of B."""
 
+        def backup(self, write, cfg, when, description, extra_tags: Sequence[str] = ()):
+            a.use(monkeypatch)
+            a.write(f"cfg/from_a_{len(raced)}.txt", "a\n")
+            raced.append(1)
+            a.engine.run({"c": a.model("cfg")})
+            b.use(monkeypatch)
+            return super().backup(write, cfg, when + timedelta(hours=1), description, extra_tags)
 
-def test_push_race_lost_every_time_gives_up(env, monkeypatch):
-    class AlwaysStale(GitRepo):
-        def push(self) -> bool:
-            return False
-
+    raced: list[int] = []
     a = machine(env, "a")
     a.use(monkeypatch)
-    a.engine.init(env["remote"], env["recipient"])
-    b = machine(env, "b", git_cls=AlwaysStale)
+    a.engine.init()
+    b = machine(env, "b", store_cls=AlwaysLosing)
     b.use(monkeypatch)
-    b.engine.init(env["remote"], None)
     b.write("cfg/x.txt", "x\n")
-    with pytest.raises(SyncTransportError, match="kept pushing"):
+    with pytest.raises(SyncTransportError, match="kept publishing"):
         b.engine.run({"c": b.model("cfg")})
+    assert len(raced) == 3
     assert not os.path.exists(b.state_file)
 
 
@@ -559,8 +624,7 @@ def test_unreadable_file_never_publishes_a_deletion(pair, monkeypatch):
         f.chmod(0o600)
     assert Path(a.state_file).read_bytes() == state_before
     assert a.head() == head_before
-    git(a.sync_dir, "fetch", "origin")
-    assert git(a.sync_dir, "rev-list", "HEAD..@{u}") == ""  # nothing new on the remote
+    assert a.head() == head_before  # nothing new in the repository
     b.use(monkeypatch)
     b.engine.run({"c": b.model("cfg")})
     assert (b.home / "cfg" / "app.conf").read_text() == "v1\n"  # B still has its copy
@@ -600,5 +664,4 @@ def test_unreachable_parent_never_publishes_a_deletion(pair):
         (a.home / "d").chmod(0o700)
     assert Path(a.state_file).read_bytes() == state_before
     assert a.head() == head_before
-    git(a.sync_dir, "fetch", "origin")
-    assert git(a.sync_dir, "rev-list", "HEAD..@{u}") == ""
+    assert len(a.engine.store.snapshots("c", tag=SYNC_TAG)) == 1

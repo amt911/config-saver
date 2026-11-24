@@ -1,10 +1,10 @@
-"""Sync engine: ties scan, classify, manifest, the restic store and git together.
+"""Sync engine: ties scan, classify, manifest and the restic store together.
 
 Rules that bind every path through here: classify every config before touching
-anything (a conflict anywhere means zero writes, zero commits, state untouched);
+anything (a conflict anywhere means zero writes, zero snapshots, state untouched);
 only paths inside the local scope are ever written or deleted; every restored byte
 goes through TarDecompressor's member validation (this module only chooses which
-members it may restore); state is saved only after the push succeeded.
+members it may restore); state is saved only after the publish won.
 """
 
 from __future__ import annotations
@@ -19,20 +19,28 @@ import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import IO, Literal
+from typing import IO, Literal, TypeVar
 
 from config_saver.lib.errors import (
     ArchiveError,
+    StoreError,
     SyncConflictError,
-    SyncNotSetUpError,
+    SyncStateError,
     SyncTransportError,
 )
 from config_saver.lib.models.model import Model
-from config_saver.lib.restic_store import HOST_TAG_PREFIX, PARENT_TAG_PREFIX, SYNC_TAG, ResticStore, Snapshot
+from config_saver.lib.restic_store import (
+    DEFAULT_IDENTITY,
+    HOST_TAG_PREFIX,
+    PARENT_TAG_PREFIX,
+    SYNC_TAG,
+    ResticStore,
+    Snapshot,
+)
 from config_saver.lib.sync import state as state_file_io
 from config_saver.lib.sync.classify import Side, classify
-from config_saver.lib.sync.git_repo import GitRepo
-from config_saver.lib.sync.manifest import MANIFEST_MEMBER, SELF, Manifest, find_head
+from config_saver.lib.sync.manifest import MANIFEST_MEMBER, SELF, Manifest, SnapRef, losers, select_head
+from config_saver.lib.sync.remote import SyncRemote
 from config_saver.lib.sync.scan import LocalScope, scan
 from config_saver.lib.sync.state import SyncState
 from config_saver.lib.tar_compressor.tar_compressor import CompressResult, TarCompressor
@@ -42,7 +50,6 @@ MAX_ATTEMPTS = 3
 _NO_PARENT = "none"
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _STAGING = ".staging"
-LOCK_FILE = ".lock"
 
 
 @dataclass
@@ -56,7 +63,7 @@ class SyncReport:
 
 @dataclass
 class _Cfg:
-    """Everything known about one sync config after pulling and scanning."""
+    """Everything known about one sync config after listing and scanning."""
 
     name: str
     model: Model
@@ -85,61 +92,65 @@ def _parent_of(snapshot: Snapshot) -> str | None:
     return None
 
 
+_T = TypeVar("_T")
+
+
+def _transport(call: Callable[[], _T]) -> _T:
+    """Run a sync verb; a restic failure inside it is a transport failure (exit 10)."""
+    try:
+        return call()
+    except StoreError as exc:
+        raise SyncTransportError(str(exc)) from exc
+
+
 class SyncEngine:
     def __init__(
         self,
-        sync_dir: str,
-        state_file: str,
+        remote: SyncRemote,
         identity: str | None,
+        state_file: str,
+        staging_root: str,
+        lock_file: str,
         host: str,
-        git: GitRepo | None = None,
+        store: ResticStore | None = None,
     ):
-        self.sync_dir = sync_dir
+        self.remote = remote
         self.state_file = state_file
+        self.lock_file = lock_file
         self.host = re.sub(r"[\s,]+", "-", host) or "unknown"
-        self.store = ResticStore(sync_dir, identity)
-        self.git = git or GitRepo(sync_dir)
-        self.staging = os.path.join(sync_dir, _STAGING)
+        self.store = store or remote.store(identity or DEFAULT_IDENTITY)
+        self.staging_root = staging_root
+        self.staging = os.path.join(staging_root, _STAGING)
 
     # ------------------------------------------------------------------- init
 
-    def init(self, remote_url: str, recipient: str | None) -> None:
-        if os.path.exists(os.path.join(self.sync_dir, ".git")):
-            raise FileExistsError(f"sync is already set up in {self.sync_dir}")
-        existed = os.path.isdir(self.sync_dir)
-        if self.git.remote_has_branch(remote_url):
-            self.git.clone(remote_url)  # the shared age key decrypts it: no recipient needed
-            return
-        if not recipient:
-            raise SyncNotSetUpError("the remote is empty: pass --encrypt-to <age recipient> to create the sync store")
-        try:
-            os.makedirs(self.sync_dir, mode=0o700, exist_ok=True)
-            self.store.init(recipient)
-            self.git.init(remote_url)
-            self.git.commit_all()
-            if not self.git.push():
-                raise SyncTransportError("the remote changed while initialising; run the init again")
-        except BaseException:
-            if not existed:
-                shutil.rmtree(self.sync_dir, ignore_errors=True)
-            raise
+    def init(self) -> Literal["created", "joined"]:
+        """Join the repository if it exists (nothing is written there), else create it."""
+
+        def go() -> Literal["created", "joined"]:
+            if self.store.exists():
+                return "joined"
+            self.store.init_plain()
+            return "created"
+
+        return _transport(go)
 
     # ------------------------------------------------------------ public verbs
 
     def status(self, configs: Mapping[str, Model]) -> SyncReport:
         with self._locked(), self._workspace():
-            cfgs, skipped = self._analyse(configs, state_file_io.load(self.state_file))
+            cfgs, skipped = _transport(lambda: self._analyse(configs, state_file_io.load(self.state_file)))
             return self._report(cfgs, skipped)
 
     def run(self, configs: Mapping[str, Model]) -> SyncReport:
         with self._locked():
-            return self._run(configs, state_file_io.load(self.state_file))
+            return _transport(lambda: self._run(configs, state_file_io.load(self.state_file)))
 
     def resolve(
         self, configs: Mapping[str, Model], side: Literal["local", "remote"], paths: list[str] | None
     ) -> SyncReport:
         with self._locked():
-            return self._resolve(configs, side, paths)
+            return _transport(lambda: self._resolve(configs, side, paths))
 
     def _resolve(
         self, configs: Mapping[str, Model], side: Literal["local", "remote"], paths: list[str] | None
@@ -182,7 +193,7 @@ class SyncEngine:
                     _extend(total.deleted, c.name, c.delete_local)
                 merged = {c.name: self._merge(c) for c in cfgs.values()}
                 new_ids = self._publish(cfgs, merged)
-                if new_ids is None:  # the remote moved under us: start again from the pull
+                if new_ids is None:  # lost the race to another machine: start again from the listing
                     continue
                 for c in cfgs.values():
                     side, publish = merged[c.name]
@@ -194,10 +205,10 @@ class SyncEngine:
                         _extend(total.published, c.name, sorted(publish))
                 state_file_io.save(self.state_file, state)
                 return total
-        raise SyncTransportError("another machine kept pushing; try again")
+        raise SyncTransportError("another machine kept publishing; try again")
 
     def _publish(self, cfgs: dict[str, _Cfg], merged: dict[str, tuple[Side, set[str]]]) -> dict[str, str] | None:
-        """Upload what only this machine has; ``{}`` if nothing, ``None`` if the push lost a race."""
+        """Upload what only this machine has; ``{}`` if nothing, ``None`` if another machine's publish won."""
         created: dict[str, str] = {}
         for c in cfgs.values():
             side, publish = merged[c.name]
@@ -213,11 +224,11 @@ class SyncEngine:
             created[c.name] = snapshot.id
         if not created:
             return created
-        self.git.commit_all()
-        if self.git.push():
+        by_cfg = self._by_cfg(self.store.snapshots(tag=SYNC_TAG))
+        # Ours won when it is on the winning chain: another machine may already have built on top of it.
+        if all(snap_id not in losers(by_cfg.get(name, [])) for name, snap_id in created.items()):
             return created
         self.store.forget_ids(list(created.values()))
-        self.git.reset_to_upstream()
         return None
 
     @staticmethod
@@ -230,20 +241,25 @@ class SyncEngine:
     # ------------------------------------------------------------- analysis
 
     def _analyse(self, configs: Mapping[str, Model], state: SyncState) -> tuple[dict[str, _Cfg], list[str]]:
-        # Anything unpushed in the working tree is leftover of a run that died before
-        # saving its state: it is disposable, and an orphan snapshot would fork the history.
-        self.git.reset_to_upstream()
-        self.git.pull()
+        all_snaps = self.store.snapshots(tag=SYNC_TAG)
+        by_cfg = self._by_cfg(all_snaps)
         cfgs: dict[str, _Cfg] = {}
         for name in sorted(n for n, m in configs.items() if m.sync):
-            cfgs[name] = self._analyse_one(name, configs[name], state.base.get(name, {}))
-        remote_names = {s.cfg for s in self.store.snapshots(tag=SYNC_TAG)}
-        return cfgs, sorted(remote_names - set(cfgs))
+            cfgs[name] = self._analyse_one(name, configs[name], state.base.get(name, {}), by_cfg.get(name, []))
+        return cfgs, sorted(set(by_cfg) - set(cfgs))
 
-    def _analyse_one(self, name: str, model: Model, base: Side) -> _Cfg:
+    @staticmethod
+    def _by_cfg(snapshots: list[Snapshot]) -> dict[str, list[SnapRef]]:
+        by_cfg: dict[str, list[SnapRef]] = {}
+        for s in snapshots:
+            by_cfg.setdefault(s.cfg, []).append(SnapRef(s.id, _parent_of(s), s.time))
+        return by_cfg
+
+    def _analyse_one(self, name: str, model: Model, base: Side, snaps: list[SnapRef]) -> _Cfg:
         scope, local, _total = scan(model)
-        snaps = self.store.snapshots(name, tag=SYNC_TAG)
-        head = find_head([(s.id, _parent_of(s)) for s in snaps], name)
+        head = select_head(snaps)
+        if snaps and head is None:
+            raise SyncStateError(f"the sync history of {name} has no usable head (a snapshot cycle?)")
         remote = self._read_manifest(head, name) if head else None
         remote_side = remote.side() if remote else {}
         local_scope = {p for p in set(base) | set(local) | set(remote_side) if scope.contains(p)}
@@ -342,6 +358,7 @@ class SyncEngine:
     def _workspace(self) -> Iterator[None]:
         """A fresh private staging area (it holds plaintext), removed on every path."""
         shutil.rmtree(self.staging, ignore_errors=True)
+        os.makedirs(self.staging_root, mode=0o700, exist_ok=True)
         os.makedirs(self.staging, mode=0o700)
         try:
             yield
@@ -350,10 +367,9 @@ class SyncEngine:
 
     @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
-        """One sync at a time per sync dir (timer vs manual run): non-blocking, fail fast."""
-        if not os.path.isdir(os.path.join(self.sync_dir, ".git")):
-            raise SyncNotSetUpError("sync is not set up on this machine: run the sync init first")
-        fd = os.open(os.path.join(self.sync_dir, LOCK_FILE), os.O_WRONLY | os.O_CREAT, 0o600)
+        """One sync at a time per machine (timer vs manual run): non-blocking, fail fast."""
+        os.makedirs(os.path.dirname(self.lock_file), mode=0o700, exist_ok=True)
+        fd = os.open(self.lock_file, os.O_WRONLY | os.O_CREAT, 0o600)
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -15,8 +15,9 @@ from config_saver.lib.exit_codes import EXIT_OK, EXIT_SYNC_CONFLICT, EXIT_USAGE
 from config_saver.lib.models.model import Model
 from config_saver.lib.sync import paths as sync_paths
 from config_saver.lib.sync.engine import SyncEngine, SyncReport
+from config_saver.lib.sync.remote import SyncRemote, load_remote, save_remote
 
-REQUIRED_TOOLS = ("git", "restic", "age")
+REQUIRED_TOOLS = ("restic", "age")
 _HOME_PREFIX = "home/user"
 
 ConfigLoader = Callable[[], Mapping[str, Model]]
@@ -87,18 +88,24 @@ def _print_report(report: SyncReport, *, dry: bool) -> None:
         print(Fore.YELLOW + "skipped (no local config): " + ", ".join(report.skipped_remote))
 
 
-def _engine(args: argparse.Namespace) -> SyncEngine:
-    return SyncEngine(sync_paths.sync_dir(), sync_paths.state_path(), args.identity, socket.gethostname())
+def _engine(args: argparse.Namespace, remote: SyncRemote) -> SyncEngine:
+    return SyncEngine(
+        remote,
+        args.identity,
+        sync_paths.state_path(),
+        sync_paths.sync_dir(),
+        sync_paths.lock_path(),
+        socket.gethostname(),
+    )
 
 
-def _require_set_up() -> None:
-    missing = [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
+def _require_tools(remote: SyncRemote | None) -> None:
+    needed = list(REQUIRED_TOOLS)
+    if remote is not None and remote.needs_rclone:
+        needed.append("rclone")
+    missing = [tool for tool in needed if shutil.which(tool) is None]
     if missing:
         raise SyncNotSetUpError(f"sync needs {', '.join(missing)} installed and on PATH")
-    if not os.path.isdir(os.path.join(sync_paths.sync_dir(), ".git")):
-        raise SyncNotSetUpError(
-            "sync is not set up: run config-saver --sync-init <git-url> --encrypt-to <age recipient>"
-        )
 
 
 def handle(args: argparse.Namespace, load_configs: ConfigLoader) -> int:
@@ -107,15 +114,16 @@ def handle(args: argparse.Namespace, load_configs: ConfigLoader) -> int:
         print(Fore.RED + "Use only one of --sync, --sync-init, --sync-status and --sync-resolve.")
         return EXIT_USAGE
     if args.sync_init:
-        recipients = args.encrypt_to or []
-        if len(recipients) > 1:
-            print(Fore.RED + "--sync-init takes at most one --encrypt-to recipient.")
-            return EXIT_USAGE
-        _engine(args).init(args.sync_init, recipients[0] if recipients else None)
-        print(Fore.GREEN + f"Sync is set up in {sync_paths.sync_dir()}. Mark configurations with 'sync: true'.")
+        remote = SyncRemote(args.sync_init, ())
+        _require_tools(remote)
+        outcome = _engine(args, remote).init()
+        save_remote(sync_paths.remote_config_path(), remote)  # only once the repository is usable
+        print(Fore.GREEN + f"Sync repository {outcome}. Mark configurations with 'sync: true'.")
         return EXIT_OK
-    _require_set_up()
-    engine = _engine(args)
+    _require_tools(None)
+    remote = load_remote(sync_paths.remote_config_path())
+    _require_tools(remote)
+    engine = _engine(args, remote)
     if args.sync_status:
         report = engine.status(load_configs())
         _print_report(report, dry=True)

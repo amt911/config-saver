@@ -1227,11 +1227,23 @@ def test_sync_flag_combinations_exit_usage(argv: list[str], fake_home: Path) -> 
 def test_sync_without_setup_exits_not_found(
     fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setenv("XDG_DATA_HOME", str(fake_home / "share"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / "conf"))
     monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
     for flag in (["--sync"], ["--sync-status"], ["--sync-resolve", "local"]):
         assert run(flag) == EXIT_NOT_FOUND
         assert "sync is not set up" in capsys.readouterr().out
+
+
+def test_sync_with_rclone_remote_needs_rclone(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from config_saver.lib.sync.remote import SyncRemote, save_remote
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / "conf"))
+    save_remote(str(fake_home / "conf" / "config-saver" / "sync.json"), SyncRemote("rclone:drive:backups"))
+    monkeypatch.setattr("shutil.which", lambda tool: None if tool == "rclone" else "/usr/bin/fake")
+    assert run(["--sync"]) == EXIT_NOT_FOUND
+    assert "rclone" in capsys.readouterr().out
 
 
 def test_sync_with_a_missing_tool_names_it(
@@ -1252,10 +1264,12 @@ def _sync_stub(
     monkeypatch: pytest.MonkeyPatch, fake_home: Path, error: Exception | None = None, **report: object
 ) -> None:
     from config_saver.lib.sync.engine import SyncEngine, SyncReport
+    from config_saver.lib.sync.remote import SyncRemote, save_remote
 
-    monkeypatch.setenv("XDG_DATA_HOME", str(fake_home / "share"))
-    (fake_home / "share" / "config-saver" / "sync" / ".git").mkdir(parents=True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / "conf"))
+    save_remote(str(fake_home / "conf" / "config-saver" / "sync.json"), SyncRemote(str(fake_home / "repo")))
     monkeypatch.setattr("shutil.which", lambda _tool: "/usr/bin/fake")
+    monkeypatch.setattr(SyncEngine, "__init__", lambda self, *_a, **_k: None)  # no identity file in unit tests
 
     def act(self: SyncEngine, *_a: object, **_k: object) -> SyncReport:
         if error is not None:

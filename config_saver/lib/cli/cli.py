@@ -250,13 +250,13 @@ class CLI:
         parser.add_argument(
             "--sync",
             action="store_true",
-            help="Sync the configurations marked 'sync: true' with the other machines (git remote)",
+            help="Sync the configurations marked 'sync: true' with the other machines (restic repository)",
         )
         parser.add_argument(
             "--sync-init",
             metavar="URL",
             default=None,
-            help="Set up sync against this git remote (clones it, or creates the store with --encrypt-to)",
+            help="Set up sync against this restic repository (joins it if it exists, else creates it)",
         )
         parser.add_argument(
             "--sync-status", action="store_true", help="Show what --sync would do (exit 11 on conflicts)"

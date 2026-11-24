@@ -6,13 +6,12 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from config_saver.lib.errors import ArchiveError, StoreError
+from config_saver.lib.errors import ArchiveError
 from config_saver.lib.sync.classify import Fingerprint
 from config_saver.lib.sync.manifest import (
     SELF,
     Manifest,
     SnapRef,
-    find_head,
     losers,
     select_head,
     unreferenced,
@@ -123,22 +122,6 @@ def test_missing_top_level_key_rejected():
     del doc["scope"]
     with pytest.raises(ArchiveError):
         Manifest.from_json(json.dumps(doc).encode())
-
-
-def test_find_head():
-    assert find_head([], "c") is None
-    assert find_head([("a", None)], "c") == "a"
-    assert find_head([("b", "a"), ("a", None), ("c", "b")], "c") == "c"
-
-
-def test_find_head_fork():
-    with pytest.raises(StoreError, match="sync history of cfg1 forked"):
-        find_head([("a", None), ("b", "a"), ("c", "a")], "cfg1")
-
-
-def test_find_head_cycle():
-    with pytest.raises(StoreError, match="sync history of c forked"):
-        find_head([("a", "b"), ("b", "a")], "c")
 
 
 # Each rejection names the field that failed: the message is how an operator tells which

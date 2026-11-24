@@ -1,4 +1,4 @@
-"""--sync-init / --sync / --sync-resolve through the real command, two machines, one bare remote.
+"""--sync-init / --sync / --sync-resolve through the real command, two machines, one local restic repository.
 
 End to end on purpose: what is under test is the process exit code, stdout and the
 real files on disk, which no in-process test can answer. Everything finer (exit
@@ -20,8 +20,8 @@ from tests.conftest import write_config
 pytestmark = [
     pytest.mark.restic,
     pytest.mark.skipif(
-        any(shutil.which(b) is None for b in ("restic", "age", "age-keygen", "git")),
-        reason="needs restic, age, age-keygen and git on PATH",
+        any(shutil.which(b) is None for b in ("restic", "age", "age-keygen")),
+        reason="needs restic, age and age-keygen on PATH",
     ),
 ]
 
@@ -41,8 +41,6 @@ class Machine:
             "PATH": os.environ["PATH"],
             "HOME": str(self.home),
             "PYTHONPATH": REPO_ROOT,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
             "RESTIC_CACHE_DIR": str(root / f"{name}-cache"),
         }
 
@@ -68,23 +66,19 @@ class Machine:
 def machines(tmp_path: Path) -> tuple[Machine, Machine, str]:
     key = tmp_path / "key.txt"
     subprocess.run(["age-keygen", "-o", str(key)], check=True, capture_output=True)
-    recipient = subprocess.run(
-        ["age-keygen", "-y", str(key)], check=True, capture_output=True, text=True
-    ).stdout.strip()
-    remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, capture_output=True)
-    return Machine(tmp_path, "a", key), Machine(tmp_path, "b", key), f"{remote}|{recipient}"
+    return Machine(tmp_path, "a", key), Machine(tmp_path, "b", key), str(tmp_path / "repo")
 
 
 def test_two_machines_sync_conflict_and_resolve(machines: tuple[Machine, Machine, str]) -> None:
-    a, b, remote_and_recipient = machines
-    remote, recipient = remote_and_recipient.split("|")
+    a, b, remote = machines
 
     a.write("one\n")
-    init_a = a.sync("--sync-init", remote, "--encrypt-to", recipient)
+    init_a = a.sync("--sync-init", remote)
     assert init_a.returncode == 0, init_a.stderr + init_a.stdout
-    init_b = b.sync("--sync-init", remote)  # the remote has content now: this clones
+    assert "created" in init_a.stdout
+    init_b = b.sync("--sync-init", remote)  # the repository exists now: this joins it
     assert init_b.returncode == 0, init_b.stderr + init_b.stdout
+    assert "joined" in init_b.stdout
 
     assert a.sync("--sync").returncode == 0
     got = b.sync("--sync")

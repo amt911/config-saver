@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from config_saver.lib.errors import ArchiveError, StoreError
+from config_saver.lib.errors import ArchiveError
 from config_saver.lib.sync.classify import Fingerprint, Side
 
 MANIFEST_MEMBER = ".config-saver-sync-manifest.json"
@@ -110,17 +110,6 @@ class Manifest:
 
     def side(self) -> Side:
         return {p: fp for p, (fp, _) in self.entries.items()}
-
-
-def find_head(snaps: list[tuple[str, str | None]], cfg: str) -> str | None:
-    """Return the one snapshot id no other snapshot names as parent."""
-    if not snaps:
-        return None
-    parents = {parent for _, parent in snaps if parent is not None}
-    heads = [sid for sid, _ in snaps if sid not in parents]
-    if len(heads) != 1:
-        raise StoreError(f"sync history of {cfg} forked")
-    return heads[0]
 
 
 @dataclass(frozen=True)

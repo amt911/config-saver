@@ -64,11 +64,11 @@ class SyncSystemConfigError(ValueError, ConfigSaverError):
 
 
 class SyncTransportError(OSError, ConfigSaverError):
-    """git could not reach, update or publish to the sync remote."""
+    """the sync remote (restic repository) could not be reached, read or published to."""
 
 
 class SyncNotSetUpError(FileNotFoundError, ConfigSaverError):
-    """Sync was not initialised on this machine, or git itself is missing."""
+    """Sync was not initialised on this machine, or a required tool is missing."""
 
 
 class SyncConflictError(ConfigSaverError):
