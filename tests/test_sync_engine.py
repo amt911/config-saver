@@ -182,6 +182,12 @@ def _synced_pair(pair, monkeypatch, text="v1\n"):
     return a, b
 
 
+def _without_cache(state_file: str) -> dict:
+    doc = json.loads(Path(state_file).read_text())
+    doc.pop("hash_cache", None)
+    return doc
+
+
 def test_conflict_aborts_without_writes(pair, monkeypatch):
     a, b = _synced_pair(pair, monkeypatch)
     a.use(monkeypatch)
@@ -189,13 +195,13 @@ def test_conflict_aborts_without_writes(pair, monkeypatch):
     a.engine.run({"c": a.model("cfg")})
     b.use(monkeypatch)
     b.write("cfg/app.conf", "from b\n")
-    before_state = Path(b.state_file).read_bytes()
+    before_state = _without_cache(b.state_file)
 
     with pytest.raises(SyncConflictError) as exc:
         b.engine.run({"c": b.model("cfg")})
     assert exc.value.conflicts == {"c": ["home/user/cfg/app.conf"]}
     assert (b.home / "cfg" / "app.conf").read_text() == "from b\n"
-    assert Path(b.state_file).read_bytes() == before_state
+    assert _without_cache(b.state_file) == before_state  # only the hash cache may change on a conflict
     assert len(b.engine.store.snapshots("c", tag=SYNC_TAG)) == 2  # nothing of ours was published
 
 
@@ -1047,8 +1053,11 @@ def test_prune_failure_after_publish_keeps_state_and_retries_next_run(env, monke
     assert saved.heads["c"] == a.head()
     assert saved.last_prune is None  # not recorded: the next run tries again
     counting.fail_prune = False
+    a.engine.run({"c": a.model("cfg")})  # inside the back-off window: no attempt, nothing recorded
+    assert state_io.load(a.state_file).last_prune is None
+    a.engine.now = Clock(T0 + DAY)  # a day later it tries again
     a.engine.run({"c": a.model("cfg")})
-    assert state_io.load(a.state_file).last_prune == T0
+    assert state_io.load(a.state_file).last_prune == T0 + DAY
 
 
 def test_a_publish_built_on_a_snapshot_forgotten_meanwhile_retries(env, monkeypatch):
@@ -1719,8 +1728,17 @@ class _Counted:
 
 def test_the_manifest_of_a_big_snapshot_is_read_without_pulling_the_whole_tar(env, monkeypatch):
     import contextlib
+    import subprocess as sp
 
     seen: list[_Counted] = []
+    procs: list[sp.Popen] = []
+
+    class Recording(sp.Popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            procs.append(self)
+
+    monkeypatch.setattr("config_saver.lib.restic_store.subprocess.Popen", Recording)
 
     class Store(ResticStore):
         @contextlib.contextmanager
@@ -1739,8 +1757,8 @@ def test_the_manifest_of_a_big_snapshot_is_read_without_pulling_the_whole_tar(en
         read = a.engine._read_manifest(snap.id, "c")
     assert read.entries["home/user/cfg/f.txt"][1] == snap.id
     assert seen and seen[0].n < 2 * 1024 * 1024  # the 20 MB behind the manifest was never read
-    with pytest.raises(ChildProcessError):  # restic was stopped and reaped: no zombie, nothing left running
-        os.waitpid(-1, os.WNOHANG)
+    assert procs and all(p.returncode is not None for p in procs)  # restic was stopped and reaped: no zombie
+    assert all(p.poll() is not None for p in procs)
 
 
 def test_a_manifest_that_is_not_among_the_first_members_is_refused(env, monkeypatch):
